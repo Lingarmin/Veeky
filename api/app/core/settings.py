@@ -19,7 +19,8 @@ class Settings(BaseSettings):
     libretranslate_url: str = "http://localhost:5000"
     libretranslate_api_key: SecretStr | None = None
     analysis_provider_api_key: SecretStr | None = None
-    analysis_provider_model: str = "gpt-4.1-mini"
+    analysis_provider_url: str = ""
+    analysis_provider_model: str = "configured-model"
     allowed_chrome_extension_origins: list[str] = Field(default_factory=list)
 
 
