@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="YouTube 视频预览 Chrome Side Panel 交互演示" />
+    <title>先看 · YouTube 视频预览演示</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="demo-page">
+      <header class="demo-heading">
+        <div>
+          <span class="demo-kicker">INTERACTIVE PROTOTYPE</span>
+          <h1>YouTube 视频预览</h1>
+        </div>
+        <p>切换下方浏览器标签，查看 Side Panel 如何只保留在发起分析的视频页。</p>
+      </header>
+
+      <section class="browser" aria-label="浏览器交互演示">
+        <div class="browser-tabs" role="tablist" aria-label="演示标签页">
+          <div class="window-controls" aria-hidden="true">
+            <span></span><span></span><span></span>
+          </div>
+          <button class="browser-tab is-active" type="button" role="tab" aria-selected="true" data-browser-tab="youtube">
+            <span class="tab-favicon youtube-favicon" aria-hidden="true">▶</span>
+            <span class="tab-title">But what is a neural network?</span>
+            <span class="tab-close" aria-hidden="true">×</span>
+          </button>
+          <button class="browser-tab" type="button" role="tab" aria-selected="false" data-browser-tab="article">
+            <span class="tab-favicon article-favicon" aria-hidden="true">N</span>
+            <span class="tab-title">项目周报 · Notes</span>
+            <span class="tab-close" aria-hidden="true">×</span>
+          </button>
+          <button class="new-tab" type="button" title="新建标签页" aria-label="新建标签页">+</button>
+        </div>
+
+        <div class="browser-toolbar">
+          <div class="nav-buttons" aria-hidden="true"><span>‹</span><span>›</span><span>↻</span></div>
+          <div class="address-bar">
+            <span class="site-lock" aria-hidden="true">●</span>
+            <span id="addressText">youtube.com/watch?v=aircAruvnKk</span>
+          </div>
+          <span class="toolbar-menu" aria-hidden="true">⋮</span>
+        </div>
+
+        <div class="browser-viewport">
+          <section class="webpage youtube-page" id="youtubePage" aria-label="YouTube 视频页">
+            <header class="youtube-header">
+              <div class="youtube-brand"><span class="youtube-mark">▶</span><strong>YouTube</strong></div>
+              <div class="youtube-search">搜索</div>
+              <div class="youtube-profile">G</div>
+            </header>
+
+            <div class="youtube-content">
+              <div class="video-column">
+                <div class="video-player" id="videoPlayer">
+                  <canvas id="videoCanvas" aria-label="神经网络视频画面示意"></canvas>
+                  <div class="video-label">CHAPTER 1 · DEEP LEARNING</div>
+                  <div class="video-controls">
+                    <button class="player-button" id="playButton" type="button" aria-label="播放" title="播放">▶</button>
+                    <span id="currentTime">0:00</span>
+                    <div class="player-progress" aria-label="视频播放进度"><span id="playerProgress"></span></div>
+                    <span>19:19</span>
+                    <span aria-hidden="true">⚙</span>
+                  </div>
+                </div>
+
+                <h2>But what is a neural network? | Chapter 1, Deep learning</h2>
+                <div class="video-meta">
+                  <div class="channel-avatar">3B</div>
+                  <div><strong>3Blue1Brown</strong><span>7.1M subscribers</span></div>
+                  <button type="button">Subscribe</button>
+                  <span class="video-stats">16M views · 6 years ago</span>
+                </div>
+                <div class="description">
+                  <strong>Neural networks explained without the usual jargon.</strong>
+                  <p>This chapter builds intuition from handwritten digit recognition, then introduces layers, weights, biases and training.</p>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="webpage article-page" id="articlePage" aria-label="其他网页" hidden>
+            <nav class="notes-nav"><strong>NOTES</strong><span>文档</span><span>项目</span><span>归档</span></nav>
+            <article>
+              <span class="article-label">WEEK 31</span>
+              <h2>视频预览工具项目周报</h2>
+              <p class="article-lead">这是一张普通网页标签。Side Panel 在这里不会显示，原视频的分析任务仍保留。</p>
+              <div class="article-divider"></div>
+              <h3>本周完成</h3>
+              <p>确认公开字幕检测流程，确定 LibreTranslate 只用于开发和内部测试，并完成标签页级 Side Panel 的交互定义。</p>
+              <h3>下一步</h3>
+              <p>接入真实字幕轨道，在保持句段时间戳的前提下完成翻译与摘要。</p>
+            </article>
+          </section>
+
+          <aside class="side-panel" id="sidePanel" aria-label="先看视频分析面板">
+            <header class="panel-header">
+              <div class="panel-brand">
+                <span class="panel-logo">先</span>
+                <div><strong>先看</strong><span>视频预览</span></div>
+              </div>
+              <div class="panel-actions">
+                <button id="rerunButton" type="button" title="重新分析" aria-label="重新分析">↻</button>
+                <button type="button" title="更多" aria-label="更多">⋯</button>
+              </div>
+            </header>
+
+            <div class="source-strip">
+              <span class="source-status"><i></i> 已读取字幕</span>
+              <span>English · 自动生成</span>
+              <span>译为简体中文</span>
+            </div>
+
+            <nav class="panel-tabs" role="tablist" aria-label="分析结果">
+              <button class="is-active" type="button" role="tab" aria-selected="true" data-section="overview">概览</button>
+              <button type="button" role="tab" aria-selected="false" data-section="transcript">逐字稿</button>
+            </nav>
+
+            <div class="panel-body" id="panelBody"></div>
+          </aside>
+        </div>
+      </section>
+
+      <footer class="demo-note">
+        <span>演示使用模拟字幕与分析结果</span>
+        <span>点击章节时间可以改变视频进度</span>
+      </footer>
+    </main>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="demo-state.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>
