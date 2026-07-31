@@ -29,6 +29,7 @@ class TranslationCacheKey:
     track_id: str
     target_language: str
     transcript_version: str
+    provider: str
     provider_version: str
 
 
@@ -76,6 +77,7 @@ class CachedTranslationService:
             track_id=track_id,
             target_language=target_language,
             transcript_version=transcript_version,
+            provider=self.provider.name,
             provider_version=self.provider.version,
         )
         cached = await self.cache.get(key)
@@ -118,6 +120,18 @@ class LibreTranslateProvider:
         source_language: str,
         target_language: str,
     ) -> list[TranslatedSegment]:
+        if _libretranslate_language(source_language) == _libretranslate_language(
+            target_language
+        ):
+            return [
+                TranslatedSegment(
+                    segment_id=segment.segment_id,
+                    start_ms=segment.start_ms,
+                    duration_ms=segment.duration_ms,
+                    text=segment.text,
+                )
+                for segment in segments
+            ]
         batches = _build_batches(segments, self.max_batch_chars)
         if self.client is not None:
             return await self._translate_batches(
@@ -165,8 +179,8 @@ class LibreTranslateProvider:
     ) -> list[str]:
         payload: dict[str, object] = {
             "q": [segment.text for segment in batch],
-            "source": source_language,
-            "target": target_language,
+            "source": _libretranslate_language(source_language),
+            "target": _libretranslate_language(target_language),
             "format": "text",
         }
         if self.api_key:
@@ -243,3 +257,12 @@ def _build_batches(
     if current:
         batches.append(current)
     return batches
+
+
+def _libretranslate_language(language: str) -> str:
+    normalized = language.replace("_", "-").lower()
+    if normalized in {"zh-hans", "zh-cn", "zh-sg"}:
+        return "zh"
+    if normalized in {"zh-hant", "zh-tw", "zh-hk", "zh-mo"}:
+        return "zt"
+    return normalized.split("-", 1)[0]

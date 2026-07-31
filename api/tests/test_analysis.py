@@ -19,7 +19,10 @@ class FakeProvider:
 
     async def analyze(self, segments, target_language):
         self.calls += 1
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 def source_segments():
@@ -32,7 +35,7 @@ def source_segments():
 def valid_payload():
     return {
         "one_line_summary": "视频解释了神经网络的基本结构。",
-        "summary_points": ["输入层保存像素", "权重决定连接强度"],
+        "summary_points": ["输入层保存像素", "权重决定连接强度", "偏置影响激活结果"],
         "chapters": [
             {"start_ms": 0, "end_ms": 2000, "title": "基础结构", "summary": "从像素到权重"}
         ],
@@ -99,3 +102,35 @@ async def test_deduplicates_identical_highlights():
     )
 
     assert len(result.highlights) == 1
+
+
+@pytest.mark.asyncio
+async def test_retries_temporary_provider_failures():
+    provider = FakeProvider(
+        [
+            AnalysisGenerationError("analysis_unavailable", "offline"),
+            AnalysisGenerationError("analysis_unavailable", "busy"),
+            valid_payload(),
+        ]
+    )
+
+    result = await StructuredAnalysisService(provider).analyze(
+        source_segments(), "zh-Hans", duration_ms=2000
+    )
+
+    assert result.one_line_summary.startswith("视频解释")
+    assert provider.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_rejects_highlight_without_excerpts():
+    invalid = valid_payload()
+    invalid["highlights"][0].pop("original_excerpt")
+    provider = FakeProvider([invalid, invalid, invalid])
+
+    with pytest.raises(AnalysisGenerationError) as error:
+        await StructuredAnalysisService(provider).analyze(
+            source_segments(), "zh-Hans", duration_ms=2000
+        )
+
+    assert error.value.code == "analysis_invalid_response"

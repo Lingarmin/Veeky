@@ -1,17 +1,27 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime, timezone
+import hashlib
 from urllib.parse import parse_qs, urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.db.models import AnalysisJob, AnalysisResult, Video
+from app.db.models import (
+    AnalysisJob,
+    AnalysisResult,
+    TranscriptTrack,
+    Translation,
+    Video,
+)
 from app.db.session import get_session
+from app.core.settings import Settings, get_settings
 from app.services.transcripts import TranscriptInspection, TranscriptService, transcript_version
 
 
@@ -67,15 +77,29 @@ class AnalysisStatusResponse(ApiModel):
     failure_detail: str | None = None
 
 
+class TranscriptSegmentResponse(ApiModel):
+    id: str
+    start_ms: int
+    duration_ms: int
+    original: str
+    translated: str | None = None
+
+
 class AnalysisResultResponse(ApiModel):
     job_id: str
     video_id: str
+    video_title: str
+    duration_ms: int
     source_language: str
     target_language: str
+    is_generated: bool | None = None
     one_line_summary: str
     summary_points: list[str]
     chapters: list[dict]
     highlights: list[dict]
+    transcript: list[TranscriptSegmentResponse] = Field(default_factory=list)
+    partial: bool = False
+    failure_code: str | None = None
     model_name: str
     model_version: str
 
@@ -92,6 +116,16 @@ def dispatch_analysis_job(job_id: str) -> object:
 
 def get_job_dispatcher() -> JobDispatcher:
     return dispatch_analysis_job
+
+
+def get_pipeline_revision(settings: Settings = Depends(get_settings)) -> str:
+    return "|".join(
+        [
+            f"libretranslate@{settings.libretranslate_version}",
+            f"{settings.analysis_provider_model}@{settings.analysis_provider_version}",
+            f"prompt@{settings.analysis_prompt_version}",
+        ]
+    )
 
 
 @router.post("/videos/inspect", response_model=InspectResponse)
@@ -121,6 +155,7 @@ async def create_analysis(
     session: AsyncSession = Depends(get_session),
     transcript_service: TranscriptService = Depends(get_transcript_service),
     dispatcher: JobDispatcher = Depends(get_job_dispatcher),
+    pipeline_revision: str = Depends(get_pipeline_revision),
 ) -> AnalysisCreateResponse:
     _validate_video_id(request.video_id)
     inspection = await run_in_threadpool(
@@ -131,8 +166,12 @@ async def create_analysis(
         raise _api_error(422, "source_language_unavailable", "所选字幕语言不可读取")
 
     version = transcript_version(inspection.segments)
-    cache_key = ":".join(
-        [request.video_id, request.source_language, request.target_language, version]
+    cache_key = analysis_cache_key(
+        request.video_id,
+        request.source_language,
+        request.target_language,
+        version,
+        pipeline_revision,
     )
     existing = await session.scalar(select(AnalysisJob).where(AnalysisJob.cache_key == cache_key))
     if existing and existing.status != "failed":
@@ -161,6 +200,7 @@ async def create_analysis(
             video_id=request.video_id,
             source_language=request.source_language,
             target_language=request.target_language,
+            transcript_version=version,
             cache_key=cache_key,
         )
         session.add(job)
@@ -170,10 +210,33 @@ async def create_analysis(
         job.failure_code = None
         job.failure_detail = None
         job.completed_at = None
+        job.transcript_version = version
 
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        concurrent = await session.scalar(
+            select(AnalysisJob).where(AnalysisJob.cache_key == cache_key)
+        )
+        if concurrent is None:
+            raise
+        response.status_code = 200 if concurrent.status == "completed" else 202
+        return AnalysisCreateResponse(
+            job_id=concurrent.id,
+            cache_hit=concurrent.status == "completed",
+            status=concurrent.status,
+        )
     await session.refresh(job)
-    dispatcher(job.id)
+    try:
+        dispatcher(job.id)
+    except Exception as error:
+        job.status = "failed"
+        job.failure_code = "dispatch_failed"
+        job.failure_detail = str(error)
+        job.completed_at = datetime.now(timezone.utc)
+        await session.commit()
+        raise _api_error(503, "dispatch_failed", "后台任务暂时无法启动，请重试") from error
     response.status_code = 202
     return AnalysisCreateResponse(job_id=job.id, cache_hit=False, status=job.status)
 
@@ -199,25 +262,76 @@ async def get_analysis_result(
 ) -> AnalysisResultResponse:
     job = await session.scalar(
         select(AnalysisJob)
-        .options(selectinload(AnalysisJob.result))
+        .options(selectinload(AnalysisJob.result), selectinload(AnalysisJob.video))
         .where(AnalysisJob.id == job_id)
     )
     if job is None:
         raise _api_error(404, "analysis_not_found", "没有找到这个分析任务")
-    if job.status != "completed" or job.result is None:
+    partial = job.status == "failed" and job.failure_code == "translation_failed"
+    if not partial and (job.status != "completed" or job.result is None):
         raise _api_error(409, "analysis_not_complete", "分析结果还没有准备好")
-    result: AnalysisResult = job.result
+
+    version = job.transcript_version
+    track = await session.scalar(
+        select(TranscriptTrack)
+        .options(selectinload(TranscriptTrack.segments))
+        .where(
+            TranscriptTrack.video_id == job.video_id,
+            TranscriptTrack.language_code == job.source_language,
+            TranscriptTrack.transcript_version == version,
+        )
+        .order_by(TranscriptTrack.created_at.desc())
+    )
+    translated_by_id: dict[str, str] = {}
+    if track is not None:
+        translation = await session.scalar(
+            select(Translation)
+            .where(
+                Translation.track_id == track.id,
+                Translation.target_language == job.target_language,
+                Translation.transcript_version == version,
+            )
+            .order_by(Translation.created_at.desc())
+        )
+        if translation is not None:
+            translated_by_id = {
+                str(segment["segment_id"]): str(segment["text"])
+                for segment in translation.segments
+                if segment.get("segment_id") and segment.get("text") is not None
+            }
+
+    result: AnalysisResult | None = job.result
     return AnalysisResultResponse(
         job_id=job.id,
         video_id=job.video_id,
+        video_title=job.video.title,
+        duration_ms=job.video.duration_ms,
         source_language=job.source_language,
         target_language=job.target_language,
-        one_line_summary=result.one_line_summary,
-        summary_points=result.summary_points,
-        chapters=result.chapters,
-        highlights=result.highlights,
-        model_name=result.model_name,
-        model_version=result.model_version,
+        is_generated=track.is_generated if track is not None else None,
+        one_line_summary=(
+            result.one_line_summary if result else "翻译暂时失败，摘要尚未生成。"
+        ),
+        summary_points=result.summary_points if result else [],
+        chapters=result.chapters if result else [],
+        highlights=result.highlights if result else [],
+        transcript=[
+            TranscriptSegmentResponse(
+                id=segment.id,
+                start_ms=segment.start_ms,
+                duration_ms=segment.duration_ms,
+                original=segment.text,
+                translated=translated_by_id.get(segment.id),
+            )
+            for segment in sorted(
+                track.segments if track is not None else [],
+                key=lambda item: item.sequence,
+            )
+        ],
+        partial=partial,
+        failure_code=job.failure_code if partial else None,
+        model_name=result.model_name if result else "not-generated",
+        model_version=result.model_version if result else "not-generated",
     )
 
 
@@ -238,6 +352,19 @@ def extract_youtube_video_id(url: str) -> str:
     if parsed.scheme not in {"http", "https"} or not _is_video_id(video_id):
         raise _api_error(422, "invalid_youtube_url", "请输入有效的 YouTube 视频链接")
     return video_id
+
+
+def analysis_cache_key(
+    video_id: str,
+    source_language: str,
+    target_language: str,
+    transcript_version: str,
+    pipeline_revision: str,
+) -> str:
+    revision = hashlib.sha256(pipeline_revision.encode()).hexdigest()[:16]
+    return ":".join(
+        [video_id, source_language, target_language, transcript_version, revision]
+    )
 
 
 def _validate_video_id(video_id: str) -> None:

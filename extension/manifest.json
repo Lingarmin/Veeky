@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "先看 · YouTube 视频预览",
+  "version": "0.1.0",
+  "description": "读取公开视频字幕，在观看前生成翻译、摘要与时间轴。",
+  "permissions": ["sidePanel", "storage", "tabs"],
+  "host_permissions": [
+    "https://www.youtube.com/*",
+    "https://youtu.be/*",
+    "http://127.0.0.1:8000/*",
+    "http://localhost:8000/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "打开先看"
+  }
+}

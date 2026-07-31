@@ -5,7 +5,11 @@ from datetime import datetime, timezone
 
 from celery import Celery
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 from sqlalchemy.orm import selectinload
 
 from app.core.settings import get_settings
@@ -16,7 +20,6 @@ from app.db.models import (
     TranscriptTrack,
     Translation,
 )
-from app.db.session import get_session_factory
 from app.services.analysis import (
     AnalysisGenerationError,
     AnalysisSegment,
@@ -37,13 +40,16 @@ from app.services.translation import (
 
 settings = get_settings()
 celery_app = Celery("youtube_preview", broker=settings.redis_url, backend=settings.redis_url)
-celery_app.conf.update(task_acks_late=True, task_track_started=True)
+celery_app.conf.update(
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
+    task_track_started=True,
+)
 
 
 class SqlTranslationCache:
-    def __init__(self, session: AsyncSession, provider_name: str):
+    def __init__(self, session: AsyncSession):
         self.session = session
-        self.provider_name = provider_name
 
     async def get(self, key: TranslationCacheKey) -> list[TranslatedSegment] | None:
         translation = await self.session.scalar(
@@ -51,6 +57,7 @@ class SqlTranslationCache:
                 Translation.track_id == key.track_id,
                 Translation.target_language == key.target_language,
                 Translation.transcript_version == key.transcript_version,
+                Translation.provider == key.provider,
                 Translation.provider_version == key.provider_version,
             )
         )
@@ -65,7 +72,7 @@ class SqlTranslationCache:
             Translation(
                 track_id=key.track_id,
                 target_language=key.target_language,
-                provider=self.provider_name,
+                provider=key.provider,
                 provider_version=key.provider_version,
                 transcript_version=key.transcript_version,
                 segments=[
@@ -94,8 +101,8 @@ class AnalysisPipeline:
         self.translation_provider = translation_provider
         self.analysis_service = analysis_service
 
-    async def run(self, job_id: str) -> None:
-        job = await self._claim(job_id)
+    async def run(self, job_id: str, *, resume: bool = False) -> None:
+        job = await self._claim(job_id, resume=resume)
         if job is None:
             return
 
@@ -120,6 +127,13 @@ class AnalysisPipeline:
                 return
 
             version = transcript_version(inspection.segments)
+            if version != job.transcript_version:
+                await self._fail(
+                    job_id,
+                    "transcript_changed",
+                    "YouTube captions changed after the task was created",
+                )
+                return
             async with self.session_factory() as session:
                 track = await self._persist_transcript(
                     session, job.video_id, inspection, version
@@ -139,7 +153,7 @@ class AnalysisPipeline:
                 for segment in stored_segments
             ]
             async with self.session_factory() as session:
-                cache = SqlTranslationCache(session, self.translation_provider.name)
+                cache = SqlTranslationCache(session)
                 translation_service = CachedTranslationService(
                     self.translation_provider, cache
                 )
@@ -194,7 +208,7 @@ class AnalysisPipeline:
             await self._fail(job_id, "analysis_internal_error", str(error))
             raise
 
-    async def _claim(self, job_id: str) -> AnalysisJob | None:
+    async def _claim(self, job_id: str, *, resume: bool) -> AnalysisJob | None:
         async with self.session_factory() as session:
             job = await session.scalar(
                 select(AnalysisJob)
@@ -202,7 +216,12 @@ class AnalysisPipeline:
                 .where(AnalysisJob.id == job_id)
                 .with_for_update()
             )
-            if job is None or job.status != "queued":
+            resumable = job is not None and job.status in {
+                "fetching_transcript",
+                "translating",
+                "analyzing",
+            }
+            if job is None or (job.status != "queued" and not (resume and resumable)):
                 return None
             job.status = "fetching_transcript"
             await session.commit()
@@ -257,7 +276,9 @@ class AnalysisPipeline:
             await session.commit()
 
 
-def build_default_pipeline() -> AnalysisPipeline:
+def build_default_pipeline(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> AnalysisPipeline:
     current = get_settings()
     translation_key = (
         current.libretranslate_api_key.get_secret_value()
@@ -272,20 +293,41 @@ def build_default_pipeline() -> AnalysisPipeline:
     translation_provider = LibreTranslateProvider(
         current.libretranslate_url,
         api_key=translation_key,
+        version=current.libretranslate_version,
     )
     analysis_provider = HttpAnalysisProvider(
         current.analysis_provider_url,
         model=current.analysis_provider_model,
         api_key=analysis_key,
+        version=(
+            f"{current.analysis_provider_version}"
+            f"+prompt.{current.analysis_prompt_version}"
+        ),
     )
     return AnalysisPipeline(
-        get_session_factory(),
+        session_factory,
         TranscriptService(),
         translation_provider,
         StructuredAnalysisService(analysis_provider),
     )
 
 
-@celery_app.task(name="analysis.analyze_video")
-def analyze_video(job_id: str) -> None:
-    asyncio.run(build_default_pipeline().run(job_id))
+async def run_analysis_task(job_id: str, *, resume: bool = False) -> None:
+    current = get_settings()
+    engine = create_async_engine(current.database_url, pool_pre_ping=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        await build_default_pipeline(session_factory).run(job_id, resume=resume)
+    finally:
+        await engine.dispose()
+
+
+@celery_app.task(bind=True, name="analysis.analyze_video")
+def analyze_video(task, job_id: str) -> None:
+    delivery_info = task.request.delivery_info or {}
+    asyncio.run(
+        run_analysis_task(
+            job_id,
+            resume=bool(delivery_info.get("redelivered")),
+        )
+    )

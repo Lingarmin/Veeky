@@ -28,15 +28,15 @@ class TimedSummary(BaseModel):
 
 
 class Highlight(TimedSummary):
-    original_excerpt: str = ""
-    translated_excerpt: str = ""
+    original_excerpt: str = Field(min_length=1)
+    translated_excerpt: str = Field(min_length=1)
 
 
 class AnalysisPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     one_line_summary: str = Field(min_length=1)
-    summary_points: list[str] = Field(min_length=1, max_length=10)
+    summary_points: list[str] = Field(min_length=3, max_length=6)
     chapters: list[TimedSummary] = Field(min_length=1)
     highlights: list[Highlight] = Field(default_factory=list)
 
@@ -76,7 +76,11 @@ class StructuredAnalysisService:
     ) -> AnalysisResult:
         last_error: Exception | None = None
         for _ in range(self.max_attempts):
-            raw = await self.provider.analyze(segments, target_language)
+            try:
+                raw = await self.provider.analyze(segments, target_language)
+            except AnalysisGenerationError as error:
+                last_error = error
+                continue
             try:
                 payload = AnalysisPayload.model_validate(raw)
                 _validate_timestamps(payload, duration_ms)
@@ -92,6 +96,8 @@ class StructuredAnalysisService:
                 model_version=self.provider.version,
                 generated_at=datetime.now(timezone.utc),
             )
+        if isinstance(last_error, AnalysisGenerationError):
+            raise AnalysisGenerationError(last_error.code, str(last_error)) from last_error
         raise AnalysisGenerationError(
             "analysis_invalid_response",
             f"Analysis provider did not return a valid result: {last_error}",
@@ -124,6 +130,11 @@ class HttpAnalysisProvider:
         payload = {
             "model": self.name,
             "targetLanguage": target_language,
+            "instructions": (
+                "Summarize the timestamped transcript in targetLanguage. Return only "
+                "JSON matching responseSchema. Keep chapters chronological, use 3 to 6 "
+                "summary points, and ground every chapter and highlight in the transcript."
+            ),
             "transcript": [asdict(segment) for segment in segments],
             "responseSchema": AnalysisPayload.model_json_schema(),
         }

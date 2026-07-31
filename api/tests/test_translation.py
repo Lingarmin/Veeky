@@ -67,6 +67,31 @@ async def test_batches_without_splitting_segments_and_preserves_ids():
 
 
 @pytest.mark.asyncio
+async def test_maps_product_language_codes_to_libretranslate_codes():
+    client = FakeHttpClient()
+    provider = LibreTranslateProvider("http://translate:5000", client=client)
+
+    await provider.translate(segments("Hello"), "en-US", "zh-Hans")
+    await provider.translate(segments("你好"), "zh-Hant", "en")
+
+    assert client.requests[0]["json"]["source"] == "en"
+    assert client.requests[0]["json"]["target"] == "zh"
+    assert client.requests[1]["json"]["source"] == "zt"
+    assert client.requests[1]["json"]["target"] == "en"
+
+
+@pytest.mark.asyncio
+async def test_same_language_returns_source_without_http_request():
+    client = FakeHttpClient()
+    provider = LibreTranslateProvider("http://translate:5000", client=client)
+
+    result = await provider.translate(segments("你好"), "zh-CN", "zh-Hans")
+
+    assert result[0].text == "你好"
+    assert client.requests == []
+
+
+@pytest.mark.asyncio
 async def test_retries_network_and_server_errors_at_most_three_times():
     import httpx
 
@@ -128,3 +153,24 @@ async def test_cache_hit_does_not_call_provider():
 
     assert second == first
     assert len(client.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_cache_does_not_cross_translation_providers():
+    cache = MemoryCache()
+    first_client = FakeHttpClient()
+    first_provider = LibreTranslateProvider("http://first:5000", client=first_client)
+    second_client = FakeHttpClient()
+    second_provider = LibreTranslateProvider("http://second:5000", client=second_client)
+    second_provider.name = "llm-translation"
+    source = segments("Hello")
+
+    await CachedTranslationService(first_provider, cache).translate(
+        "track-1", source, "en", "zh", "sha256:abc"
+    )
+    await CachedTranslationService(second_provider, cache).translate(
+        "track-1", source, "en", "zh", "sha256:abc"
+    )
+
+    assert len(first_client.requests) == 1
+    assert len(second_client.requests) == 1

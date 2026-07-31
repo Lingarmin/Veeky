@@ -105,6 +105,7 @@ class Translation(Base):
             "track_id",
             "target_language",
             "transcript_version",
+            "provider",
             "provider_version",
             name="uq_translation_cache_key",
         ),
@@ -141,6 +142,7 @@ class AnalysisJob(Base):
     )
     source_language: Mapped[str] = mapped_column(String(35))
     target_language: Mapped[str] = mapped_column(String(35))
+    transcript_version: Mapped[str] = mapped_column(String(100))
     cache_key: Mapped[str] = mapped_column(String(300), unique=True)
     status: Mapped[str] = mapped_column(String(40), default="queued")
     failure_code: Mapped[str | None] = mapped_column(String(80), nullable=True)

@@ -34,7 +34,6 @@ services:
     image: libretranslate/libretranslate:v1.6.5
     environment:
       LT_DISABLE_WEB_UI: "true"
-      LT_LOAD_ONLY: en,zh
     ports:
       - "127.0.0.1:5000:5000"
     restart: unless-stopped

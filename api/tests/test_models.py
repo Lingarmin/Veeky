@@ -70,11 +70,52 @@ async def test_translation_cache_key_is_unique(session):
 
 
 @pytest.mark.asyncio
+async def test_translation_cache_allows_same_version_from_different_providers(session):
+    video = Video(
+        video_id="aircAruvnKk",
+        title="But what is a neural network?",
+        duration_ms=1_159_000,
+        source_url="https://www.youtube.com/watch?v=aircAruvnKk",
+    )
+    track = TranscriptTrack(
+        video=video,
+        language_code="en",
+        language_name="English",
+        is_generated=False,
+        is_translatable=True,
+        transcript_version="sha256:abc",
+    )
+    session.add_all(
+        [
+            Translation(
+                track=track,
+                target_language="zh-Hans",
+                provider="libretranslate",
+                provider_version="v1",
+                transcript_version="sha256:abc",
+                segments=[],
+            ),
+            Translation(
+                track=track,
+                target_language="zh-Hans",
+                provider="llm-translation",
+                provider_version="v1",
+                transcript_version="sha256:abc",
+                segments=[],
+            ),
+        ]
+    )
+
+    await session.commit()
+
+
+@pytest.mark.asyncio
 async def test_analysis_job_starts_queued_and_uses_utc_timestamp(session):
     job = AnalysisJob(
         video_id="aircAruvnKk",
         source_language="en",
         target_language="zh-Hans",
+        transcript_version="sha256:abc",
         cache_key="aircAruvnKk:en:zh-Hans",
     )
     session.add(job)

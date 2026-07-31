@@ -1,14 +1,26 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from app.api.analyses import get_job_dispatcher, get_session, get_transcript_service
+from app.api.analyses import (
+    get_job_dispatcher,
+    get_pipeline_revision,
+    get_session,
+    get_transcript_service,
+)
 from app.core.settings import Settings
-from app.db.models import AnalysisResult, Base
+from app.db.models import (
+    AnalysisResult,
+    Base,
+    TranscriptSegment as StoredTranscriptSegment,
+    TranscriptTrack,
+    Translation,
+)
 from app.main import create_app
 from app.services.transcripts import (
     TranscriptInspection,
@@ -40,8 +52,8 @@ class FakeTranscriptService:
 
 
 @pytest.fixture
-async def api_context():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+async def api_context(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'api.sqlite'}")
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -128,6 +140,25 @@ async def test_create_reuses_active_and_completed_jobs(api_context):
 
 
 @pytest.mark.asyncio
+async def test_concurrent_create_requests_reuse_one_job(api_context):
+    client, _, _, dispatched = api_context
+    payload = {
+        "videoId": "aircAruvnKk",
+        "sourceLanguage": "en",
+        "targetLanguage": "zh-Hans",
+    }
+
+    first, second = await asyncio.gather(
+        client.post("/v1/analyses", json=payload),
+        client.post("/v1/analyses", json=payload),
+    )
+
+    assert {first.status_code, second.status_code} == {202}
+    assert first.json()["jobId"] == second.json()["jobId"]
+    assert dispatched == [first.json()["jobId"]]
+
+
+@pytest.mark.asyncio
 async def test_status_and_result_endpoints(api_context):
     client, _, factory, _ = api_context
     created = await client.post(
@@ -158,8 +189,148 @@ async def test_status_and_result_endpoints(api_context):
             model_name="fake",
             model_version="test",
         )
+        version = job.transcript_version
+        track = TranscriptTrack(
+            video_id=job.video_id,
+            language_code="en",
+            language_name="English",
+            is_generated=False,
+            is_translatable=True,
+            transcript_version=version,
+        )
+        track.segments = [
+            StoredTranscriptSegment(
+                sequence=0,
+                start_ms=0,
+                duration_ms=1500,
+                text="Hello world",
+            )
+        ]
+        session.add(track)
+        await session.flush()
+        session.add(
+            Translation(
+                track_id=track.id,
+                target_language="zh-Hans",
+                provider="fake",
+                provider_version="test",
+                transcript_version=version,
+                segments=[
+                    {
+                        "segment_id": track.segments[0].id,
+                        "start_ms": 0,
+                        "duration_ms": 1500,
+                        "text": "你好，世界",
+                    }
+                ],
+            )
+        )
         await session.commit()
 
     result = await client.get(f"/v1/analyses/{job_id}/result")
     assert result.status_code == 200
     assert result.json()["oneLineSummary"] == "神经网络从样本中学习。"
+    assert result.json()["videoTitle"] == "YouTube video aircAruvnKk"
+    assert result.json()["durationMs"] == 1500
+    assert result.json()["isGenerated"] is False
+    assert result.json()["transcript"] == [
+        {
+            "id": result.json()["transcript"][0]["id"],
+            "startMs": 0,
+            "durationMs": 1500,
+            "original": "Hello world",
+            "translated": "你好，世界",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_translation_failure_returns_original_transcript(api_context):
+    client, _, factory, _ = api_context
+    created = await client.post(
+        "/v1/analyses",
+        json={
+            "videoId": "aircAruvnKk",
+            "sourceLanguage": "en",
+            "targetLanguage": "zh-Hans",
+        },
+    )
+    job_id = created.json()["jobId"]
+
+    from app.db.models import AnalysisJob
+
+    async with factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        version = job.transcript_version
+        job.status = "failed"
+        job.failure_code = "translation_failed"
+        track = TranscriptTrack(
+            video_id=job.video_id,
+            language_code="en",
+            language_name="English",
+            is_generated=True,
+            is_translatable=True,
+            transcript_version=version,
+        )
+        track.segments = [
+            StoredTranscriptSegment(
+                sequence=0,
+                start_ms=0,
+                duration_ms=1500,
+                text="Hello world",
+            )
+        ]
+        session.add(track)
+        await session.commit()
+
+    result = await client.get(f"/v1/analyses/{job_id}/result")
+
+    assert result.status_code == 200
+    assert result.json()["partial"] is True
+    assert result.json()["failureCode"] == "translation_failed"
+    assert result.json()["isGenerated"] is True
+    assert result.json()["transcript"][0]["original"] == "Hello world"
+    assert result.json()["transcript"][0]["translated"] is None
+
+
+@pytest.mark.asyncio
+async def test_pipeline_revision_change_creates_a_new_job(api_context):
+    client, app, _, dispatched = api_context
+    payload = {
+        "videoId": "aircAruvnKk",
+        "sourceLanguage": "en",
+        "targetLanguage": "zh-Hans",
+    }
+    first = await client.post("/v1/analyses", json=payload)
+    app.dependency_overrides[get_pipeline_revision] = lambda: "next-pipeline"
+
+    second = await client.post("/v1/analyses", json=payload)
+
+    assert second.status_code == 202
+    assert second.json()["jobId"] != first.json()["jobId"]
+    assert dispatched == [first.json()["jobId"], second.json()["jobId"]]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_failure_can_be_retried(api_context):
+    client, app, _, dispatched = api_context
+
+    def fail_dispatch(_job_id):
+        raise ConnectionError("redis unavailable")
+
+    app.dependency_overrides[get_job_dispatcher] = lambda: fail_dispatch
+    payload = {
+        "videoId": "aircAruvnKk",
+        "sourceLanguage": "en",
+        "targetLanguage": "zh-Hans",
+    }
+    failed = await client.post("/v1/analyses", json=payload)
+
+    assert failed.status_code == 503
+    assert failed.json()["detail"]["code"] == "dispatch_failed"
+
+    app.dependency_overrides[get_job_dispatcher] = lambda: dispatched.append
+    retried = await client.post("/v1/analyses", json=payload)
+
+    assert retried.status_code == 202
+    assert dispatched == [retried.json()["jobId"]]

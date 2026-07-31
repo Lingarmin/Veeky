@@ -18,9 +18,12 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     libretranslate_url: str = "http://localhost:5000"
     libretranslate_api_key: SecretStr | None = None
+    libretranslate_version: str = "1.6.5"
     analysis_provider_api_key: SecretStr | None = None
     analysis_provider_url: str = ""
     analysis_provider_model: str = "configured-model"
+    analysis_provider_version: str = "v1"
+    analysis_prompt_version: str = "v1"
     allowed_chrome_extension_origins: list[str] = Field(default_factory=list)
 
 

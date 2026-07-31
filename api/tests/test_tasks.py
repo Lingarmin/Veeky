@@ -11,6 +11,7 @@ from app.services.transcripts import (
     TranscriptInspection,
     TranscriptSegment,
     TranscriptTrackInfo,
+    transcript_version,
 )
 from app.services.translation import TranslatedSegment, TranslationProviderError
 from app.workers.tasks import AnalysisPipeline
@@ -69,7 +70,7 @@ class FakeAnalysisService:
         assert all(isinstance(item, AnalysisSegment) for item in segments)
         return AnalysisResult(
             one_line_summary="神经网络从像素中学习。",
-            summary_points=["像素进入输入层"],
+            summary_points=["像素进入输入层", "权重控制连接", "偏置调整激活"],
             chapters=[TimedSummary(start_ms=0, end_ms=2000, title="输入", summary="像素")],
             highlights=[
                 Highlight(
@@ -93,6 +94,8 @@ async def pipeline_context():
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
+    transcript = FakeTranscriptService().inspect("aircAruvnKk").segments
+    version = transcript_version(transcript)
     async with factory() as session:
         video = Video(
             video_id="aircAruvnKk",
@@ -104,7 +107,8 @@ async def pipeline_context():
             video=video,
             source_language="en",
             target_language="zh-Hans",
-            cache_key="aircAruvnKk:en:zh-Hans:version",
+            transcript_version=version,
+            cache_key=f"aircAruvnKk:en:zh-Hans:{version}:revision",
         )
         session.add(job)
         await session.commit()
@@ -189,3 +193,48 @@ async def test_completed_job_is_idempotent(pipeline_context):
     await pipeline.run(job_id)
 
     assert transcript_service.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_redelivered_in_progress_job_resumes(pipeline_context):
+    factory, job_id = pipeline_context
+    async with factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        job.status = "fetching_transcript"
+        await session.commit()
+    pipeline = AnalysisPipeline(
+        factory,
+        FakeTranscriptService(),
+        FakeTranslationProvider(),
+        FakeAnalysisService(),
+    )
+
+    await pipeline.run(job_id, resume=True)
+
+    async with factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        assert job.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_changed_transcript_fails_before_persistence(pipeline_context):
+    factory, job_id = pipeline_context
+    async with factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        job.transcript_version = "outdated-version"
+        await session.commit()
+    pipeline = AnalysisPipeline(
+        factory,
+        FakeTranscriptService(),
+        FakeTranslationProvider(),
+        FakeAnalysisService(),
+    )
+
+    await pipeline.run(job_id)
+
+    async with factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        segment_count = await session.scalar(select(func.count()).select_from(StoredSegment))
+        assert job.status == "failed"
+        assert job.failure_code == "transcript_changed"
+        assert segment_count == 0

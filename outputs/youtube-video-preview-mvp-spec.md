@@ -1,6 +1,6 @@
 # YouTube 视频预览工具 MVP：产品需求与技术实施方案
 
-**状态：** 已确认，等待实施
+**状态：** MVP 已实现，待内部联调
 
 ## 1. 产品定义
 
@@ -118,7 +118,7 @@ Chrome Side Panel <- FastAPI: 轮询任务状态和读取结果
 字幕和译文必须分开保存。翻译缓存键为：
 
 ```text
-videoId + sourceLanguage + targetLanguage + transcriptVersion + providerVersion
+videoId + sourceLanguage + targetLanguage + transcriptVersion + provider + providerVersion
 ```
 
 ### 6.2 API
