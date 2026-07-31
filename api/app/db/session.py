@@ -11,6 +11,10 @@ _engine = create_async_engine(get_settings().database_url, pool_pre_ping=True)
 _session_factory = async_sessionmaker(_engine, expire_on_commit=False)
 
 
+def get_session_factory() -> async_sessionmaker[AsyncSession]:
+    return _session_factory
+
+
 async def get_session() -> AsyncIterator[AsyncSession]:
     async with _session_factory() as session:
         yield session

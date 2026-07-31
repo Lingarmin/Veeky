@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Callable
 from urllib.parse import parse_qs, urlparse
 
@@ -13,7 +12,7 @@ from sqlalchemy.orm import selectinload
 
 from app.db.models import AnalysisJob, AnalysisResult, Video
 from app.db.session import get_session
-from app.services.transcripts import TranscriptInspection, TranscriptService
+from app.services.transcripts import TranscriptInspection, TranscriptService, transcript_version
 
 
 router = APIRouter(prefix="/v1")
@@ -131,9 +130,9 @@ async def create_analysis(
     if inspection.selected is None or inspection.selected.language_code != request.source_language:
         raise _api_error(422, "source_language_unavailable", "所选字幕语言不可读取")
 
-    transcript_version = _transcript_version(inspection)
+    version = transcript_version(inspection.segments)
     cache_key = ":".join(
-        [request.video_id, request.source_language, request.target_language, transcript_version]
+        [request.video_id, request.source_language, request.target_language, version]
     )
     existing = await session.scalar(select(AnalysisJob).where(AnalysisJob.cache_key == cache_key))
     if existing and existing.status != "failed":
@@ -248,15 +247,6 @@ def _validate_video_id(video_id: str) -> None:
 
 def _is_video_id(video_id: str) -> bool:
     return len(video_id) == 11 and all(character.isalnum() or character in "-_" for character in video_id)
-
-
-def _transcript_version(inspection: TranscriptInspection) -> str:
-    digest = hashlib.sha256()
-    for segment in inspection.segments:
-        digest.update(
-            f"{segment.sequence}:{segment.start_ms}:{segment.duration_ms}:{segment.text}\n".encode()
-        )
-    return digest.hexdigest()
 
 
 def _require_available_transcript(inspection: TranscriptInspection) -> None:

@@ -1,0 +1,291 @@
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timezone
+
+from celery import Celery
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import selectinload
+
+from app.core.settings import get_settings
+from app.db.models import (
+    AnalysisJob,
+    AnalysisResult as StoredAnalysisResult,
+    TranscriptSegment as StoredTranscriptSegment,
+    TranscriptTrack,
+    Translation,
+)
+from app.db.session import get_session_factory
+from app.services.analysis import (
+    AnalysisGenerationError,
+    AnalysisSegment,
+    HttpAnalysisProvider,
+    StructuredAnalysisService,
+)
+from app.services.transcripts import TranscriptService, transcript_version
+from app.services.translation import (
+    CachedTranslationService,
+    LibreTranslateProvider,
+    TranslatedSegment,
+    TranslationCacheKey,
+    TranslationProvider,
+    TranslationProviderError,
+    TranslationSegment,
+)
+
+
+settings = get_settings()
+celery_app = Celery("youtube_preview", broker=settings.redis_url, backend=settings.redis_url)
+celery_app.conf.update(task_acks_late=True, task_track_started=True)
+
+
+class SqlTranslationCache:
+    def __init__(self, session: AsyncSession, provider_name: str):
+        self.session = session
+        self.provider_name = provider_name
+
+    async def get(self, key: TranslationCacheKey) -> list[TranslatedSegment] | None:
+        translation = await self.session.scalar(
+            select(Translation).where(
+                Translation.track_id == key.track_id,
+                Translation.target_language == key.target_language,
+                Translation.transcript_version == key.transcript_version,
+                Translation.provider_version == key.provider_version,
+            )
+        )
+        if translation is None:
+            return None
+        return [TranslatedSegment(**segment) for segment in translation.segments]
+
+    async def put(
+        self, key: TranslationCacheKey, value: list[TranslatedSegment]
+    ) -> None:
+        self.session.add(
+            Translation(
+                track_id=key.track_id,
+                target_language=key.target_language,
+                provider=self.provider_name,
+                provider_version=key.provider_version,
+                transcript_version=key.transcript_version,
+                segments=[
+                    {
+                        "segment_id": segment.segment_id,
+                        "start_ms": segment.start_ms,
+                        "duration_ms": segment.duration_ms,
+                        "text": segment.text,
+                    }
+                    for segment in value
+                ],
+            )
+        )
+
+
+class AnalysisPipeline:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        transcript_service: TranscriptService,
+        translation_provider: TranslationProvider,
+        analysis_service: StructuredAnalysisService,
+    ):
+        self.session_factory = session_factory
+        self.transcript_service = transcript_service
+        self.translation_provider = translation_provider
+        self.analysis_service = analysis_service
+
+    async def run(self, job_id: str) -> None:
+        job = await self._claim(job_id)
+        if job is None:
+            return
+
+        try:
+            inspection = await asyncio.to_thread(
+                self.transcript_service.inspect,
+                job.video_id,
+                [job.source_language],
+            )
+            if not inspection.available:
+                await self._fail(
+                    job_id,
+                    inspection.failure_code or "transcript_unavailable",
+                    inspection.failure_detail,
+                )
+                return
+            if (
+                inspection.selected is None
+                or inspection.selected.language_code != job.source_language
+            ):
+                await self._fail(job_id, "source_language_unavailable", None)
+                return
+
+            version = transcript_version(inspection.segments)
+            async with self.session_factory() as session:
+                track = await self._persist_transcript(
+                    session, job.video_id, inspection, version
+                )
+                stored_segments = list(track.segments)
+                job_row = await session.get(AnalysisJob, job_id)
+                job_row.status = "translating"
+                await session.commit()
+
+            translation_inputs = [
+                TranslationSegment(
+                    segment_id=segment.id,
+                    start_ms=segment.start_ms,
+                    duration_ms=segment.duration_ms,
+                    text=segment.text,
+                )
+                for segment in stored_segments
+            ]
+            async with self.session_factory() as session:
+                cache = SqlTranslationCache(session, self.translation_provider.name)
+                translation_service = CachedTranslationService(
+                    self.translation_provider, cache
+                )
+                translated = await translation_service.translate(
+                    track.id,
+                    translation_inputs,
+                    job.source_language,
+                    job.target_language,
+                    version,
+                )
+                job_row = await session.get(AnalysisJob, job_id)
+                job_row.status = "analyzing"
+                await session.commit()
+
+            translated_by_id = {item.segment_id: item for item in translated}
+            analysis_segments = [
+                AnalysisSegment(
+                    segment_id=segment.id,
+                    start_ms=segment.start_ms,
+                    duration_ms=segment.duration_ms,
+                    original=segment.text,
+                    translated=translated_by_id[segment.id].text,
+                )
+                for segment in stored_segments
+            ]
+            result = await self.analysis_service.analyze(
+                analysis_segments,
+                job.target_language,
+                duration_ms=job.video.duration_ms,
+            )
+            async with self.session_factory() as session:
+                job_row = await session.get(AnalysisJob, job_id)
+                job_row.status = "completed"
+                job_row.completed_at = datetime.now(timezone.utc)
+                job_row.failure_code = None
+                job_row.failure_detail = None
+                job_row.result = StoredAnalysisResult(
+                    one_line_summary=result.one_line_summary,
+                    summary_points=result.summary_points,
+                    chapters=[chapter.model_dump() for chapter in result.chapters],
+                    highlights=[highlight.model_dump() for highlight in result.highlights],
+                    model_name=result.model_name,
+                    model_version=result.model_version,
+                    generated_at=result.generated_at,
+                )
+                await session.commit()
+        except TranslationProviderError as error:
+            await self._fail(job_id, "translation_failed", f"{error.code}: {error}")
+        except AnalysisGenerationError as error:
+            await self._fail(job_id, error.code, str(error))
+        except Exception as error:
+            await self._fail(job_id, "analysis_internal_error", str(error))
+            raise
+
+    async def _claim(self, job_id: str) -> AnalysisJob | None:
+        async with self.session_factory() as session:
+            job = await session.scalar(
+                select(AnalysisJob)
+                .options(selectinload(AnalysisJob.video))
+                .where(AnalysisJob.id == job_id)
+                .with_for_update()
+            )
+            if job is None or job.status != "queued":
+                return None
+            job.status = "fetching_transcript"
+            await session.commit()
+            return job
+
+    async def _persist_transcript(self, session, video_id, inspection, version):
+        selected = inspection.selected
+        track = await session.scalar(
+            select(TranscriptTrack)
+            .options(selectinload(TranscriptTrack.segments))
+            .where(
+                TranscriptTrack.video_id == video_id,
+                TranscriptTrack.language_code == selected.language_code,
+                TranscriptTrack.is_generated == selected.is_generated,
+                TranscriptTrack.transcript_version == version,
+            )
+        )
+        if track is not None:
+            return track
+        track = TranscriptTrack(
+            video_id=video_id,
+            language_code=selected.language_code,
+            language_name=selected.language_name,
+            is_generated=selected.is_generated,
+            is_translatable=selected.is_translatable,
+            transcript_version=version,
+        )
+        track.segments = [
+            StoredTranscriptSegment(
+                sequence=segment.sequence,
+                start_ms=segment.start_ms,
+                duration_ms=segment.duration_ms,
+                text=segment.text,
+            )
+            for segment in inspection.segments
+        ]
+        session.add(track)
+        await session.flush()
+        return track
+
+    async def _fail(
+        self, job_id: str, failure_code: str, failure_detail: str | None
+    ) -> None:
+        async with self.session_factory() as session:
+            job = await session.get(AnalysisJob, job_id)
+            if job is None:
+                return
+            job.status = "failed"
+            job.failure_code = failure_code
+            job.failure_detail = failure_detail
+            job.completed_at = datetime.now(timezone.utc)
+            await session.commit()
+
+
+def build_default_pipeline() -> AnalysisPipeline:
+    current = get_settings()
+    translation_key = (
+        current.libretranslate_api_key.get_secret_value()
+        if current.libretranslate_api_key
+        else None
+    )
+    analysis_key = (
+        current.analysis_provider_api_key.get_secret_value()
+        if current.analysis_provider_api_key
+        else None
+    )
+    translation_provider = LibreTranslateProvider(
+        current.libretranslate_url,
+        api_key=translation_key,
+    )
+    analysis_provider = HttpAnalysisProvider(
+        current.analysis_provider_url,
+        model=current.analysis_provider_model,
+        api_key=analysis_key,
+    )
+    return AnalysisPipeline(
+        get_session_factory(),
+        TranscriptService(),
+        translation_provider,
+        StructuredAnalysisService(analysis_provider),
+    )
+
+
+@celery_app.task(name="analysis.analyze_video")
+def analyze_video(job_id: str) -> None:
+    asyncio.run(build_default_pipeline().run(job_id))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 from typing import Any, Iterable, Sequence
 
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -158,6 +159,15 @@ def _normalize_segments(raw_segments: Iterable[Any]) -> list[TranscriptSegment]:
             )
         )
     return result
+
+
+def transcript_version(segments: Sequence[TranscriptSegment]) -> str:
+    digest = hashlib.sha256()
+    for segment in segments:
+        digest.update(
+            f"{segment.sequence}:{segment.start_ms}:{segment.duration_ms}:{segment.text}\n".encode()
+        )
+    return digest.hexdigest()
 
 
 def _failure_code(error: Exception) -> str:
