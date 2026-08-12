@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 
@@ -93,7 +94,13 @@ async def test_api_pipeline_returns_timestamped_transcript_and_reuses_result():
     factory = async_sessionmaker(engine, expire_on_commit=False)
     transcript_service = FixedTranscriptService()
     translation_provider = FixedTranslationProvider()
-    app = create_app(Settings())
+    app = create_app(
+        Settings(
+            llm_credential_encryption_key=base64.b64encode(b"v" * 32).decode(
+                "ascii"
+            )
+        )
+    )
 
     async def session_dependency() -> AsyncIterator[AsyncSession]:
         async with factory() as session:

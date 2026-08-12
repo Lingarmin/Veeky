@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -35,6 +35,7 @@ from app.services.llm import (
     normalize_provider_config,
 )
 from app.security.installations import require_installation
+from app.security.credentials import JobCredentialCipher
 
 
 router = APIRouter(prefix="/v1")
@@ -198,6 +199,19 @@ def get_job_dispatcher() -> JobDispatcher:
     return dispatch_analysis_job
 
 
+def get_job_credential_cipher(
+    settings: Settings = Depends(get_settings),
+) -> JobCredentialCipher:
+    try:
+        return JobCredentialCipher(settings.llm_credential_encryption_key)
+    except ValueError as error:
+        raise _api_error(
+            503,
+            "credential_protection_unavailable",
+            "服务端凭据保护尚未配置",
+        ) from error
+
+
 def get_pipeline_revision(settings: Settings = Depends(get_settings)) -> str:
     return "|".join(
         [
@@ -236,8 +250,10 @@ async def create_analysis(
     session: AsyncSession = Depends(get_session),
     transcript_service: TranscriptService = Depends(get_transcript_service),
     dispatcher: JobDispatcher = Depends(get_job_dispatcher),
-    pipeline_revision: str = Depends(get_pipeline_revision),
     installation: Installation = Depends(require_installation),
+    credential_cipher: JobCredentialCipher = Depends(get_job_credential_cipher),
+    pipeline_revision: str = Depends(get_pipeline_revision),
+    settings: Settings = Depends(get_settings),
 ) -> AnalysisCreateResponse:
     installation_id = installation.id
     _validate_llm_config(request.llm_config)
@@ -271,6 +287,12 @@ async def create_analysis(
             # A worker can disappear after claiming a job. Re-queue the job when
             # the user explicitly starts the same analysis again.
             existing.status = "queued"
+            _store_llm_credential(
+                existing,
+                request.llm_config,
+                credential_cipher,
+                settings.llm_credential_ttl_seconds,
+            )
             await session.commit()
             try:
                 dispatcher(existing.id)
@@ -279,6 +301,7 @@ async def create_analysis(
                 existing.failure_code = "worker_unavailable"
                 existing.failure_detail = str(error)
                 existing.completed_at = datetime.now(timezone.utc)
+                _clear_llm_credential(existing)
                 await session.commit()
                 raise _api_error(
                     503,
@@ -290,6 +313,7 @@ async def create_analysis(
                 existing.failure_code = "dispatch_failed"
                 existing.failure_detail = str(error)
                 existing.completed_at = datetime.now(timezone.utc)
+                _clear_llm_credential(existing)
                 await session.commit()
                 raise _api_error(
                     503, "dispatch_failed", "后台任务暂时无法启动，请重试"
@@ -315,7 +339,9 @@ async def create_analysis(
         video.duration_ms = duration_ms
 
     if existing is None:
+        job_id = str(uuid.uuid4())
         job = AnalysisJob(
+            id=job_id,
             installation_id=installation_id,
             video_id=request.video_id,
             source_language=request.source_language,
@@ -323,6 +349,12 @@ async def create_analysis(
             transcript_version=version,
             cache_key=cache_key,
             llm_config=_llm_snapshot(request.llm_config),
+        )
+        _store_llm_credential(
+            job,
+            request.llm_config,
+            credential_cipher,
+            settings.llm_credential_ttl_seconds,
         )
         session.add(job)
     else:
@@ -333,6 +365,12 @@ async def create_analysis(
         job.completed_at = None
         job.transcript_version = version
         job.llm_config = _llm_snapshot(request.llm_config)
+        _store_llm_credential(
+            job,
+            request.llm_config,
+            credential_cipher,
+            settings.llm_credential_ttl_seconds,
+        )
 
     try:
         await session.commit()
@@ -360,6 +398,7 @@ async def create_analysis(
         job.failure_code = "worker_unavailable"
         job.failure_detail = str(error)
         job.completed_at = datetime.now(timezone.utc)
+        _clear_llm_credential(job)
         await session.commit()
         raise _api_error(
             503,
@@ -371,6 +410,7 @@ async def create_analysis(
         job.failure_code = "dispatch_failed"
         job.failure_detail = str(error)
         job.completed_at = datetime.now(timezone.utc)
+        _clear_llm_credential(job)
         await session.commit()
         raise _api_error(503, "dispatch_failed", "后台任务暂时无法启动，请重试") from error
     response.status_code = 202
@@ -631,9 +671,28 @@ def _llm_snapshot(config: LlmConfigRequest) -> dict[str, str]:
     return {
         "provider": normalized.provider,
         "api_url": normalized.api_url,
-        "api_key": normalized.api_key,
         "model": normalized.model,
     }
+
+
+def _store_llm_credential(
+    job: AnalysisJob,
+    config: LlmConfigRequest,
+    cipher: JobCredentialCipher,
+    ttl_seconds: int,
+) -> None:
+    normalized = normalize_provider_config(
+        config.provider, config.api_url, config.api_key, config.model
+    )
+    job.llm_credential_ciphertext = cipher.encrypt(job.id, normalized.api_key)
+    job.llm_credential_expires_at = datetime.now(timezone.utc) + timedelta(
+        seconds=ttl_seconds
+    )
+
+
+def _clear_llm_credential(job: AnalysisJob) -> None:
+    job.llm_credential_ciphertext = None
+    job.llm_credential_expires_at = None
 
 
 def _is_video_id(video_id: str) -> bool:

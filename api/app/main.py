@@ -91,6 +91,7 @@ async def health(
 def create_app(settings: Settings | None = None) -> FastAPI:
     application_settings = settings or get_settings()
     application = FastAPI(title="YouTube Preview API")
+    application.dependency_overrides[get_settings] = lambda: application_settings
     local_extension_origin_pattern = (
         r"chrome-extension://[a-p]{32}"
         if (

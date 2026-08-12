@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
 
@@ -14,6 +15,7 @@ from app.api.analyses import (
     dispatch_analysis_job,
     get_job_dispatcher,
     get_pipeline_revision,
+    get_job_credential_cipher,
     get_session,
     get_transcript_service,
 )
@@ -34,6 +36,7 @@ from app.services.transcripts import (
     TranscriptSegment,
     TranscriptTrackInfo,
 )
+from app.security.credentials import JobCredentialCipher
 
 
 class FakeTranscriptService:
@@ -59,6 +62,7 @@ class FakeTranscriptService:
 
 
 LLM_CONFIG = {"apiUrl": "https://api.example.com/v1", "apiKey": "test-key"}
+VALID_TEST_KEY = base64.b64encode(b"v" * 32).decode("ascii")
 INSTALLATION_ID = "11111111-1111-4111-8111-111111111111"
 INSTALLATION_TOKEN = "installation-token-with-at-least-forty-three-characters"
 AUTH_HEADERS = {
@@ -80,7 +84,7 @@ async def api_context(tmp_path):
         await connection.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
 
-    app = create_app(Settings())
+    app = create_app(Settings(llm_credential_encryption_key=VALID_TEST_KEY))
     dispatched = []
 
     async def session_dependency() -> AsyncIterator[AsyncSession]:
@@ -90,6 +94,9 @@ async def api_context(tmp_path):
     app.dependency_overrides[get_session] = session_dependency
     app.dependency_overrides[get_transcript_service] = lambda: FakeTranscriptService()
     app.dependency_overrides[get_job_dispatcher] = lambda: dispatched.append
+    app.dependency_overrides[get_job_credential_cipher] = lambda: JobCredentialCipher(
+        VALID_TEST_KEY
+    )
 
     async with AsyncClient(
         transport=ASGITransport(app=app),
@@ -156,6 +163,34 @@ async def test_create_requires_llm_configuration(api_context):
     assert response.status_code == 422
     assert response.json()["detail"]["code"] == "llm_config_required"
     assert dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_create_stores_only_encrypted_temporary_llm_credential(api_context):
+    client, _, factory, _ = api_context
+
+    response = await client.post(
+        "/v1/analyses",
+        json={
+            "videoId": "aircAruvnKk",
+            "sourceLanguage": "en",
+            "targetLanguage": "zh-Hans",
+            "llmConfig": LLM_CONFIG,
+        },
+    )
+
+    assert response.status_code == 202
+    async with factory() as session:
+        job = await session.get(AnalysisJob, response.json()["jobId"])
+        assert "api_key" not in job.llm_config
+        assert "test-key" not in job.llm_credential_ciphertext
+        assert job.llm_credential_expires_at is not None
+        assert (
+            JobCredentialCipher(VALID_TEST_KEY).decrypt(
+                job.id, job.llm_credential_ciphertext
+            )
+            == "test-key"
+        )
 
 
 @pytest.mark.asyncio
@@ -754,7 +789,7 @@ async def test_pipeline_revision_change_creates_a_new_job(api_context):
 
 @pytest.mark.asyncio
 async def test_dispatch_failure_can_be_retried(api_context):
-    client, app, _, dispatched = api_context
+    client, app, factory, dispatched = api_context
 
     def fail_dispatch(_job_id):
         raise ConnectionError("redis unavailable")
@@ -770,6 +805,10 @@ async def test_dispatch_failure_can_be_retried(api_context):
 
     assert failed.status_code == 503
     assert failed.json()["detail"]["code"] == "dispatch_failed"
+    async with factory() as session:
+        job = await session.scalar(select(AnalysisJob))
+        assert job.llm_credential_ciphertext is None
+        assert job.llm_credential_expires_at is None
 
     app.dependency_overrides[get_job_dispatcher] = lambda: dispatched.append
     retried = await client.post("/v1/analyses", json=payload)
@@ -813,3 +852,5 @@ async def test_create_reports_when_the_background_worker_is_unavailable(api_cont
         )
         assert job.status == "failed"
         assert job.failure_code == "worker_unavailable"
+        assert job.llm_credential_ciphertext is None
+        assert job.llm_credential_expires_at is None
