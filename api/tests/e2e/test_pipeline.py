@@ -9,7 +9,12 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from app.api.analyses import get_job_dispatcher, get_session, get_transcript_service
+from app.api.analyses import (
+    get_job_dispatcher,
+    get_session,
+    get_transcript_service,
+    get_video_metadata_service,
+)
 from app.core.settings import Settings
 from app.db.models import Base
 from app.main import create_app
@@ -46,6 +51,11 @@ class PermissiveQuotaLimiter:
     @asynccontextmanager
     async def installation_create_lock(self, installation_id):
         yield
+
+
+class FixedVideoMetadataService:
+    def duration_ms(self, video_id):
+        return 2000
 
 
 class FixedTranslationProvider:
@@ -119,6 +129,9 @@ async def test_api_pipeline_returns_timestamped_transcript_and_reuses_result():
 
     app.dependency_overrides[get_session] = session_dependency
     app.dependency_overrides[get_transcript_service] = lambda: transcript_service
+    app.dependency_overrides[get_video_metadata_service] = (
+        lambda: FixedVideoMetadataService()
+    )
     app.dependency_overrides[get_job_dispatcher] = lambda: lambda _job_id: None
     app.dependency_overrides[get_quota_limiter] = lambda: PermissiveQuotaLimiter()
 

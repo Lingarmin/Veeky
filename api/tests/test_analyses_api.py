@@ -20,6 +20,7 @@ from app.api.analyses import (
     get_quota_limiter,
     get_session,
     get_transcript_service,
+    get_video_metadata_service,
 )
 from app.core.settings import Settings
 from app.db.models import (
@@ -40,6 +41,7 @@ from app.services.transcripts import (
 )
 from app.security.credentials import JobCredentialCipher
 from app.security.quotas import QuotaServiceUnavailable, RateLimitExceeded
+from app.services.video_metadata import VideoMetadataError
 
 
 class FakeTranscriptService:
@@ -62,6 +64,19 @@ class FakeTranscriptService:
             segments=[TranscriptSegment(0, 0, 1500, "Hello world")],
             available=True,
         )
+
+
+class FakeVideoMetadataService:
+    def __init__(self, duration_ms=1500, error=None):
+        self.duration = duration_ms
+        self.error = error
+        self.calls = []
+
+    def duration_ms(self, video_id):
+        self.calls.append(video_id)
+        if self.error:
+            raise self.error
+        return self.duration
 
 
 class PermissiveQuotaLimiter:
@@ -126,6 +141,9 @@ async def api_context(tmp_path):
 
     app.dependency_overrides[get_session] = session_dependency
     app.dependency_overrides[get_transcript_service] = lambda: FakeTranscriptService()
+    app.dependency_overrides[get_video_metadata_service] = (
+        lambda: FakeVideoMetadataService()
+    )
     app.dependency_overrides[get_job_dispatcher] = lambda: dispatched.append
     app.dependency_overrides[get_job_credential_cipher] = lambda: JobCredentialCipher(
         VALID_TEST_KEY
@@ -185,6 +203,94 @@ async def test_inspect_reports_no_caption_track(api_context):
 
     assert response.status_code == 422
     assert response.json()["detail"]["code"] == "no_caption_track"
+
+
+@pytest.mark.asyncio
+async def test_inspect_allows_video_exactly_four_hours(api_context):
+    client, app, _, _ = api_context
+    app.dependency_overrides[get_video_metadata_service] = (
+        lambda: FakeVideoMetadataService(14_400_000)
+    )
+
+    response = await client.post(
+        "/v1/videos/inspect",
+        json={"url": "https://youtu.be/aircAruvnKk"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["durationMs"] == 14_400_000
+
+
+@pytest.mark.asyncio
+async def test_inspect_rejects_video_over_four_hours_before_fetching_captions(
+    api_context,
+):
+    client, app, _, _ = api_context
+    transcript = FakeTranscriptService()
+    transcript.calls = 0
+    original_inspect = transcript.inspect
+
+    def counting_inspect(*args, **kwargs):
+        transcript.calls += 1
+        return original_inspect(*args, **kwargs)
+
+    transcript.inspect = counting_inspect
+    app.dependency_overrides[get_transcript_service] = lambda: transcript
+    app.dependency_overrides[get_video_metadata_service] = (
+        lambda: FakeVideoMetadataService(14_401_000)
+    )
+
+    response = await client.post(
+        "/v1/videos/inspect",
+        json={"url": "https://youtu.be/aircAruvnKk"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "code": "video_too_long",
+        "message": "此视频时长过长，无法分析。",
+    }
+    assert transcript.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_inspect_does_not_fall_back_to_caption_duration_when_metadata_fails(
+    api_context,
+):
+    client, app, _, _ = api_context
+    app.dependency_overrides[get_video_metadata_service] = lambda: FakeVideoMetadataService(
+        error=VideoMetadataError("lookup failed")
+    )
+
+    response = await client.post(
+        "/v1/videos/inspect",
+        json={"url": "https://youtu.be/aircAruvnKk"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "video_metadata_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_create_rechecks_video_duration(api_context):
+    client, app, _, dispatched = api_context
+    app.dependency_overrides[get_video_metadata_service] = (
+        lambda: FakeVideoMetadataService(14_401_000)
+    )
+
+    response = await client.post(
+        "/v1/analyses",
+        json={
+            "videoId": "aircAruvnKk",
+            "sourceLanguage": "en",
+            "targetLanguage": "zh-Hans",
+            "llmConfig": LLM_CONFIG,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "video_too_long"
+    assert dispatched == []
 
 
 @pytest.mark.asyncio

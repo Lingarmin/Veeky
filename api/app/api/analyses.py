@@ -26,6 +26,7 @@ from app.db.models import (
 from app.db.session import get_session
 from app.core.settings import Settings, get_settings
 from app.services.transcripts import TranscriptInspection, TranscriptService, transcript_version
+from app.services.video_metadata import VideoMetadataError, VideoMetadataService
 from app.services.translation import provider_translation_version
 from app.services.llm import (
     LLM_PROVIDER_DEFAULTS,
@@ -234,6 +235,12 @@ def get_transcript_service() -> TranscriptService:
     return TranscriptService(proxy_url=settings.youtube_transcript_proxy_url)
 
 
+def get_video_metadata_service(
+    settings: Settings = Depends(get_settings),
+) -> VideoMetadataService:
+    return VideoMetadataService(proxy_url=settings.youtube_transcript_proxy_url)
+
+
 def dispatch_analysis_job(job_id: str) -> object:
     from app.workers.tasks import analyze_video, celery_app
 
@@ -277,16 +284,18 @@ def get_pipeline_revision(settings: Settings = Depends(get_settings)) -> str:
 async def inspect_video(
     request: InspectRequest,
     transcript_service: TranscriptService = Depends(get_transcript_service),
+    metadata_service: VideoMetadataService = Depends(get_video_metadata_service),
+    settings: Settings = Depends(get_settings),
     _: Installation = Depends(require_installation),
     __: None = Depends(enforce_write_quota),
 ) -> InspectResponse:
     video_id = extract_youtube_video_id(request.url)
+    duration_ms = await _video_duration_ms(metadata_service, video_id, settings)
     inspection = await run_in_threadpool(
         transcript_service.inspect, video_id, request.preferred_languages
     )
     _require_available_transcript(inspection)
     assert inspection.selected is not None
-    duration_ms = max(segment.start_ms + segment.duration_ms for segment in inspection.segments)
     return InspectResponse(
         video_id=video_id,
         duration_ms=duration_ms,
@@ -301,6 +310,7 @@ async def create_analysis(
     response: Response,
     session: AsyncSession = Depends(get_session),
     transcript_service: TranscriptService = Depends(get_transcript_service),
+    metadata_service: VideoMetadataService = Depends(get_video_metadata_service),
     dispatcher: JobDispatcher = Depends(get_job_dispatcher),
     installation: Installation = Depends(require_installation),
     credential_cipher: JobCredentialCipher = Depends(get_job_credential_cipher),
@@ -312,6 +322,9 @@ async def create_analysis(
     installation_id = installation.id
     _validate_llm_config(request.llm_config)
     _validate_video_id(request.video_id)
+    duration_ms = await _video_duration_ms(
+        metadata_service, request.video_id, settings
+    )
     inspection = await run_in_threadpool(
         transcript_service.inspect, request.video_id, [request.source_language]
     )
@@ -391,7 +404,6 @@ async def create_analysis(
     if (active_jobs or 0) >= settings.max_active_jobs_per_installation:
         raise _analysis_concurrency_error()
 
-    duration_ms = max(segment.start_ms + segment.duration_ms for segment in inspection.segments)
     video = await session.get(Video, request.video_id)
     if video is None:
         video = Video(
@@ -796,6 +808,28 @@ def _analysis_concurrency_error() -> HTTPException:
         "analysis_concurrency_limit",
         "已有视频正在分析，请等待完成后再试。",
     )
+
+
+async def _video_duration_ms(
+    service: VideoMetadataService,
+    video_id: str,
+    settings: Settings,
+) -> int:
+    try:
+        duration_ms = await run_in_threadpool(service.duration_ms, video_id)
+    except VideoMetadataError as error:
+        raise _api_error(
+            502,
+            "video_metadata_unavailable",
+            "暂时无法读取视频时长，请稍后再试。",
+        ) from error
+    if duration_ms > settings.max_video_duration_seconds * 1000:
+        raise _api_error(
+            422,
+            "video_too_long",
+            "此视频时长过长，无法分析。",
+        )
+    return duration_ms
 
 
 def _is_video_id(video_id: str) -> bool:
