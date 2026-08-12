@@ -4,6 +4,7 @@ import pytest
 
 from app.services.translation import (
     CachedTranslationService,
+    LlmTranslationProvider,
     LibreTranslateProvider,
     TranslationProviderError,
     TranslationSegment,
@@ -44,6 +45,34 @@ class MemoryCache:
 
     async def put(self, key, value):
         self.values[key] = value
+
+
+class FakeLlmClient:
+    provider = "kimi"
+    model = "kimi-k2.5"
+    url = "https://api.example.com/v1/chat/completions"
+
+    def __init__(self):
+        self.requests = []
+        self.active_requests = 0
+        self.max_active_requests = 0
+
+    async def complete_json(self, messages):
+        import asyncio
+        import json
+
+        payload = json.loads(messages[-1]["content"])
+        self.requests.append(payload)
+        self.active_requests += 1
+        self.max_active_requests = max(self.max_active_requests, self.active_requests)
+        await asyncio.sleep(0)
+        self.active_requests -= 1
+        return {
+            "translations": [
+                {"segment_id": item["segment_id"], "text": f"ZH:{item['text']}"}
+                for item in payload["segments"]
+            ]
+        }
 
 
 def segments(*texts):
@@ -174,3 +203,16 @@ async def test_cache_does_not_cross_translation_providers():
 
     assert len(first_client.requests) == 1
     assert len(second_client.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_llm_translation_groups_long_transcripts_into_large_parallel_batches():
+    client = FakeLlmClient()
+    provider = LlmTranslationProvider(client)
+    source = segments(*["x" * 1000 for _ in range(20)])
+
+    result = await provider.translate(source, "en", "zh-Hans")
+
+    assert sorted(len(request["segments"]) for request in client.requests) == [2, 3, 3, 3, 3, 3, 3]
+    assert client.max_active_requests == 3
+    assert [item.segment_id for item in result] == [str(index) for index in range(20)]

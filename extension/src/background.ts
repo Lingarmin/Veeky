@@ -2,7 +2,10 @@ import type { ActiveTabContext, AnalyzedTab, ExtensionMessage } from "./shared/t
 
 const STORAGE_KEY = "analyzedTabs";
 
-type ChromeApi = Pick<typeof chrome, "action" | "runtime" | "sidePanel" | "storage" | "tabs">;
+type ChromeApi = Pick<
+  typeof chrome,
+  "action" | "runtime" | "sidePanel" | "scripting" | "storage" | "tabs"
+>;
 
 export function parseVideoId(url?: string): string | null {
   if (!url) return null;
@@ -23,12 +26,13 @@ export function parseVideoId(url?: string): string | null {
 
 export function installBackgroundHandlers(chromeApi: ChromeApi): void {
   chromeApi.sidePanel.setPanelBehavior({ openPanelOnActionClick: false }).catch(() => undefined);
+  void configureActiveTab(chromeApi).catch(() => undefined);
 
-  chromeApi.action.onClicked.addListener(async (tab) => {
+  chromeApi.action.onClicked.addListener((tab) => {
     const tabId = tab.id;
     if (tabId === undefined || !parseVideoId(tab.url)) return;
-    await chromeApi.sidePanel.setOptions({ tabId, path: "sidepanel.html", enabled: true });
-    await chromeApi.sidePanel.open({ tabId });
+    void chromeApi.sidePanel.setOptions({ tabId, path: "sidepanel.html", enabled: true }).catch(() => undefined);
+    void chromeApi.sidePanel.open({ tabId }).catch(() => undefined);
   });
 
   chromeApi.tabs.onActivated.addListener(async ({ tabId }) => {
@@ -72,7 +76,16 @@ async function handleMessage(chromeApi: ChromeApi, message: ExtensionMessage): P
   }
 
   if (message.type === "SEEK_VIDEO") {
-    const seconds = Math.max(0, Math.floor(message.startMs / 1000));
+    const tab = await chromeApi.tabs.get(message.tabId);
+    const seconds = Math.max(0, message.startMs / 1000);
+    if (parseVideoId(tab.url) === message.videoId) {
+      await chromeApi.scripting.executeScript({
+        target: { tabId: message.tabId },
+        func: seekCurrentYouTubePlayer,
+        args: [seconds],
+      });
+      return { ok: true };
+    }
     await chromeApi.tabs.update(message.tabId, {
       url: `https://www.youtube.com/watch?v=${message.videoId}&t=${seconds}s`,
     });
@@ -93,6 +106,13 @@ async function handleMessage(chromeApi: ChromeApi, message: ExtensionMessage): P
   return context;
 }
 
+function seekCurrentYouTubePlayer(seconds: number): void {
+  const video = document.querySelector<HTMLVideoElement>("video.html5-main-video, video");
+  if (!video) throw new Error("YouTube player is not ready");
+  video.currentTime = seconds;
+  void video.play().catch(() => undefined);
+}
+
 async function loadAnalyzedTabs(chromeApi: ChromeApi): Promise<Record<string, AnalyzedTab>> {
   const value = await chromeApi.storage.session.get(STORAGE_KEY);
   return (value[STORAGE_KEY] as Record<string, AnalyzedTab> | undefined) ?? {};
@@ -103,14 +123,19 @@ async function updatePanelForTab(
   tabId: number,
   url?: string,
 ): Promise<void> {
-  const analyzedTabs = await loadAnalyzedTabs(chromeApi);
-  const analysis = analyzedTabs[String(tabId)];
-  const isAnalyzedVideo = analysis?.videoId === parseVideoId(url);
+  const isYouTubeVideo = parseVideoId(url) !== null;
   await chromeApi.sidePanel.setOptions(
-    isAnalyzedVideo
+    isYouTubeVideo
       ? { tabId, path: "sidepanel.html", enabled: true }
       : { tabId, enabled: false },
   );
+}
+
+async function configureActiveTab(chromeApi: ChromeApi): Promise<void> {
+  const [tab] = await chromeApi.tabs.query({ active: true, currentWindow: true });
+  if (tab?.id !== undefined) {
+    await updatePanelForTab(chromeApi, tab.id, tab.url);
+  }
 }
 
 function validId(candidate: string | null | undefined): string | null {

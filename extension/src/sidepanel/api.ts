@@ -1,5 +1,6 @@
 import type {
   AnalysisResult,
+  AnalysisHistoryResponse,
   AnalysisStatus,
   JobStatus,
   VideoInspection,
@@ -12,13 +13,17 @@ export interface AnalysisCreateResponse {
 }
 
 export interface AnalysisApi {
+  testLlm(config: { provider: string; apiUrl: string; apiKey: string; model: string }): Promise<{ ok: boolean; message: string }>;
   inspect(url: string): Promise<VideoInspection>;
   createAnalysis(input: {
     videoId: string;
     sourceLanguage: string;
     targetLanguage: string;
     title: string;
+    llmConfig: { provider: string; apiUrl: string; apiKey: string; model: string };
+    force?: boolean;
   }): Promise<AnalysisCreateResponse>;
+  getHistory(input?: { videoId?: string; limit?: number; offset?: number }): Promise<AnalysisHistoryResponse>;
   getStatus(jobId: string): Promise<AnalysisStatus>;
   getResult(jobId: string): Promise<AnalysisResult>;
 }
@@ -37,6 +42,10 @@ export class ApiError extends Error {
 
 export function createApi(baseUrl = "http://127.0.0.1:8000"): AnalysisApi {
   return {
+    testLlm: (config) => request(`${baseUrl}/v1/llm/test`, {
+      method: "POST",
+      body: JSON.stringify(config),
+    }),
     inspect: (url) => request(`${baseUrl}/v1/videos/inspect`, {
       method: "POST",
       body: JSON.stringify({ url }),
@@ -45,6 +54,14 @@ export function createApi(baseUrl = "http://127.0.0.1:8000"): AnalysisApi {
       method: "POST",
       body: JSON.stringify(input),
     }),
+    getHistory: (input = {}) => {
+      const query = new URLSearchParams();
+      if (input.videoId) query.set("videoId", input.videoId);
+      if (input.limit !== undefined) query.set("limit", String(input.limit));
+      if (input.offset !== undefined) query.set("offset", String(input.offset));
+      const suffix = query.size > 0 ? `?${query.toString()}` : "";
+      return request(`${baseUrl}/v1/analyses/history${suffix}`);
+    },
     getStatus: (jobId) => request(`${baseUrl}/v1/analyses/${jobId}`),
     getResult: (jobId) => request(`${baseUrl}/v1/analyses/${jobId}/result`),
   };

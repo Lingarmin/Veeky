@@ -108,6 +108,7 @@ async def test_api_pipeline_returns_timestamped_transcript_and_reuses_result():
         "sourceLanguage": "en",
         "targetLanguage": "zh-Hans",
         "title": "But what is a neural network?",
+        "llmConfig": {"apiUrl": "https://api.example.com/v1", "apiKey": "test-key"},
     }
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"

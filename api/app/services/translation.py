@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
 import httpx
+
+from app.services.llm import LlmProviderError, OpenAICompatibleClient
 
 
 @dataclass(frozen=True)
@@ -38,6 +42,150 @@ class TranslationProviderError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.status_code = status_code
+
+
+class LlmTranslationProvider:
+    def __init__(
+        self,
+        client: OpenAICompatibleClient,
+        *,
+        max_batch_chars: int = 3000,
+        max_concurrency: int = 3,
+    ):
+        self.client = client
+        self.name = client.provider
+        self.version = provider_translation_version(
+            getattr(client, "url", ""), provider=client.provider, version=client.model
+        )
+        self.max_batch_chars = max_batch_chars
+        self.max_concurrency = max(1, max_concurrency)
+
+    async def translate(
+        self,
+        segments: Sequence[TranslationSegment],
+        source_language: str,
+        target_language: str,
+    ) -> list[TranslatedSegment]:
+        if not segments:
+            return []
+        batches = _build_batches(segments, self.max_batch_chars)
+        semaphore = asyncio.Semaphore(self.max_concurrency)
+
+        async def translate_batch(
+            batch: Sequence[TranslationSegment],
+        ) -> list[TranslatedSegment]:
+            async with semaphore:
+                return await self._translate_batch(
+                    batch, source_language, target_language
+                )
+
+        translated_batches = await asyncio.gather(
+            *(translate_batch(batch) for batch in batches)
+        )
+        return [segment for batch in translated_batches for segment in batch]
+
+    async def _translate_batch(
+        self,
+        batch: Sequence[TranslationSegment],
+        source_language: str,
+        target_language: str,
+    ) -> list[TranslatedSegment]:
+        messages = [
+            {"role": "system", "content": "Translate each subtitle segment. Return only JSON with a translations array. Keep every segment_id exactly once. Do not explain or reason. Output the complete JSON object."},
+            {"role": "user", "content": json.dumps({"source_language": source_language, "target_language": target_language, "segments": [{"segment_id": item.segment_id, "text": item.text} for item in batch]}, ensure_ascii=False)},
+        ]
+        try:
+            body = await self.client.complete_json(messages)
+        except LlmProviderError as error:
+            raise TranslationProviderError(error.code.replace("llm_", "translation_"), str(error)) from error
+        values = body.get("translations")
+        if not isinstance(values, list):
+            raise TranslationProviderError("translation_invalid_response", f"{self.name} 缺少 translations 数组")
+        by_id = {
+            item.get("segment_id"): _translation_text(item)
+            for item in values
+            if isinstance(item, dict)
+        }
+        expected_ids = {item.segment_id for item in batch}
+        if set(by_id) == expected_ids and all(
+            isinstance(by_id.get(item.segment_id), str) for item in batch
+        ):
+            return [
+                TranslatedSegment(item.segment_id, item.start_ms, item.duration_ms, by_id[item.segment_id])
+                for item in batch
+            ]
+        positional_texts = [
+            _translation_text(item) for item in values if isinstance(item, dict)
+        ]
+        if len(positional_texts) == len(batch) and all(
+            isinstance(text, str) and text.strip() for text in positional_texts
+        ):
+            return [
+                TranslatedSegment(item.segment_id, item.start_ms, item.duration_ms, text)
+                for item, text in zip(batch, positional_texts, strict=True)
+            ]
+        if len(batch) == 1:
+            # Some OpenAI-compatible gateways omit the id when only one item
+            # is requested. The response is still unambiguous, so preserve it
+            # instead of reporting a false mismatch.
+            if len(values) == 1 and isinstance(values[0], dict):
+                text = _translation_text(values[0])
+                if isinstance(text, str) and text.strip():
+                    item = batch[0]
+                    return [
+                        TranslatedSegment(item.segment_id, item.start_ms, item.duration_ms, text)
+                    ]
+            raise TranslationProviderError(
+                "translation_response_mismatch", f"{self.name} 返回的字幕段落不完整"
+            )
+        midpoint = len(batch) // 2
+        first = await self._translate_batch(
+            batch[:midpoint], source_language, target_language
+        )
+        second = await self._translate_batch(
+            batch[midpoint:], source_language, target_language
+        )
+        return [*first, *second]
+
+
+def _translation_text(item: dict) -> str | None:
+    for key in ("text", "translation", "translated_text", "translated", "content"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+class KimiTranslationProvider(LlmTranslationProvider):
+    """Compatibility wrapper for callers that still construct the Kimi provider."""
+
+    def __init__(
+        self,
+        client,
+        *,
+        max_batch_chars: int = 3000,
+        max_concurrency: int = 3,
+    ):
+        if not hasattr(client, "provider"):
+            client.provider = "kimi"
+        if not hasattr(client, "model"):
+            client.model = "kimi-k2.5"
+        super().__init__(
+            client,
+            max_batch_chars=max_batch_chars,
+            max_concurrency=max_concurrency,
+        )
+
+
+def provider_translation_version(
+    endpoint: str, *, provider: str = "kimi", version: str = "kimi-k2.5"
+) -> str:
+    endpoint_fingerprint = hashlib.sha256(endpoint.encode()).hexdigest()[:12] if endpoint else "test"
+    return f"{provider}.{version}+url.{endpoint_fingerprint}"
+
+
+def kimi_translation_version(endpoint: str, *, version: str = "kimi-k2.5") -> str:
+    return provider_translation_version(endpoint, provider="kimi", version=version)
 
 
 class TranslationProvider(Protocol):

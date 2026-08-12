@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "youtube-preview-api"
 version = "0.1.0"
 description = "FastAPI backend for the YouTube video preview MVP"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
   "alembic>=1.16,<2",
   "asyncpg>=0.30,<1",

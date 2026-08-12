@@ -144,6 +144,7 @@ class AnalysisJob(Base):
     target_language: Mapped[str] = mapped_column(String(35))
     transcript_version: Mapped[str] = mapped_column(String(100))
     cache_key: Mapped[str] = mapped_column(String(300), unique=True)
+    llm_config: Mapped[dict[str, str] | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(String(40), default="queued")
     failure_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
     failure_detail: Mapped[str | None] = mapped_column(Text, nullable=True)

@@ -1,4 +1,53 @@
 services:
+  api:
+    build:
+      context: ./api
+    env_file:
+      - ./api/.env
+    environment:
+      RUNNING_IN_DOCKER: "true"
+      DATABASE_URL: postgresql+asyncpg://youtube_preview:${POSTGRES_PASSWORD:-youtube_preview}@postgresql:5432/youtube_preview
+      REDIS_URL: redis://redis:6379/0
+      LIBRETRANSLATE_URL: http://libretranslate:5000
+    command: ["/bin/sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./api
+    env_file:
+      - ./api/.env
+    environment:
+      RUNNING_IN_DOCKER: "true"
+      DATABASE_URL: postgresql+asyncpg://youtube_preview:${POSTGRES_PASSWORD:-youtube_preview}@postgresql:5432/youtube_preview
+      REDIS_URL: redis://redis:6379/0
+      LIBRETRANSLATE_URL: http://libretranslate:5000
+    hostname: worker
+    command: ["celery", "-A", "app.workers.tasks.celery_app", "worker", "--loglevel=INFO", "--concurrency=1"]
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.workers.tasks.celery_app inspect ping -d celery@worker --timeout=3 | grep -q pong"]
+      interval: 15s
+      timeout: 10s
+      retries: 4
+      start_period: 25s
+    restart: unless-stopped
+
   postgresql:
     image: postgres:16.9-alpine
     environment:

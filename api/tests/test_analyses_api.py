@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.api.analyses import (
+    WorkerUnavailableError,
+    dispatch_analysis_job,
     get_job_dispatcher,
     get_pipeline_revision,
     get_session,
@@ -16,10 +20,12 @@ from app.api.analyses import (
 from app.core.settings import Settings
 from app.db.models import (
     AnalysisResult,
+    AnalysisJob,
     Base,
     TranscriptSegment as StoredTranscriptSegment,
     TranscriptTrack,
     Translation,
+    Video,
 )
 from app.main import create_app
 from app.services.transcripts import (
@@ -49,6 +55,9 @@ class FakeTranscriptService:
             segments=[TranscriptSegment(0, 0, 1500, "Hello world")],
             available=True,
         )
+
+
+LLM_CONFIG = {"apiUrl": "https://api.example.com/v1", "apiKey": "test-key"}
 
 
 @pytest.fixture
@@ -112,6 +121,31 @@ async def test_inspect_reports_no_caption_track(api_context):
 
 
 @pytest.mark.asyncio
+async def test_create_requires_llm_configuration(api_context):
+    client, _, _, dispatched = api_context
+    response = await client.post(
+        "/v1/analyses",
+        json={"videoId": "aircAruvnKk", "sourceLanguage": "en", "targetLanguage": "zh-Hans"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "llm_config_required"
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_llm_test_rejects_invalid_url_without_network_call(api_context):
+    client, _, _, _ = api_context
+    response = await client.post(
+        "/v1/llm/test", json={"apiUrl": "not-a-url", "apiKey": "secret"}
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "llm_config_invalid"
+    assert "secret" not in response.text
+
+
+@pytest.mark.asyncio
 async def test_create_reuses_active_and_completed_jobs(api_context):
     client, _, factory, dispatched = api_context
     payload = {
@@ -119,6 +153,7 @@ async def test_create_reuses_active_and_completed_jobs(api_context):
         "sourceLanguage": "en",
         "targetLanguage": "zh-Hans",
         "title": "But what is a neural network?",
+        "llmConfig": LLM_CONFIG,
     }
     first = await client.post("/v1/analyses", json=payload)
     second = await client.post("/v1/analyses", json=payload)
@@ -139,6 +174,241 @@ async def test_create_reuses_active_and_completed_jobs(api_context):
     assert completed.json()["cacheHit"] is True
 
 
+async def _store_history_job(
+    factory,
+    *,
+    video_id: str,
+    title: str,
+    status: str,
+    completed_at: datetime | None,
+    with_result: bool = True,
+    cache_suffix: str,
+) -> str:
+    async with factory() as session:
+        video = await session.get(Video, video_id)
+        if video is None:
+            video = Video(
+                video_id=video_id,
+                title=title,
+                duration_ms=754_000,
+                source_url=f"https://www.youtube.com/watch?v={video_id}",
+            )
+            session.add(video)
+        job = AnalysisJob(
+            video_id=video_id,
+            source_language="en",
+            target_language="zh-Hans",
+            transcript_version="transcript-v1",
+            cache_key=f"history:{cache_suffix}",
+            llm_config={
+                "provider": "deepseek",
+                "api_url": "https://api.example.com/v1",
+                "api_key": "must-not-leak",
+                "model": "deepseek-v4-flash",
+            },
+            status=status,
+            completed_at=completed_at,
+        )
+        if with_result:
+            job.result = AnalysisResult(
+                one_line_summary=f"Summary {cache_suffix}",
+                summary_points=[],
+                chapters=[],
+                highlights=[],
+                model_name="deepseek",
+                model_version="deepseek-v4-flash",
+            )
+        session.add(job)
+        await session.commit()
+        return job.id
+
+
+@pytest.mark.asyncio
+async def test_history_returns_only_completed_results_newest_first(api_context):
+    client, _, factory, _ = api_context
+    now = datetime.now(timezone.utc)
+    older_id = await _store_history_job(
+        factory,
+        video_id="aircAruvnKk",
+        title="Neural networks",
+        status="completed",
+        completed_at=now - timedelta(hours=2),
+        cache_suffix="older",
+    )
+    newest_id = await _store_history_job(
+        factory,
+        video_id="3eExfC63uSc",
+        title="A newer video",
+        status="completed",
+        completed_at=now - timedelta(hours=1),
+        cache_suffix="newest",
+    )
+    await _store_history_job(
+        factory,
+        video_id="queuedVid01",
+        title="Queued",
+        status="queued",
+        completed_at=None,
+        cache_suffix="queued",
+    )
+    await _store_history_job(
+        factory,
+        video_id="failedVid01",
+        title="Failed",
+        status="failed",
+        completed_at=now,
+        cache_suffix="failed",
+    )
+    await _store_history_job(
+        factory,
+        video_id="noResult001",
+        title="No result",
+        status="completed",
+        completed_at=now,
+        with_result=False,
+        cache_suffix="no-result",
+    )
+
+    response = await client.get("/v1/analyses/history")
+
+    assert response.status_code == 200
+    assert [item["jobId"] for item in response.json()["items"]] == [
+        newest_id,
+        older_id,
+    ]
+    newest = response.json()["items"][0]
+    assert newest["videoTitle"] == "A newer video"
+    assert newest["durationMs"] == 754_000
+    assert newest["modelName"] == "deepseek"
+    assert newest["modelVersion"] == "deepseek-v4-flash"
+    assert response.json()["hasMore"] is False
+    assert "llmConfig" not in newest
+    assert "must-not-leak" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_history_filters_by_video_and_paginates(api_context):
+    client, _, factory, _ = api_context
+    now = datetime.now(timezone.utc)
+    expected_ids = []
+    for index in range(3):
+        expected_ids.append(
+            await _store_history_job(
+                factory,
+                video_id="aircAruvnKk",
+                title="Neural networks",
+                status="completed",
+                completed_at=now + timedelta(minutes=index),
+                cache_suffix=f"matching-{index}",
+            )
+        )
+    await _store_history_job(
+        factory,
+        video_id="3eExfC63uSc",
+        title="Another video",
+        status="completed",
+        completed_at=now + timedelta(hours=1),
+        cache_suffix="other-video",
+    )
+
+    first_page = await client.get(
+        "/v1/analyses/history",
+        params={"videoId": "aircAruvnKk", "limit": 2, "offset": 0},
+    )
+    second_page = await client.get(
+        "/v1/analyses/history",
+        params={"videoId": "aircAruvnKk", "limit": 2, "offset": 2},
+    )
+
+    assert [item["jobId"] for item in first_page.json()["items"]] == list(
+        reversed(expected_ids[1:])
+    )
+    assert first_page.json()["hasMore"] is True
+    assert [item["jobId"] for item in second_page.json()["items"]] == [
+        expected_ids[0]
+    ]
+    assert second_page.json()["hasMore"] is False
+
+
+@pytest.mark.asyncio
+async def test_history_validates_pagination(api_context):
+    client, _, _, _ = api_context
+
+    assert (await client.get("/v1/analyses/history?limit=0")).status_code == 422
+    assert (await client.get("/v1/analyses/history?limit=101")).status_code == 422
+    assert (await client.get("/v1/analyses/history?offset=-1")).status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_force_create_generates_new_jobs_and_preserves_cached_result(api_context):
+    client, _, factory, dispatched = api_context
+    payload = {
+        "videoId": "aircAruvnKk",
+        "sourceLanguage": "en",
+        "targetLanguage": "zh-Hans",
+        "title": "Neural networks",
+        "llmConfig": LLM_CONFIG,
+    }
+    original = await client.post("/v1/analyses", json=payload)
+    original_id = original.json()["jobId"]
+    async with factory() as session:
+        job = await session.get(AnalysisJob, original_id)
+        job.status = "completed"
+        job.completed_at = datetime.now(timezone.utc)
+        job.result = AnalysisResult(
+            one_line_summary="Original summary",
+            summary_points=["Original point"],
+            chapters=[],
+            highlights=[],
+            model_name="fake",
+            model_version="test",
+        )
+        await session.commit()
+
+    cached = await client.post("/v1/analyses", json={**payload, "force": False})
+    forced_once = await client.post("/v1/analyses", json={**payload, "force": True})
+    forced_twice = await client.post("/v1/analyses", json={**payload, "force": True})
+
+    assert cached.status_code == 200
+    assert cached.json()["jobId"] == original_id
+    assert cached.json()["cacheHit"] is True
+    assert forced_once.status_code == 202
+    assert forced_twice.status_code == 202
+    assert len({original_id, forced_once.json()["jobId"], forced_twice.json()["jobId"]}) == 3
+    assert dispatched == [
+        original_id,
+        forced_once.json()["jobId"],
+        forced_twice.json()["jobId"],
+    ]
+    original_result = await client.get(f"/v1/analyses/{original_id}/result")
+    assert original_result.json()["oneLineSummary"] == "Original summary"
+    assert original_result.json()["summaryPoints"] == ["Original point"]
+
+
+@pytest.mark.asyncio
+async def test_create_requeues_an_interrupted_in_progress_job(api_context):
+    client, _, factory, dispatched = api_context
+    payload = {
+        "videoId": "aircAruvnKk",
+        "sourceLanguage": "en",
+        "targetLanguage": "zh-Hans",
+        "llmConfig": LLM_CONFIG,
+    }
+    created = await client.post("/v1/analyses", json=payload)
+    job_id = created.json()["jobId"]
+
+    async with factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        job.status = "translating"
+        await session.commit()
+
+    resumed = await client.post("/v1/analyses", json=payload)
+
+    assert resumed.status_code == 202
+    assert resumed.json() == {"jobId": job_id, "cacheHit": False, "status": "queued"}
+    assert dispatched == [job_id, job_id]
+
+
 @pytest.mark.asyncio
 async def test_concurrent_create_requests_reuse_one_job(api_context):
     client, _, _, dispatched = api_context
@@ -146,6 +416,7 @@ async def test_concurrent_create_requests_reuse_one_job(api_context):
         "videoId": "aircAruvnKk",
         "sourceLanguage": "en",
         "targetLanguage": "zh-Hans",
+        "llmConfig": LLM_CONFIG,
     }
 
     first, second = await asyncio.gather(
@@ -167,6 +438,7 @@ async def test_status_and_result_endpoints(api_context):
             "videoId": "aircAruvnKk",
             "sourceLanguage": "en",
             "targetLanguage": "zh-Hans",
+            "llmConfig": LLM_CONFIG,
         },
     )
     job_id = created.json()["jobId"]
@@ -253,6 +525,7 @@ async def test_translation_failure_returns_original_transcript(api_context):
             "videoId": "aircAruvnKk",
             "sourceLanguage": "en",
             "targetLanguage": "zh-Hans",
+            "llmConfig": LLM_CONFIG,
         },
     )
     job_id = created.json()["jobId"]
@@ -294,12 +567,67 @@ async def test_translation_failure_returns_original_transcript(api_context):
 
 
 @pytest.mark.asyncio
+async def test_result_returns_summary_while_translation_is_still_running(api_context):
+    client, _, factory, _ = api_context
+    created = await client.post(
+        "/v1/analyses",
+        json={
+            "videoId": "aircAruvnKk",
+            "sourceLanguage": "en",
+            "targetLanguage": "zh-Hans",
+            "llmConfig": LLM_CONFIG,
+        },
+    )
+    job_id = created.json()["jobId"]
+
+    async with factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        version = job.transcript_version
+        job.status = "translating"
+        job.result = AnalysisResult(
+            one_line_summary="视频介绍了神经网络的输入层。",
+            summary_points=["像素输入", "权重连接", "逐层计算"],
+            chapters=[{"start_ms": 0, "end_ms": 1500, "title": "输入", "summary": "像素"}],
+            highlights=[],
+            model_name="fake",
+            model_version="test",
+        )
+        track = TranscriptTrack(
+            video_id=job.video_id,
+            language_code="en",
+            language_name="English",
+            is_generated=False,
+            is_translatable=True,
+            transcript_version=version,
+        )
+        track.segments = [
+            StoredTranscriptSegment(
+                sequence=0,
+                start_ms=0,
+                duration_ms=1500,
+                text="Hello world",
+            )
+        ]
+        session.add(track)
+        await session.commit()
+
+    result = await client.get(f"/v1/analyses/{job_id}/result")
+
+    assert result.status_code == 200
+    assert result.json()["partial"] is True
+    assert result.json()["failureCode"] is None
+    assert result.json()["oneLineSummary"] == "视频介绍了神经网络的输入层。"
+    assert result.json()["transcript"][0]["translated"] is None
+
+
+@pytest.mark.asyncio
 async def test_pipeline_revision_change_creates_a_new_job(api_context):
     client, app, _, dispatched = api_context
     payload = {
         "videoId": "aircAruvnKk",
         "sourceLanguage": "en",
         "targetLanguage": "zh-Hans",
+        "llmConfig": LLM_CONFIG,
     }
     first = await client.post("/v1/analyses", json=payload)
     app.dependency_overrides[get_pipeline_revision] = lambda: "next-pipeline"
@@ -323,6 +651,7 @@ async def test_dispatch_failure_can_be_retried(api_context):
         "videoId": "aircAruvnKk",
         "sourceLanguage": "en",
         "targetLanguage": "zh-Hans",
+        "llmConfig": LLM_CONFIG,
     }
     failed = await client.post("/v1/analyses", json=payload)
 
@@ -334,3 +663,40 @@ async def test_dispatch_failure_can_be_retried(api_context):
 
     assert retried.status_code == 202
     assert dispatched == [retried.json()["jobId"]]
+
+
+def test_dispatch_requires_a_live_celery_worker(monkeypatch):
+    monkeypatch.setattr(
+        "app.workers.tasks.celery_app.control.ping", lambda timeout: []
+    )
+
+    with pytest.raises(WorkerUnavailableError, match="Worker"):
+        dispatch_analysis_job("aircAruvnKk")
+
+
+@pytest.mark.asyncio
+async def test_create_reports_when_the_background_worker_is_unavailable(api_context):
+    client, app, factory, _ = api_context
+
+    def unavailable_dispatcher(_job_id):
+        raise WorkerUnavailableError("Worker is unavailable")
+
+    app.dependency_overrides[get_job_dispatcher] = lambda: unavailable_dispatcher
+    response = await client.post(
+        "/v1/analyses",
+        json={
+            "videoId": "aircAruvnKk",
+            "sourceLanguage": "en",
+            "targetLanguage": "zh-Hans",
+            "llmConfig": LLM_CONFIG,
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "worker_unavailable"
+    async with factory() as session:
+        job = await session.scalar(
+            select(AnalysisJob).where(AnalysisJob.video_id == "aircAruvnKk")
+        )
+        assert job.status == "failed"
+        assert job.failure_code == "worker_unavailable"

@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "先看 · YouTube 视频预览",
+  "name": "Veeky - AI Agent：YouTube Video Translate & Summarize",
   "version": "0.1.0",
   "description": "读取公开视频字幕，在观看前生成翻译、摘要与时间轴。",
-  "permissions": ["sidePanel", "storage", "tabs"],
+  "permissions": ["sidePanel", "storage", "tabs", "scripting"],
   "host_permissions": [
     "https://www.youtube.com/*",
     "https://youtu.be/*",
@@ -14,7 +14,22 @@
     "service_worker": "background.js",
     "type": "module"
   },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "icons": {
+    "16": "icons/veeky-16.png",
+    "32": "icons/veeky-32.png",
+    "48": "icons/veeky-48.png",
+    "128": "icons/veeky-128.png"
+  },
   "action": {
-    "default_title": "打开先看"
+    "default_title": "打开 Veeky",
+    "default_icon": {
+      "16": "icons/veeky-16.png",
+      "32": "icons/veeky-32.png",
+      "48": "icons/veeky-48.png",
+      "128": "icons/veeky-128.png"
+    }
   }
 }

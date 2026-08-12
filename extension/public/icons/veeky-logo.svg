@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc">
+  <title id="title">Veeky Logo</title>
+  <desc id="desc">A play symbol paired with content analysis lines in a red rounded square.</desc>
+  <rect width="128" height="128" rx="26" fill="#E92F23"/>
+  <path d="M27 31.5c0-4.6 5.1-7.3 8.9-4.7l42.8 29.1c6 4.1 6 12.9 0 17L35.9 102c-3.8 2.6-8.9-.1-8.9-4.7V31.5Z" fill="#fff"/>
+  <path d="M72 35h31M80 55h23M80 75h15" fill="none" stroke="#fff" stroke-width="8" stroke-linecap="round"/>
+</svg>

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
-from typing import Any, Iterable, Sequence
+from time import sleep as blocking_sleep
+from typing import Any, Callable, Iterable, Sequence
 
+from requests.exceptions import RequestException
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import (
     AgeRestricted,
@@ -18,6 +20,7 @@ from youtube_transcript_api._errors import (
     YouTubeRequestFailed,
     YouTubeTranscriptApiException,
 )
+from youtube_transcript_api.proxies import GenericProxyConfig
 
 
 @dataclass(frozen=True)
@@ -47,8 +50,24 @@ class TranscriptInspection:
     failure_detail: str | None = None
 
 class TranscriptService:
-    def __init__(self, api: Any | None = None):
-        self.api = api or YouTubeTranscriptApi()
+    def __init__(
+        self,
+        api: Any | None = None,
+        proxy_url: str | None = None,
+        *,
+        max_attempts: int = 3,
+        sleep: Callable[[float], None] = blocking_sleep,
+    ):
+        self.max_attempts = max_attempts
+        self.sleep = sleep
+        if api is not None:
+            self.api = api
+        elif proxy_url:
+            self.api = YouTubeTranscriptApi(
+                proxy_config=GenericProxyConfig(https_url=proxy_url)
+            )
+        else:
+            self.api = YouTubeTranscriptApi()
 
     def inspect(
         self,
@@ -56,13 +75,20 @@ class TranscriptService:
         preferred_languages: Sequence[str] = (),
     ) -> TranscriptInspection:
         try:
-            raw_tracks = list(self.api.list(video_id))
+            raw_tracks = self._retry_request(lambda: list(self.api.list(video_id)))
         except YouTubeTranscriptApiException as error:
             code = _failure_code(error)
             return TranscriptInspection(
                 video_id=video_id,
                 tracks=[],
                 failure_code=code,
+                failure_detail=str(error),
+            )
+        except RequestException as error:
+            return TranscriptInspection(
+                video_id=video_id,
+                tracks=[],
+                failure_code="transcript_connection_failed",
                 failure_detail=str(error),
             )
 
@@ -77,7 +103,7 @@ class TranscriptService:
         selected_index = _select_track_index(tracks, preferred_languages)
         selected = tracks[selected_index]
         try:
-            raw_segments = raw_tracks[selected_index].fetch()
+            raw_segments = self._retry_request(raw_tracks[selected_index].fetch)
             segments = _normalize_segments(raw_segments)
         except YouTubeTranscriptApiException as error:
             code = _failure_code(error)
@@ -86,6 +112,14 @@ class TranscriptService:
                 tracks=tracks,
                 selected=selected,
                 failure_code=code,
+                failure_detail=str(error),
+            )
+        except RequestException as error:
+            return TranscriptInspection(
+                video_id=video_id,
+                tracks=tracks,
+                selected=selected,
+                failure_code="transcript_connection_failed",
                 failure_detail=str(error),
             )
 
@@ -104,6 +138,16 @@ class TranscriptService:
             segments=segments,
             available=True,
         )
+
+    def _retry_request(self, operation: Callable[[], Any]) -> Any:
+        for attempt in range(self.max_attempts):
+            try:
+                return operation()
+            except RequestException:
+                if attempt == self.max_attempts - 1:
+                    raise
+                self.sleep(0.25 * (2**attempt))
+        raise AssertionError("transcript retry loop exhausted")
 
 
 def _track_info(track: Any) -> TranscriptTrackInfo:

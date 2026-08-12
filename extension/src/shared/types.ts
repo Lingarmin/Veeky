@@ -20,6 +20,13 @@ export interface ActiveTabContext {
   analysis: AnalyzedTab | null;
 }
 
+export interface LlmConfig {
+  provider: "kimi" | "deepseek";
+  apiUrl: string;
+  apiKey: string;
+  model: string;
+}
+
 export type ExtensionMessage =
   | { type: "GET_ACTIVE_TAB_CONTEXT" }
   | { type: "REGISTER_ANALYSIS"; tabId: number; videoId: string; jobId: string }
@@ -83,4 +90,21 @@ export interface AnalysisResult {
   failureCode: string | null;
   modelName: string;
   modelVersion: string;
+}
+
+export interface AnalysisHistoryItem {
+  jobId: string;
+  videoId: string;
+  videoTitle: string;
+  durationMs: number;
+  sourceLanguage: string;
+  targetLanguage: string;
+  completedAt: string;
+  modelName: string;
+  modelVersion: string;
+}
+
+export interface AnalysisHistoryResponse {
+  items: AnalysisHistoryItem[];
+  hasMore: boolean;
 }

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import pytest
+from requests.exceptions import ConnectTimeout, ConnectionError
 
 from app.services.transcripts import TranscriptService
 
@@ -97,3 +98,51 @@ def test_no_track_is_reported_without_fabricating_segments():
     assert result.available is False
     assert result.failure_code == "no_caption_track"
     assert result.segments == []
+
+
+def test_configured_proxy_is_passed_to_youtube_transcript_client(monkeypatch):
+    captured = {}
+
+    class RecordingApi:
+        def __init__(self, *, proxy_config):
+            captured["proxy_config"] = proxy_config
+
+    monkeypatch.setattr("app.services.transcripts.YouTubeTranscriptApi", RecordingApi)
+
+    TranscriptService(proxy_url="http://127.0.0.1:7890")
+
+    assert captured["proxy_config"].to_requests_dict() == {
+        "http": "http://127.0.0.1:7890",
+        "https": "http://127.0.0.1:7890",
+    }
+
+
+def test_network_timeout_is_reported_as_a_transcript_connection_failure():
+    class TimeoutApi:
+        def list(self, video_id):
+            raise ConnectTimeout("youtube connection timed out")
+
+    result = TranscriptService(api=TimeoutApi()).inspect("aircAruvnKk")
+
+    assert result.available is False
+    assert result.failure_code == "transcript_connection_failed"
+
+
+def test_retries_a_connection_reset_before_reading_captions():
+    class ResetThenSuccessApi:
+        def __init__(self):
+            self.calls = 0
+
+        def list(self, video_id):
+            self.calls += 1
+            if self.calls == 1:
+                raise ConnectionError("Connection reset by peer")
+            return FakeTranscriptList([FakeTrack("en", "English")])
+
+    sleeps = []
+    api = ResetThenSuccessApi()
+    result = TranscriptService(api=api, sleep=sleeps.append).inspect("aircAruvnKk")
+
+    assert result.available is True
+    assert api.calls == 2
+    assert sleeps == [0.25]

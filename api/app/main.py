@@ -90,9 +90,18 @@ async def health(
 def create_app(settings: Settings | None = None) -> FastAPI:
     application_settings = settings or get_settings()
     application = FastAPI(title="YouTube Preview API")
+    local_extension_origin_pattern = (
+        r"chrome-extension://[a-p]{32}"
+        if (
+            application_settings.environment == "development"
+            and not application_settings.allowed_chrome_extension_origins
+        )
+        else None
+    )
     application.add_middleware(
         CORSMiddleware,
         allow_origins=application_settings.allowed_chrome_extension_origins,
+        allow_origin_regex=local_extension_origin_pattern,
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],

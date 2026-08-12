@@ -16,6 +16,7 @@ def test_settings_include_service_urls_analysis_model_and_extension_origins():
         analysis_provider_model="analysis-model",
         analysis_provider_version="v2",
         analysis_prompt_version="v3",
+        youtube_transcript_proxy_url="http://127.0.0.1:7890",
         allowed_chrome_extension_origins=["chrome-extension://abc"],
     )
 
@@ -28,6 +29,7 @@ def test_settings_include_service_urls_analysis_model_and_extension_origins():
     assert settings.analysis_provider_model == "analysis-model"
     assert settings.analysis_provider_version == "v2"
     assert settings.analysis_prompt_version == "v3"
+    assert settings.youtube_transcript_proxy_url == "http://127.0.0.1:7890"
     assert settings.allowed_chrome_extension_origins == ["chrome-extension://abc"]
 
 
@@ -47,6 +49,37 @@ async def test_app_allows_configured_chrome_extension_origin():
             headers={
                 "Origin": origin,
                 "Access-Control-Request-Method": "GET",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == origin
+
+
+def test_settings_use_the_host_proxy_from_inside_docker(monkeypatch):
+    monkeypatch.setenv("RUNNING_IN_DOCKER", "true")
+
+    settings = Settings(
+        youtube_transcript_proxy_url="http://127.0.0.1:7890",
+    )
+
+    assert settings.youtube_transcript_proxy_url == "http://host.docker.internal:7890"
+
+
+@pytest.mark.asyncio
+async def test_development_app_allows_a_local_chrome_extension_origin_without_known_id():
+    origin = "chrome-extension://abcdefghijklmnopabcdefghijklmnop"
+    test_app = main.create_app(Settings(_env_file=None))
+
+    async with AsyncClient(
+        transport=ASGITransport(app=test_app), base_url="http://testserver"
+    ) as client:
+        response = await client.options(
+            "/v1/videos/inspect",
+            headers={
+                "Origin": origin,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type",
             },
         )
 

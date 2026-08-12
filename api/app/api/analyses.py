@@ -4,8 +4,9 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 import hashlib
 from urllib.parse import parse_qs, urlparse
+import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
@@ -23,10 +24,23 @@ from app.db.models import (
 from app.db.session import get_session
 from app.core.settings import Settings, get_settings
 from app.services.transcripts import TranscriptInspection, TranscriptService, transcript_version
+from app.services.translation import provider_translation_version
+from app.services.llm import (
+    LLM_PROVIDER_DEFAULTS,
+    LlmProviderError,
+    build_llm_client,
+    normalize_chat_completions_url,
+    normalize_provider_config,
+)
 
 
 router = APIRouter(prefix="/v1")
 JobDispatcher = Callable[[str], object]
+INTERRUPTIBLE_JOB_STATUSES = {"fetching_transcript", "translating", "analyzing"}
+
+
+class WorkerUnavailableError(RuntimeError):
+    pass
 
 
 def to_camel(value: str) -> str:
@@ -57,11 +71,25 @@ class InspectResponse(ApiModel):
     selected_language: str
 
 
+class LlmConfigRequest(ApiModel):
+    provider: str = "kimi"
+    api_url: str = Field(min_length=1, max_length=1000)
+    api_key: str = Field(min_length=1, max_length=500)
+    model: str | None = Field(default=None, max_length=120)
+
+
 class AnalysisCreateRequest(ApiModel):
     video_id: str
     source_language: str
     target_language: str = "zh-Hans"
     title: str | None = None
+    llm_config: LlmConfigRequest | None = None
+    force: bool = False
+
+
+class LlmTestResponse(ApiModel):
+    ok: bool
+    message: str
 
 
 class AnalysisCreateResponse(ApiModel):
@@ -75,6 +103,23 @@ class AnalysisStatusResponse(ApiModel):
     status: str
     failure_code: str | None = None
     failure_detail: str | None = None
+
+
+class AnalysisHistoryItemResponse(ApiModel):
+    job_id: str
+    video_id: str
+    video_title: str
+    duration_ms: int
+    source_language: str
+    target_language: str
+    completed_at: datetime
+    model_name: str
+    model_version: str
+
+
+class AnalysisHistoryResponse(ApiModel):
+    items: list[AnalysisHistoryItemResponse]
+    has_more: bool
 
 
 class TranscriptSegmentResponse(ApiModel):
@@ -104,13 +149,42 @@ class AnalysisResultResponse(ApiModel):
     model_version: str
 
 
+@router.post("/llm/test", response_model=LlmTestResponse)
+async def test_llm_connection(request: LlmConfigRequest) -> LlmTestResponse:
+    try:
+        config = normalize_provider_config(
+            request.provider, request.api_url, request.api_key, request.model
+        )
+        client = build_llm_client(
+            {
+                "provider": config.provider,
+                "api_url": config.api_url,
+                "api_key": config.api_key,
+                "model": config.model or "",
+            }
+        )
+        await client.test_connection()
+    except ValueError as error:
+        raise _api_error(422, "llm_config_invalid", str(error)) from error
+    except LlmProviderError as error:
+        raise _api_error(502, error.code, str(error)) from error
+    return LlmTestResponse(ok=True, message=f"{client.provider_label} 连接成功")
+
+
 def get_transcript_service() -> TranscriptService:
-    return TranscriptService()
+    settings = get_settings()
+    return TranscriptService(proxy_url=settings.youtube_transcript_proxy_url)
 
 
 def dispatch_analysis_job(job_id: str) -> object:
-    from app.workers.tasks import analyze_video
+    from app.workers.tasks import analyze_video, celery_app
 
+    try:
+        workers = celery_app.control.ping(timeout=2.0)
+    except Exception as error:
+        raise WorkerUnavailableError("Worker is unavailable") from error
+    if not workers:
+        raise WorkerUnavailableError("Worker is unavailable")
     return analyze_video.delay(job_id)
 
 
@@ -157,6 +231,7 @@ async def create_analysis(
     dispatcher: JobDispatcher = Depends(get_job_dispatcher),
     pipeline_revision: str = Depends(get_pipeline_revision),
 ) -> AnalysisCreateResponse:
+    _validate_llm_config(request.llm_config)
     _validate_video_id(request.video_id)
     inspection = await run_in_threadpool(
         transcript_service.inspect, request.video_id, [request.source_language]
@@ -171,10 +246,39 @@ async def create_analysis(
         request.source_language,
         request.target_language,
         version,
-        pipeline_revision,
+        f"{pipeline_revision}|{request.llm_config.provider}|{request.llm_config.model or ''}|{normalize_chat_completions_url(request.llm_config.api_url)}",
     )
+    if request.force:
+        cache_key = f"{cache_key}:run:{uuid.uuid4().hex}"
     existing = await session.scalar(select(AnalysisJob).where(AnalysisJob.cache_key == cache_key))
     if existing and existing.status != "failed":
+        if existing.status in INTERRUPTIBLE_JOB_STATUSES:
+            # A worker can disappear after claiming a job. Re-queue the job when
+            # the user explicitly starts the same analysis again.
+            existing.status = "queued"
+            await session.commit()
+            try:
+                dispatcher(existing.id)
+            except WorkerUnavailableError as error:
+                existing.status = "failed"
+                existing.failure_code = "worker_unavailable"
+                existing.failure_detail = str(error)
+                existing.completed_at = datetime.now(timezone.utc)
+                await session.commit()
+                raise _api_error(
+                    503,
+                    "worker_unavailable",
+                    "后台任务服务未启动，请运行 docker compose up -d 后重试",
+                ) from error
+            except Exception as error:
+                existing.status = "failed"
+                existing.failure_code = "dispatch_failed"
+                existing.failure_detail = str(error)
+                existing.completed_at = datetime.now(timezone.utc)
+                await session.commit()
+                raise _api_error(
+                    503, "dispatch_failed", "后台任务暂时无法启动，请重试"
+                ) from error
         cache_hit = existing.status == "completed"
         response.status_code = 200 if cache_hit else 202
         return AnalysisCreateResponse(
@@ -202,6 +306,7 @@ async def create_analysis(
             target_language=request.target_language,
             transcript_version=version,
             cache_key=cache_key,
+            llm_config=_llm_snapshot(request.llm_config),
         )
         session.add(job)
     else:
@@ -211,6 +316,7 @@ async def create_analysis(
         job.failure_detail = None
         job.completed_at = None
         job.transcript_version = version
+        job.llm_config = _llm_snapshot(request.llm_config)
 
     try:
         await session.commit()
@@ -230,6 +336,17 @@ async def create_analysis(
     await session.refresh(job)
     try:
         dispatcher(job.id)
+    except WorkerUnavailableError as error:
+        job.status = "failed"
+        job.failure_code = "worker_unavailable"
+        job.failure_detail = str(error)
+        job.completed_at = datetime.now(timezone.utc)
+        await session.commit()
+        raise _api_error(
+            503,
+            "worker_unavailable",
+            "后台任务服务未启动，请运行 docker compose up -d 后重试",
+        ) from error
     except Exception as error:
         job.status = "failed"
         job.failure_code = "dispatch_failed"
@@ -239,6 +356,51 @@ async def create_analysis(
         raise _api_error(503, "dispatch_failed", "后台任务暂时无法启动，请重试") from error
     response.status_code = 202
     return AnalysisCreateResponse(job_id=job.id, cache_hit=False, status=job.status)
+
+
+@router.get("/analyses/history", response_model=AnalysisHistoryResponse)
+async def get_analysis_history(
+    video_id: str | None = Query(default=None, alias="videoId"),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    session: AsyncSession = Depends(get_session),
+) -> AnalysisHistoryResponse:
+    query = (
+        select(AnalysisJob, Video, AnalysisResult)
+        .join(Video, Video.video_id == AnalysisJob.video_id)
+        .join(AnalysisResult, AnalysisResult.job_id == AnalysisJob.id)
+        .where(
+            AnalysisJob.status == "completed",
+            AnalysisJob.completed_at.is_not(None),
+        )
+    )
+    if video_id is not None:
+        query = query.where(AnalysisJob.video_id == video_id)
+    rows = (
+        await session.execute(
+            query.order_by(AnalysisJob.completed_at.desc(), AnalysisJob.id.desc())
+            .offset(offset)
+            .limit(limit + 1)
+        )
+    ).all()
+    return AnalysisHistoryResponse(
+        items=[
+            AnalysisHistoryItemResponse(
+                job_id=job.id,
+                video_id=job.video_id,
+                video_title=video.title,
+                duration_ms=video.duration_ms,
+                source_language=job.source_language,
+                target_language=job.target_language,
+                completed_at=job.completed_at,
+                model_name=result.model_name,
+                model_version=result.model_version,
+            )
+            for job, video, result in rows[:limit]
+            if job.completed_at is not None
+        ],
+        has_more=len(rows) > limit,
+    )
 
 
 @router.get("/analyses/{job_id}", response_model=AnalysisStatusResponse)
@@ -267,7 +429,10 @@ async def get_analysis_result(
     )
     if job is None:
         raise _api_error(404, "analysis_not_found", "没有找到这个分析任务")
-    partial = job.status == "failed" and job.failure_code == "translation_failed"
+    partial = (
+        (job.status == "failed" and job.failure_code == "translation_failed")
+        or (job.status == "translating" and job.result is not None)
+    )
     if not partial and (job.status != "completed" or job.result is None):
         raise _api_error(409, "analysis_not_complete", "分析结果还没有准备好")
 
@@ -284,15 +449,39 @@ async def get_analysis_result(
     )
     translated_by_id: dict[str, str] = {}
     if track is not None:
+        translation_filters = [
+            Translation.track_id == track.id,
+            Translation.target_language == job.target_language,
+            Translation.transcript_version == version,
+        ]
+        if job.llm_config and job.llm_config.get("provider", "kimi") == "kimi":
+            translation_filters.extend(
+                [
+                    Translation.provider == job.llm_config.get("provider", "kimi"),
+                    Translation.provider_version == provider_translation_version(
+                        normalize_chat_completions_url(job.llm_config["api_url"]),
+                        provider=job.llm_config.get("provider", "kimi"),
+                        version=job.llm_config.get("model", "kimi-k2.5"),
+                    ),
+                ]
+            )
         translation = await session.scalar(
             select(Translation)
-            .where(
-                Translation.track_id == track.id,
-                Translation.target_language == job.target_language,
-                Translation.transcript_version == version,
-            )
+            .where(*translation_filters)
             .order_by(Translation.created_at.desc())
         )
+        if translation is None and job.llm_config.get("provider", "kimi") == "kimi":
+            # Preserve results from injected/legacy providers while ensuring a
+            # real Kimi result prefers the endpoint-specific cache entry.
+            translation = await session.scalar(
+                select(Translation)
+                .where(
+                    Translation.track_id == track.id,
+                    Translation.target_language == job.target_language,
+                    Translation.transcript_version == version,
+                )
+                .order_by(Translation.created_at.desc())
+            )
         if translation is not None:
             translated_by_id = {
                 str(segment["segment_id"]): str(segment["text"])
@@ -370,6 +559,27 @@ def analysis_cache_key(
 def _validate_video_id(video_id: str) -> None:
     if not _is_video_id(video_id):
         raise _api_error(422, "invalid_video_id", "视频 ID 无效")
+
+
+def _validate_llm_config(config: LlmConfigRequest | None) -> None:
+    if config is None:
+        raise _api_error(422, "llm_config_required", "请先配置 LLM 服务")
+    try:
+        normalize_provider_config(config.provider, config.api_url, config.api_key, config.model)
+    except ValueError as error:
+        raise _api_error(422, "llm_config_invalid", str(error)) from error
+
+
+def _llm_snapshot(config: LlmConfigRequest) -> dict[str, str]:
+    normalized = normalize_provider_config(
+        config.provider, config.api_url, config.api_key, config.model
+    )
+    return {
+        "provider": normalized.provider,
+        "api_url": normalized.api_url,
+        "api_key": normalized.api_key,
+        "model": normalized.model,
+    }
 
 
 def _is_video_id(video_id: str) -> bool:

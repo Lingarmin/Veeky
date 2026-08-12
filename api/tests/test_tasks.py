@@ -5,7 +5,13 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import selectinload
 
-from app.db.models import AnalysisJob, Base, TranscriptSegment as StoredSegment, Video
+from app.db.models import (
+    AnalysisJob,
+    AnalysisResult as StoredAnalysisResult,
+    Base,
+    TranscriptSegment as StoredSegment,
+    Video,
+)
 from app.services.analysis import AnalysisSegment
 from app.services.transcripts import (
     TranscriptInspection,
@@ -14,7 +20,7 @@ from app.services.transcripts import (
     transcript_version,
 )
 from app.services.translation import TranslatedSegment, TranslationProviderError
-from app.workers.tasks import AnalysisPipeline
+from app.workers.tasks import AnalysisPipeline, build_llm_services
 
 
 class FakeTranscriptService:
@@ -141,6 +147,17 @@ async def test_pipeline_persists_transcript_translation_and_result(pipeline_cont
 
 
 @pytest.mark.asyncio
+async def test_pipeline_uses_kimi_providers_from_job_snapshot(pipeline_context):
+    factory, job_id = pipeline_context
+    translation_provider, analysis_service = build_llm_services(
+        {"api_url": "https://api.example.com/v1", "api_key": "secret"}
+    )
+
+    assert translation_provider.name == "kimi"
+    assert analysis_service.provider.name == "kimi"
+
+
+@pytest.mark.asyncio
 async def test_translation_failure_preserves_original_transcript(pipeline_context):
     factory, job_id = pipeline_context
     pipeline = AnalysisPipeline(
@@ -158,6 +175,67 @@ async def test_translation_failure_preserves_original_transcript(pipeline_contex
         assert job.status == "failed"
         assert job.failure_code == "translation_failed"
         assert segment_count == 2
+
+
+@pytest.mark.asyncio
+async def test_translation_failure_preserves_the_generated_summary(pipeline_context):
+    factory, job_id = pipeline_context
+    pipeline = AnalysisPipeline(
+        factory,
+        FakeTranscriptService(),
+        FakeTranslationProvider(fails=True),
+        FakeAnalysisService(),
+    )
+
+    await pipeline.run(job_id)
+
+    async with factory() as session:
+        job = await session.scalar(
+            select(AnalysisJob)
+            .options(selectinload(AnalysisJob.result))
+            .where(AnalysisJob.id == job_id)
+        )
+        assert job.status == "failed"
+        assert job.failure_code == "translation_failed"
+        assert job.result.one_line_summary == "神经网络从像素中学习。"
+
+
+@pytest.mark.asyncio
+async def test_retry_after_translation_failure_reuses_existing_analysis_result(pipeline_context):
+    factory, job_id = pipeline_context
+    pipeline = AnalysisPipeline(
+        factory,
+        FakeTranscriptService(),
+        FakeTranslationProvider(fails=True),
+        FakeAnalysisService(),
+    )
+
+    await pipeline.run(job_id)
+    async with factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        job.status = "queued"
+        await session.commit()
+
+    retry_pipeline = AnalysisPipeline(
+        factory,
+        FakeTranscriptService(),
+        FakeTranslationProvider(),
+        FakeAnalysisService(),
+    )
+    await retry_pipeline.run(job_id)
+
+    async with factory() as session:
+        job = await session.scalar(
+            select(AnalysisJob)
+            .options(selectinload(AnalysisJob.result))
+            .where(AnalysisJob.id == job_id)
+        )
+        result_count = await session.scalar(
+            select(func.count()).select_from(StoredAnalysisResult)
+        )
+        assert job.status == "completed"
+        assert job.result.one_line_summary == "神经网络从像素中学习。"
+        assert result_count == 1
 
 
 @pytest.mark.asyncio

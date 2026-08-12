@@ -25,7 +25,9 @@ from app.services.analysis import (
     AnalysisSegment,
     HttpAnalysisProvider,
     StructuredAnalysisService,
+    LlmAnalysisProvider,
 )
+from app.services.llm import build_llm_client
 from app.services.transcripts import TranscriptService, transcript_version
 from app.services.translation import (
     CachedTranslationService,
@@ -35,6 +37,7 @@ from app.services.translation import (
     TranslationProvider,
     TranslationProviderError,
     TranslationSegment,
+    LlmTranslationProvider,
 )
 
 
@@ -88,6 +91,11 @@ class SqlTranslationCache:
         )
 
 
+def build_llm_services(config: dict[str, str]) -> tuple[TranslationProvider, StructuredAnalysisService]:
+    client = build_llm_client(config)
+    return LlmTranslationProvider(client), StructuredAnalysisService(LlmAnalysisProvider(client))
+
+
 class AnalysisPipeline:
     def __init__(
         self,
@@ -100,11 +108,17 @@ class AnalysisPipeline:
         self.transcript_service = transcript_service
         self.translation_provider = translation_provider
         self.analysis_service = analysis_service
-
+        self._uses_default_providers = False
     async def run(self, job_id: str, *, resume: bool = False) -> None:
         job = await self._claim(job_id, resume=resume)
         if job is None:
             return
+        translation_provider = self.translation_provider
+        analysis_service = self.analysis_service
+        if job.llm_config and self._uses_default_providers:
+            translation_provider, analysis_service = build_llm_services(
+                dict(job.llm_config)
+            )
 
         try:
             inspection = await asyncio.to_thread(
@@ -140,6 +154,43 @@ class AnalysisPipeline:
                 )
                 stored_segments = list(track.segments)
                 job_row = await session.get(AnalysisJob, job_id)
+                job_row.status = "analyzing"
+                await session.commit()
+
+            analysis_segments = [
+                AnalysisSegment(
+                    segment_id=segment.id,
+                    start_ms=segment.start_ms,
+                    duration_ms=segment.duration_ms,
+                    original=segment.text,
+                )
+                for segment in stored_segments
+            ]
+            result = await analysis_service.analyze(
+                analysis_segments,
+                job.target_language,
+                duration_ms=job.video.duration_ms,
+            )
+            async with self.session_factory() as session:
+                job_row = await session.scalar(
+                    select(AnalysisJob)
+                    .options(selectinload(AnalysisJob.result))
+                    .where(AnalysisJob.id == job_id)
+                )
+                result_values = {
+                    "one_line_summary": result.one_line_summary,
+                    "summary_points": result.summary_points,
+                    "chapters": [chapter.model_dump() for chapter in result.chapters],
+                    "highlights": [highlight.model_dump() for highlight in result.highlights],
+                    "model_name": result.model_name,
+                    "model_version": result.model_version,
+                    "generated_at": result.generated_at,
+                }
+                if job_row.result is None:
+                    job_row.result = StoredAnalysisResult(**result_values)
+                else:
+                    for field, value in result_values.items():
+                        setattr(job_row.result, field, value)
                 job_row.status = "translating"
                 await session.commit()
 
@@ -155,7 +206,7 @@ class AnalysisPipeline:
             async with self.session_factory() as session:
                 cache = SqlTranslationCache(session)
                 translation_service = CachedTranslationService(
-                    self.translation_provider, cache
+                    translation_provider, cache
                 )
                 translated = await translation_service.translate(
                     track.id,
@@ -164,41 +215,13 @@ class AnalysisPipeline:
                     job.target_language,
                     version,
                 )
-                job_row = await session.get(AnalysisJob, job_id)
-                job_row.status = "analyzing"
                 await session.commit()
-
-            translated_by_id = {item.segment_id: item for item in translated}
-            analysis_segments = [
-                AnalysisSegment(
-                    segment_id=segment.id,
-                    start_ms=segment.start_ms,
-                    duration_ms=segment.duration_ms,
-                    original=segment.text,
-                    translated=translated_by_id[segment.id].text,
-                )
-                for segment in stored_segments
-            ]
-            result = await self.analysis_service.analyze(
-                analysis_segments,
-                job.target_language,
-                duration_ms=job.video.duration_ms,
-            )
             async with self.session_factory() as session:
                 job_row = await session.get(AnalysisJob, job_id)
                 job_row.status = "completed"
                 job_row.completed_at = datetime.now(timezone.utc)
                 job_row.failure_code = None
                 job_row.failure_detail = None
-                job_row.result = StoredAnalysisResult(
-                    one_line_summary=result.one_line_summary,
-                    summary_points=result.summary_points,
-                    chapters=[chapter.model_dump() for chapter in result.chapters],
-                    highlights=[highlight.model_dump() for highlight in result.highlights],
-                    model_name=result.model_name,
-                    model_version=result.model_version,
-                    generated_at=result.generated_at,
-                )
                 await session.commit()
         except TranslationProviderError as error:
             await self._fail(job_id, "translation_failed", f"{error.code}: {error}")
@@ -304,12 +327,14 @@ def build_default_pipeline(
             f"+prompt.{current.analysis_prompt_version}"
         ),
     )
-    return AnalysisPipeline(
+    pipeline = AnalysisPipeline(
         session_factory,
-        TranscriptService(),
+        TranscriptService(proxy_url=current.youtube_transcript_proxy_url),
         translation_provider,
         StructuredAnalysisService(analysis_provider),
     )
+    pipeline._uses_default_providers = True
+    return pipeline
 
 
 async def run_analysis_task(job_id: str, *, resume: bool = False) -> None:
