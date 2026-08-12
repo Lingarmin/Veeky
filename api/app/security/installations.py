@@ -35,7 +35,7 @@ class RegistrationRequest(BaseModel):
             parsed = uuid.UUID(value)
         except ValueError as error:
             raise ValueError("installationId must be a UUID") from error
-        if str(parsed) != value.lower():
+        if str(parsed) != value:
             raise ValueError("installationId must be a canonical UUID")
         return str(parsed)
 
@@ -108,7 +108,7 @@ async def require_installation(
     except ValueError as error:
         raise _authentication_error() from error
     canonical_id = str(parsed_id)
-    if canonical_id != installation_id.lower():
+    if canonical_id != installation_id:
         raise _authentication_error()
 
     installation = await session.get(Installation, canonical_id)

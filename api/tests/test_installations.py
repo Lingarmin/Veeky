@@ -14,6 +14,7 @@ from app.main import create_app
 
 
 INSTALLATION_ID = "11111111-1111-4111-8111-111111111111"
+INSTALLATION_ID_WITH_LETTERS = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 INSTALLATION_TOKEN = "installation-token-with-at-least-forty-three-characters"
 AUTH_HEADERS = {
     "Authorization": f"Bearer {INSTALLATION_TOKEN}",
@@ -73,6 +74,22 @@ async def test_registration_is_idempotent_for_matching_credentials(installation_
 
     assert first.status_code == 201
     assert second.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_registration_rejects_noncanonical_uppercase_installation_id(
+    installation_context,
+):
+    client, _ = installation_context
+    response = await client.post(
+        "/v1/installations/register",
+        json={
+            "installationId": INSTALLATION_ID_WITH_LETTERS.upper(),
+            "installationToken": INSTALLATION_TOKEN,
+        },
+    )
+
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -147,6 +164,31 @@ async def test_protected_endpoint_rejects_mismatched_token(installation_context)
         headers={
             **AUTH_HEADERS,
             "Authorization": "Bearer wrong-installation-token",
+        },
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"]["code"] == "installation_auth_required"
+
+
+@pytest.mark.asyncio
+async def test_protected_endpoint_rejects_noncanonical_uppercase_installation_id(
+    installation_context,
+):
+    client, _ = installation_context
+    await client.post(
+        "/v1/installations/register",
+        json={
+            "installationId": INSTALLATION_ID_WITH_LETTERS,
+            "installationToken": INSTALLATION_TOKEN,
+        },
+    )
+
+    response = await client.get(
+        "/v1/analyses/history",
+        headers={
+            "Authorization": f"Bearer {INSTALLATION_TOKEN}",
+            "X-Veeky-Installation-Id": INSTALLATION_ID_WITH_LETTERS.upper(),
         },
     )
 
