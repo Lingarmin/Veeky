@@ -16,3 +16,4 @@ extension/dist/
 playwright-report/
 test-results/
 work/
+.worktrees/
