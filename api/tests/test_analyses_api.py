@@ -65,6 +65,12 @@ AUTH_HEADERS = {
     "Authorization": f"Bearer {INSTALLATION_TOKEN}",
     "X-Veeky-Installation-Id": INSTALLATION_ID,
 }
+OTHER_INSTALLATION_ID = "22222222-2222-4222-8222-222222222222"
+OTHER_INSTALLATION_TOKEN = "other-installation-token-with-at-least-forty-three-characters"
+OTHER_AUTH_HEADERS = {
+    "Authorization": f"Bearer {OTHER_INSTALLATION_TOKEN}",
+    "X-Veeky-Installation-Id": OTHER_INSTALLATION_ID,
+}
 
 
 @pytest.fixture
@@ -191,6 +197,93 @@ async def test_create_reuses_active_and_completed_jobs(api_context):
     completed = await client.post("/v1/analyses", json=payload)
     assert completed.status_code == 200
     assert completed.json()["cacheHit"] is True
+
+
+@pytest.mark.asyncio
+async def test_identical_analysis_is_cached_per_installation(api_context):
+    client, _, factory, dispatched = api_context
+    registered = await client.post(
+        "/v1/installations/register",
+        json={
+            "installationId": OTHER_INSTALLATION_ID,
+            "installationToken": OTHER_INSTALLATION_TOKEN,
+        },
+    )
+    assert registered.status_code == 201
+    payload = {
+        "videoId": "aircAruvnKk",
+        "sourceLanguage": "en",
+        "targetLanguage": "zh-Hans",
+        "llmConfig": LLM_CONFIG,
+    }
+
+    first_a = await client.post("/v1/analyses", json=payload)
+    second_a = await client.post("/v1/analyses", json=payload)
+    first_b = await client.post(
+        "/v1/analyses", json=payload, headers=OTHER_AUTH_HEADERS
+    )
+
+    assert second_a.json()["jobId"] == first_a.json()["jobId"]
+    assert first_b.status_code == 202
+    assert first_b.json()["jobId"] != first_a.json()["jobId"]
+    async with factory() as session:
+        jobs = (await session.scalars(select(AnalysisJob))).all()
+        assert {job.installation_id for job in jobs} == {
+            INSTALLATION_ID,
+            OTHER_INSTALLATION_ID,
+        }
+    assert dispatched == [first_a.json()["jobId"], first_b.json()["jobId"]]
+
+
+@pytest.mark.asyncio
+async def test_history_and_job_reads_are_private_to_the_installation(api_context):
+    client, _, factory, _ = api_context
+    registered = await client.post(
+        "/v1/installations/register",
+        json={
+            "installationId": OTHER_INSTALLATION_ID,
+            "installationToken": OTHER_INSTALLATION_TOKEN,
+        },
+    )
+    assert registered.status_code == 201
+    payload = {
+        "videoId": "aircAruvnKk",
+        "sourceLanguage": "en",
+        "targetLanguage": "zh-Hans",
+        "llmConfig": LLM_CONFIG,
+    }
+    created_a = await client.post("/v1/analyses", json=payload)
+    created_b = await client.post(
+        "/v1/analyses", json=payload, headers=OTHER_AUTH_HEADERS
+    )
+    job_a = created_a.json()["jobId"]
+    job_b = created_b.json()["jobId"]
+    async with factory() as session:
+        for job_id in (job_a, job_b):
+            job = await session.get(AnalysisJob, job_id)
+            job.status = "completed"
+            job.completed_at = datetime.now(timezone.utc)
+            job.result = AnalysisResult(
+                one_line_summary=f"Summary {job_id}",
+                summary_points=[],
+                chapters=[],
+                highlights=[],
+                model_name="fake",
+                model_version="test",
+            )
+        await session.commit()
+
+    history_a = await client.get("/v1/analyses/history")
+    history_b = await client.get(
+        "/v1/analyses/history", headers=OTHER_AUTH_HEADERS
+    )
+
+    assert [item["jobId"] for item in history_a.json()["items"]] == [job_a]
+    assert [item["jobId"] for item in history_b.json()["items"]] == [job_b]
+    for path in (f"/v1/analyses/{job_b}", f"/v1/analyses/{job_b}/result"):
+        hidden = await client.get(path)
+        assert hidden.status_code == 404
+        assert hidden.json()["detail"]["code"] == "analysis_not_found"
 
 
 async def _store_history_job(

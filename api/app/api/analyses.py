@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import datetime, timezone
 import hashlib
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 import uuid
 
@@ -238,6 +239,7 @@ async def create_analysis(
     pipeline_revision: str = Depends(get_pipeline_revision),
     installation: Installation = Depends(require_installation),
 ) -> AnalysisCreateResponse:
+    installation_id = installation.id
     _validate_llm_config(request.llm_config)
     _validate_video_id(request.video_id)
     inspection = await run_in_threadpool(
@@ -249,6 +251,7 @@ async def create_analysis(
 
     version = transcript_version(inspection.segments)
     cache_key = analysis_cache_key(
+        installation_id,
         request.video_id,
         request.source_language,
         request.target_language,
@@ -257,7 +260,12 @@ async def create_analysis(
     )
     if request.force:
         cache_key = f"{cache_key}:run:{uuid.uuid4().hex}"
-    existing = await session.scalar(select(AnalysisJob).where(AnalysisJob.cache_key == cache_key))
+    existing = await session.scalar(
+        select(AnalysisJob).where(
+            AnalysisJob.cache_key == cache_key,
+            AnalysisJob.installation_id == installation_id,
+        )
+    )
     if existing and existing.status != "failed":
         if existing.status in INTERRUPTIBLE_JOB_STATUSES:
             # A worker can disappear after claiming a job. Re-queue the job when
@@ -308,7 +316,7 @@ async def create_analysis(
 
     if existing is None:
         job = AnalysisJob(
-            installation_id=installation.id,
+            installation_id=installation_id,
             video_id=request.video_id,
             source_language=request.source_language,
             target_language=request.target_language,
@@ -331,7 +339,10 @@ async def create_analysis(
     except IntegrityError:
         await session.rollback()
         concurrent = await session.scalar(
-            select(AnalysisJob).where(AnalysisJob.cache_key == cache_key)
+            select(AnalysisJob).where(
+                AnalysisJob.cache_key == cache_key,
+                AnalysisJob.installation_id == installation_id,
+            )
         )
         if concurrent is None:
             raise
@@ -372,8 +383,9 @@ async def get_analysis_history(
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
-    _: Installation = Depends(require_installation),
+    installation: Installation = Depends(require_installation),
 ) -> AnalysisHistoryResponse:
+    installation_id = installation.id
     query = (
         select(AnalysisJob, Video, AnalysisResult)
         .join(Video, Video.video_id == AnalysisJob.video_id)
@@ -381,6 +393,7 @@ async def get_analysis_history(
         .where(
             AnalysisJob.status == "completed",
             AnalysisJob.completed_at.is_not(None),
+            AnalysisJob.installation_id == installation_id,
         )
     )
     if video_id is not None:
@@ -416,11 +429,10 @@ async def get_analysis_history(
 async def get_analysis_status(
     job_id: str,
     session: AsyncSession = Depends(get_session),
-    _: Installation = Depends(require_installation),
+    installation: Installation = Depends(require_installation),
 ) -> AnalysisStatusResponse:
-    job = await session.get(AnalysisJob, job_id)
-    if job is None:
-        raise _api_error(404, "analysis_not_found", "没有找到这个分析任务")
+    installation_id = installation.id
+    job = await _owned_job(session, job_id, installation_id)
     return AnalysisStatusResponse(
         job_id=job.id,
         status=job.status,
@@ -433,15 +445,15 @@ async def get_analysis_status(
 async def get_analysis_result(
     job_id: str,
     session: AsyncSession = Depends(get_session),
-    _: Installation = Depends(require_installation),
+    installation: Installation = Depends(require_installation),
 ) -> AnalysisResultResponse:
-    job = await session.scalar(
-        select(AnalysisJob)
-        .options(selectinload(AnalysisJob.result), selectinload(AnalysisJob.video))
-        .where(AnalysisJob.id == job_id)
+    installation_id = installation.id
+    job = await _owned_job(
+        session,
+        job_id,
+        installation_id,
+        options=(selectinload(AnalysisJob.result), selectinload(AnalysisJob.video)),
     )
-    if job is None:
-        raise _api_error(404, "analysis_not_found", "没有找到这个分析任务")
     partial = (
         (job.status == "failed" and job.failure_code == "translation_failed")
         or (job.status == "translating" and job.result is not None)
@@ -557,6 +569,7 @@ def extract_youtube_video_id(url: str) -> str:
 
 
 def analysis_cache_key(
+    installation_id: str,
     video_id: str,
     source_language: str,
     target_language: str,
@@ -565,8 +578,36 @@ def analysis_cache_key(
 ) -> str:
     revision = hashlib.sha256(pipeline_revision.encode()).hexdigest()[:16]
     return ":".join(
-        [video_id, source_language, target_language, transcript_version, revision]
+        [
+            installation_id,
+            video_id,
+            source_language,
+            target_language,
+            transcript_version,
+            revision,
+        ]
     )
+
+
+async def _owned_job(
+    session: AsyncSession,
+    job_id: str,
+    installation_id: str,
+    *,
+    options: tuple[Any, ...] = (),
+) -> AnalysisJob:
+    query = select(AnalysisJob)
+    if options:
+        query = query.options(*options)
+    job = await session.scalar(
+        query.where(
+            AnalysisJob.id == job_id,
+            AnalysisJob.installation_id == installation_id,
+        )
+    )
+    if job is None:
+        raise _api_error(404, "analysis_not_found", "没有找到这个分析任务")
+    return job
 
 
 def _validate_video_id(video_id: str) -> None:
