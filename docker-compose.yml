@@ -4,6 +4,7 @@ services:
       context: ./api
     env_file:
       - ./api/.env
+    # Includes LLM_CREDENTIAL_ENCRYPTION_KEY and quota settings from api/.env.
     environment:
       RUNNING_IN_DOCKER: "true"
       DATABASE_URL: postgresql+asyncpg://youtube_preview:${POSTGRES_PASSWORD:-youtube_preview}@postgresql:5432/youtube_preview
@@ -30,6 +31,7 @@ services:
       context: ./api
     env_file:
       - ./api/.env
+    # Includes LLM_CREDENTIAL_ENCRYPTION_KEY and quota settings from api/.env.
     environment:
       RUNNING_IN_DOCKER: "true"
       DATABASE_URL: postgresql+asyncpg://youtube_preview:${POSTGRES_PASSWORD:-youtube_preview}@postgresql:5432/youtube_preview

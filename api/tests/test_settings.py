@@ -1,8 +1,44 @@
+import base64
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app import main
 from app.core.settings import Settings
+
+
+def test_security_and_quota_settings_have_safe_defaults():
+    settings = Settings(_env_file=None)
+
+    assert settings.llm_credential_ttl_seconds == 3600
+    assert settings.write_rate_limit_per_minute == 20
+    assert settings.read_rate_limit_per_minute == 120
+    assert settings.max_active_jobs_per_installation == 1
+    assert settings.max_video_duration_seconds == 14400
+    assert settings.llm_credential_encryption_key is None
+
+
+def test_production_settings_require_a_32_byte_base64_encryption_key():
+    key = base64.b64encode(b"a" * 32).decode("ascii")
+
+    settings = Settings(
+        _env_file=None,
+        environment="production",
+        llm_credential_encryption_key=key,
+    )
+
+    assert settings.llm_credential_encryption_key is not None
+    assert settings.llm_credential_encryption_key.get_secret_value() == key
+
+
+@pytest.mark.parametrize("key", [None, "not-base64", base64.b64encode(b"a" * 31).decode("ascii")])
+def test_production_settings_reject_missing_or_invalid_encryption_keys(key):
+    with pytest.raises(ValueError):
+        Settings(
+            _env_file=None,
+            environment="production",
+            llm_credential_encryption_key=key,
+        )
 
 
 def test_settings_include_service_urls_analysis_model_and_extension_origins():

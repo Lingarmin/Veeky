@@ -1,9 +1,11 @@
+import base64
+import binascii
 import os
 from functools import lru_cache
 from typing import Literal, Self
 from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, PositiveInt, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -30,6 +32,35 @@ class Settings(BaseSettings):
     analysis_prompt_version: str = "v1"
     environment: Literal["development", "production"] = "development"
     allowed_chrome_extension_origins: list[str] = Field(default_factory=list)
+    llm_credential_ttl_seconds: PositiveInt = 3600
+    write_rate_limit_per_minute: PositiveInt = 20
+    read_rate_limit_per_minute: PositiveInt = 120
+    max_active_jobs_per_installation: PositiveInt = 1
+    max_video_duration_seconds: PositiveInt = 14400
+    llm_credential_encryption_key: SecretStr | None = None
+
+    @model_validator(mode="after")
+    def require_valid_encryption_key_in_production(self) -> Self:
+        if self.environment != "production":
+            return self
+        if self.llm_credential_encryption_key is None:
+            raise ValueError(
+                "LLM_CREDENTIAL_ENCRYPTION_KEY is required in production"
+            )
+        try:
+            decoded_key = base64.b64decode(
+                self.llm_credential_encryption_key.get_secret_value(),
+                validate=True,
+            )
+        except (binascii.Error, ValueError) as error:
+            raise ValueError(
+                "LLM_CREDENTIAL_ENCRYPTION_KEY must be valid base64"
+            ) from error
+        if len(decoded_key) != 32:
+            raise ValueError(
+                "LLM_CREDENTIAL_ENCRYPTION_KEY must decode to exactly 32 bytes"
+            )
+        return self
 
     @model_validator(mode="after")
     def replace_loopback_proxy_inside_docker(self) -> Self:
