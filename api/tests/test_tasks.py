@@ -235,10 +235,46 @@ async def test_default_pipeline_fails_when_temporary_credentials_expired(
 
 
 @pytest.mark.asyncio
+async def test_default_pipeline_treats_invalid_ciphertext_as_expired_credentials(
+    pipeline_context,
+):
+    factory, job_id = pipeline_context
+    cipher = JobCredentialCipher(VALID_TEST_KEY)
+    async with factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        job.llm_config = {
+            "provider": "kimi",
+            "api_url": "https://api.example.com/v1",
+            "model": "kimi-k2.5",
+        }
+        job.llm_credential_ciphertext = "invalid-ciphertext"
+        job.llm_credential_expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+        await session.commit()
+    pipeline = AnalysisPipeline(
+        factory,
+        FakeTranscriptService(),
+        FakeTranslationProvider(),
+        FakeAnalysisService(),
+        credential_cipher=cipher,
+    )
+    pipeline._uses_default_providers = True
+
+    await pipeline.run(job_id)
+
+    async with factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        assert job.status == "failed"
+        assert job.failure_code == "llm_credentials_expired"
+        assert job.llm_credential_ciphertext is None
+        assert job.llm_credential_expires_at is None
+
+
+@pytest.mark.asyncio
 async def test_expired_credential_cleanup_clears_only_expired_secrets(pipeline_context):
     factory, expired_job_id = pipeline_context
     async with factory() as session:
         expired = await session.get(AnalysisJob, expired_job_id)
+        expired.status = "failed"
         expired.llm_credential_ciphertext = "expired"
         expired.llm_credential_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
         current = AnalysisJob(

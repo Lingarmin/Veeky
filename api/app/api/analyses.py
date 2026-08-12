@@ -462,6 +462,16 @@ async def create_analysis(
             )
         )
         if concurrent is None:
+            active_job = await session.scalar(
+                select(AnalysisJob).where(
+                    AnalysisJob.installation_id == installation_id,
+                    AnalysisJob.status.in_(
+                        {"queued", "fetching_transcript", "translating", "analyzing"}
+                    ),
+                )
+            )
+            if active_job is not None:
+                raise _analysis_concurrency_error()
             raise
         response.status_code = 200 if concurrent.status == "completed" else 202
         return AnalysisCreateResponse(

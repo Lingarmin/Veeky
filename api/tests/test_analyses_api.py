@@ -93,6 +93,15 @@ class PermissiveQuotaLimiter:
             yield
 
 
+class UnlockedQuotaLimiter:
+    async def enforce(self, subject, request_class, limit):
+        return None
+
+    @asynccontextmanager
+    async def installation_create_lock(self, installation_id):
+        yield
+
+
 class FailingQuotaLimiter:
     async def enforce(self, subject, request_class, limit):
         raise QuotaServiceUnavailable("redis unavailable")
@@ -864,6 +873,29 @@ async def test_concurrent_create_requests_reuse_one_job(api_context):
     assert {first.status_code, second.status_code} == {202}
     assert first.json()["jobId"] == second.json()["jobId"]
     assert dispatched == [first.json()["jobId"]]
+
+
+@pytest.mark.asyncio
+async def test_database_rejects_second_active_job_after_redis_lock_expires(api_context):
+    client, app, _, dispatched = api_context
+    app.dependency_overrides[get_quota_limiter] = lambda: UnlockedQuotaLimiter()
+    first_payload = {
+        "videoId": "aircAruvnKk",
+        "sourceLanguage": "en",
+        "targetLanguage": "zh-Hans",
+        "llmConfig": LLM_CONFIG,
+    }
+    second_payload = {**first_payload, "targetLanguage": "fr"}
+
+    first, second = await asyncio.gather(
+        client.post("/v1/analyses", json=first_payload),
+        client.post("/v1/analyses", json=second_payload),
+    )
+
+    responses = {first.status_code: first, second.status_code: second}
+    assert set(responses) == {202, 429}
+    assert responses[429].json()["detail"]["code"] == "analysis_concurrency_limit"
+    assert len(dispatched) == 1
 
 
 @pytest.mark.asyncio

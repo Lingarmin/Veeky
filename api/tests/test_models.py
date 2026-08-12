@@ -132,6 +132,44 @@ async def test_analysis_job_starts_queued_and_uses_utc_timestamp(session):
 
 
 @pytest.mark.asyncio
+async def test_installation_cannot_have_two_active_analysis_jobs(session):
+    installation = Installation(
+        id="66666666-6666-4666-8666-666666666666", token_hash="d" * 64
+    )
+    video = Video(
+        video_id="aircAruvnKk",
+        title="But what is a neural network?",
+        duration_ms=1_159_000,
+        source_url="https://www.youtube.com/watch?v=aircAruvnKk",
+    )
+    session.add_all(
+        [
+            AnalysisJob(
+                installation=installation,
+                video=video,
+                source_language="en",
+                target_language="zh-Hans",
+                transcript_version="sha256:abc",
+                cache_key="active-job-one",
+                status="queued",
+            ),
+            AnalysisJob(
+                installation=installation,
+                video=video,
+                source_language="en",
+                target_language="fr",
+                transcript_version="sha256:abc",
+                cache_key="active-job-two",
+                status="analyzing",
+            ),
+        ]
+    )
+
+    with pytest.raises(IntegrityError):
+        await session.commit()
+
+
+@pytest.mark.asyncio
 async def test_analysis_job_belongs_to_installation_and_stores_encrypted_credentials(session):
     installation = Installation(
         id="22222222-2222-4222-8222-222222222222", token_hash="b" * 64

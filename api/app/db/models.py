@@ -15,6 +15,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -148,6 +149,17 @@ class AnalysisJob(Base):
             name="ck_analysis_job_status",
         ),
         Index("ix_analysis_jobs_video_languages", "video_id", "source_language", "target_language"),
+        Index(
+            "uq_analysis_jobs_one_active_per_installation",
+            "installation_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('queued', 'fetching_transcript', 'translating', 'analyzing')"
+            ),
+            sqlite_where=text(
+                "status IN ('queued', 'fetching_transcript', 'translating', 'analyzing')"
+            ),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_string)

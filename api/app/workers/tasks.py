@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import binascii
 from datetime import datetime, timezone
 
 from celery import Celery
+from cryptography.exceptions import InvalidTag
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -130,9 +132,13 @@ class AnalysisPipeline:
                     await self._fail(job_id, "llm_credentials_expired", None)
                     return
                 assert self.credential_cipher is not None
-                api_key = self.credential_cipher.decrypt(
-                    job.id, job.llm_credential_ciphertext
-                )
+                try:
+                    api_key = self.credential_cipher.decrypt(
+                        job.id, job.llm_credential_ciphertext
+                    )
+                except (ValueError, binascii.Error, InvalidTag, UnicodeDecodeError):
+                    await self._fail(job_id, "llm_credentials_expired", None)
+                    return
                 provider_config = dict(job.llm_config or {})
                 provider_config["api_key"] = api_key
                 translation_provider, analysis_service = build_llm_services(
