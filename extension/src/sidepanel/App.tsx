@@ -41,6 +41,13 @@ interface AppProps {
   pollIntervalMs?: number;
 }
 
+interface RetryAnalysisInput {
+  videoId: string;
+  sourceLanguage: string;
+  targetLanguage: string;
+  title: string;
+}
+
 const TARGET_LANGUAGES = [
   ["zh-Hans", "简体中文"],
   ["zh-Hant", "繁体中文"],
@@ -89,6 +96,8 @@ export function App({
   const [historyError, setHistoryError] = useState("");
   const [resultFromHistory, setResultFromHistory] = useState(false);
   const [settingsReturnPhase, setSettingsReturnPhase] = useState<Phase>("selecting");
+  const [failedAnalysis, setFailedAnalysis] = useState<RetryAnalysisInput | null>(null);
+  const [errorCodeValue, setErrorCodeValue] = useState<string | null>(null);
   const timerRef = useRef<number | null>(null);
 
   const stopPolling = useCallback(() => {
@@ -129,6 +138,7 @@ export function App({
           return;
         }
         setError(errorMessageForCode(status.failureCode));
+        setErrorCodeValue(status.failureCode);
         if (videoId) {
           const history = await api.getHistory({ videoId, limit: 1, offset: 0 });
           if (history.items[0]) {
@@ -143,7 +153,9 @@ export function App({
       }
       timerRef.current = window.setTimeout(() => void poll(jobId, videoId), pollIntervalMs);
     } catch (requestError) {
-      setError(errorMessageForCode(errorCode(requestError)));
+      const code = errorCode(requestError);
+      setError(errorMessageForCode(code));
+      setErrorCodeValue(code);
       setPhase("error");
     }
   }, [api, pollIntervalMs]);
@@ -152,6 +164,8 @@ export function App({
     stopPolling();
     setPhase("loading");
     setError("");
+    setErrorCodeValue(null);
+    setFailedAnalysis(null);
     setInspection(null);
     setInspectionUrl("");
     try {
@@ -187,7 +201,9 @@ export function App({
       }
       setPhase("selecting");
     } catch (requestError) {
-      setError(errorMessageForCode(errorCode(requestError)));
+      const code = errorCode(requestError);
+      setError(errorMessageForCode(code));
+      setErrorCodeValue(code);
       setPhase("error");
     }
   }, [api, browser, poll, stopPolling]);
@@ -208,6 +224,7 @@ export function App({
     }
     stopPolling();
     setError("");
+    setErrorCodeValue(null);
     setPhase("checking");
     try {
       const inspected = await api.inspect(url);
@@ -216,7 +233,9 @@ export function App({
       setSourceLanguage(inspected.selectedLanguage);
       setPhase("ready");
     } catch (requestError) {
-      setError(errorMessageForCode(errorCode(requestError)));
+      const code = errorCode(requestError);
+      setError(errorMessageForCode(code));
+      setErrorCodeValue(code);
       setPhase("selecting");
     }
   };
@@ -275,6 +294,12 @@ export function App({
     setJobStatus("queued");
     try {
       const videoId = inspection.videoId;
+      setFailedAnalysis({
+        videoId,
+        sourceLanguage,
+        targetLanguage,
+        title: videoId === context.videoId ? context.title : `YouTube video ${videoId}`,
+      });
       const created = await api.createAnalysis({
         videoId,
         sourceLanguage,
@@ -289,11 +314,14 @@ export function App({
       if (created.status === "completed") {
         setResult(await api.getResult(created.jobId));
         setPhase("complete");
+        setFailedAnalysis(null);
       } else {
         void poll(created.jobId, videoId);
       }
     } catch (requestError) {
-      setError(errorMessageForCode(errorCode(requestError)));
+      const code = errorCode(requestError);
+      setError(errorMessageForCode(code));
+      setErrorCodeValue(code);
       setPhase("error");
     }
   };
@@ -326,6 +354,40 @@ export function App({
       void poll(created.jobId, result.videoId);
     } catch (requestError) {
       setError(errorMessageForCode(errorCode(requestError)));
+      setPhase("error");
+    }
+  };
+
+  const retryExpiredCredentials = async () => {
+    if (!context || !failedAnalysis) {
+      await prepareVideoChoice();
+      return;
+    }
+    if (!isLlmConfigured(llmConfig)) {
+      setSettingsError("请先配置 LLM 服务，才能重新提交任务。");
+      setSettingsReturnPhase("error");
+      setPhase("settings");
+      return;
+    }
+    setPhase("processing");
+    setJobStatus("queued");
+    setErrorCodeValue(null);
+    try {
+      const created = await api.createAnalysis({
+        ...failedAnalysis,
+        llmConfig,
+        force: true,
+      });
+      await browser.registerAnalysis(
+        context.tabId,
+        failedAnalysis.videoId,
+        created.jobId,
+      );
+      void poll(created.jobId, failedAnalysis.videoId);
+    } catch (requestError) {
+      const code = errorCode(requestError);
+      setError(errorMessageForCode(code));
+      setErrorCodeValue(code);
       setPhase("error");
     }
   };
@@ -443,7 +505,13 @@ export function App({
         />
       )}
       {phase === "processing" && <ProcessingView status={jobStatus} />}
-      {phase === "error" && <ErrorView message={error} onRetry={() => void prepareVideoChoice()} />}
+      {phase === "error" && <ErrorView
+        message={error}
+        retryLabel={errorCodeValue === "llm_credentials_expired" ? "重试" : "重新检查"}
+        onRetry={errorCodeValue === "llm_credentials_expired"
+          ? () => void retryExpiredCredentials()
+          : () => void prepareVideoChoice()}
+      />}
       {phase === "complete" && result && (
         <ResultView
           result={result}
@@ -753,13 +821,13 @@ function CheckingView() {
   return <main className="checking-view" aria-live="polite"><RefreshCw size={25} /><p>正在检查公开字幕</p></main>;
 }
 
-function ErrorView({ message, onRetry }: { message: string; onRetry(): void }) {
+function ErrorView({ message, retryLabel, onRetry }: { message: string; retryLabel: string; onRetry(): void }) {
   return (
     <main className="error-view">
       <AlertCircle size={30} strokeWidth={1.5} />
       <h1>{message}</h1>
       <p>检查当前视频后重试，已有后台任务不会受到影响。</p>
-      <button type="button" onClick={onRetry}>重新检查</button>
+      <button type="button" onClick={onRetry}>{retryLabel}</button>
     </main>
   );
 }

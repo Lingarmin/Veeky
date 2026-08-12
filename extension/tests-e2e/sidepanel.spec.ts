@@ -205,3 +205,67 @@ test("restores saved analysis and seeks the existing player without reloading", 
     rmSync(profilePath, { recursive: true, force: true });
   }
 });
+
+test("shows the four-hour limit error before analysis can start", async () => {
+  const extensionPath = resolve(process.cwd(), "dist");
+  const executablePath = process.env.PLAYWRIGHT_CHROMIUM_PATH
+    ?? chromium.executablePath();
+  test.skip(
+    !existsSync(executablePath),
+    "Install Playwright Chromium or set PLAYWRIGHT_CHROMIUM_PATH",
+  );
+  const profilePath = mkdtempSync(join(tmpdir(), "veeky-duration-limit-"));
+  const context = await chromium.launchPersistentContext(profilePath, {
+    executablePath,
+    headless: true,
+    args: [
+      `--disable-extensions-except=${extensionPath}`,
+      `--load-extension=${extensionPath}`,
+    ],
+  });
+
+  try {
+    await context.route("http://127.0.0.1:8000/v1/installations/register", (route) => route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({ installationId: "11111111-1111-4111-8111-111111111111" }),
+    }));
+    await context.route("http://127.0.0.1:8000/v1/analyses/history**", (route) => route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ items: [], hasMore: false }),
+    }));
+    await context.route("http://127.0.0.1:8000/v1/videos/inspect", (route) => route.fulfill({
+      status: 422,
+      contentType: "application/json",
+      body: JSON.stringify({
+        detail: {
+          code: "video_too_long",
+          message: "此视频时长过长，无法分析。",
+        },
+      }),
+    }));
+
+    let worker = context.serviceWorkers()[0];
+    if (!worker) worker = await context.waitForEvent("serviceworker");
+    const extensionId = new URL(worker.url()).host;
+
+    const videoPage = await context.newPage();
+    await videoPage.route("**/*", (route) => route.fulfill({
+      contentType: "text/html",
+      body: "<title>Long video</title><video></video>",
+    }));
+    await videoPage.goto("https://www.youtube.com/watch?v=aircAruvnKk");
+
+    const extensionPage = await context.newPage();
+    await extensionPage.goto(`chrome-extension://${extensionId}/sidepanel.html`);
+    await videoPage.bringToFront();
+    await extensionPage.reload();
+    await extensionPage.getByRole("button", { name: "检查当前视频字幕" }).click();
+
+    await expect(extensionPage.getByText("此视频时长过长，无法分析。")).toBeVisible();
+    await expect(extensionPage.getByRole("button", { name: "分析此视频" })).toHaveCount(0);
+  } finally {
+    await context.close();
+    rmSync(profilePath, { recursive: true, force: true });
+  }
+});

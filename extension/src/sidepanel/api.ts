@@ -38,6 +38,7 @@ export class ApiError extends Error {
     public readonly code: string,
     message: string,
     public readonly status: number,
+    public readonly retryAfter: number | null = null,
     options?: ErrorOptions,
   ) {
     super(message, options);
@@ -108,7 +109,7 @@ async function authenticatedFetch(
       },
     });
   } catch (error) {
-    throw new ApiError("api_unavailable", "无法连接分析服务", 0, { cause: error });
+    throw new ApiError("api_unavailable", "无法连接分析服务", 0, null, { cause: error });
   }
   return response;
 }
@@ -133,7 +134,14 @@ function parseApiResponse<T>(response: Response, body: Record<string, any>): T {
       detail.code ?? "api_error",
       detail.message ?? "分析请求失败",
       response.status,
+      parseRetryAfter(response.headers.get("Retry-After")),
     );
   }
   return body as T;
+}
+
+function parseRetryAfter(value: string | null): number | null {
+  if (!value) return null;
+  const seconds = Number(value);
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds : null;
 }

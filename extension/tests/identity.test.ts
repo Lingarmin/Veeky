@@ -98,4 +98,22 @@ describe("installation identity", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(fetchMock.mock.calls.filter(([url]) => url.endsWith("/v1/installations/register"))).toHaveLength(1);
   });
+
+  it("preserves Retry-After on API errors", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      detail: { code: "rate_limit_exceeded", message: "slow down" },
+    }), {
+      status: 429,
+      headers: { "Content-Type": "application/json", "Retry-After": "37" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      createApi("http://api.test", createIdentityStore()).getHistory(),
+    ).rejects.toMatchObject({
+      code: "rate_limit_exceeded",
+      status: 429,
+      retryAfter: 37,
+    });
+  });
 });
