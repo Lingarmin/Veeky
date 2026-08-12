@@ -17,6 +17,7 @@ from sqlalchemy.orm import selectinload
 from app.db.models import (
     AnalysisJob,
     AnalysisResult,
+    Installation,
     TranscriptTrack,
     Translation,
     Video,
@@ -32,6 +33,7 @@ from app.services.llm import (
     normalize_chat_completions_url,
     normalize_provider_config,
 )
+from app.security.installations import require_installation
 
 
 router = APIRouter(prefix="/v1")
@@ -150,7 +152,10 @@ class AnalysisResultResponse(ApiModel):
 
 
 @router.post("/llm/test", response_model=LlmTestResponse)
-async def test_llm_connection(request: LlmConfigRequest) -> LlmTestResponse:
+async def test_llm_connection(
+    request: LlmConfigRequest,
+    _: Installation = Depends(require_installation),
+) -> LlmTestResponse:
     try:
         config = normalize_provider_config(
             request.provider, request.api_url, request.api_key, request.model
@@ -206,6 +211,7 @@ def get_pipeline_revision(settings: Settings = Depends(get_settings)) -> str:
 async def inspect_video(
     request: InspectRequest,
     transcript_service: TranscriptService = Depends(get_transcript_service),
+    _: Installation = Depends(require_installation),
 ) -> InspectResponse:
     video_id = extract_youtube_video_id(request.url)
     inspection = await run_in_threadpool(
@@ -230,6 +236,7 @@ async def create_analysis(
     transcript_service: TranscriptService = Depends(get_transcript_service),
     dispatcher: JobDispatcher = Depends(get_job_dispatcher),
     pipeline_revision: str = Depends(get_pipeline_revision),
+    installation: Installation = Depends(require_installation),
 ) -> AnalysisCreateResponse:
     _validate_llm_config(request.llm_config)
     _validate_video_id(request.video_id)
@@ -301,6 +308,7 @@ async def create_analysis(
 
     if existing is None:
         job = AnalysisJob(
+            installation_id=installation.id,
             video_id=request.video_id,
             source_language=request.source_language,
             target_language=request.target_language,
@@ -364,6 +372,7 @@ async def get_analysis_history(
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
+    _: Installation = Depends(require_installation),
 ) -> AnalysisHistoryResponse:
     query = (
         select(AnalysisJob, Video, AnalysisResult)
@@ -405,7 +414,9 @@ async def get_analysis_history(
 
 @router.get("/analyses/{job_id}", response_model=AnalysisStatusResponse)
 async def get_analysis_status(
-    job_id: str, session: AsyncSession = Depends(get_session)
+    job_id: str,
+    session: AsyncSession = Depends(get_session),
+    _: Installation = Depends(require_installation),
 ) -> AnalysisStatusResponse:
     job = await session.get(AnalysisJob, job_id)
     if job is None:
@@ -420,7 +431,9 @@ async def get_analysis_status(
 
 @router.get("/analyses/{job_id}/result", response_model=AnalysisResultResponse)
 async def get_analysis_result(
-    job_id: str, session: AsyncSession = Depends(get_session)
+    job_id: str,
+    session: AsyncSession = Depends(get_session),
+    _: Installation = Depends(require_installation),
 ) -> AnalysisResultResponse:
     job = await session.scalar(
         select(AnalysisJob)

@@ -111,8 +111,21 @@ async def test_api_pipeline_returns_timestamped_transcript_and_reuses_result():
         "llmConfig": {"apiUrl": "https://api.example.com/v1", "apiKey": "test-key"},
     }
     async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers={
+            "Authorization": "Bearer integration-test-installation-token-with-256-bits",
+            "X-Veeky-Installation-Id": "11111111-1111-4111-8111-111111111111",
+        },
     ) as client:
+        registered = await client.post(
+            "/v1/installations/register",
+            json={
+                "installationId": "11111111-1111-4111-8111-111111111111",
+                "installationToken": "integration-test-installation-token-with-256-bits",
+            },
+        )
+        assert registered.status_code == 201
         created = await client.post("/v1/analyses", json=payload)
         assert created.status_code == 202
         job_id = created.json()["jobId"]

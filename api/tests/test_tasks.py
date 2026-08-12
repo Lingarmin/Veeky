@@ -9,6 +9,7 @@ from app.db.models import (
     AnalysisJob,
     AnalysisResult as StoredAnalysisResult,
     Base,
+    Installation,
     TranscriptSegment as StoredSegment,
     Video,
 )
@@ -103,6 +104,9 @@ async def pipeline_context():
     transcript = FakeTranscriptService().inspect("aircAruvnKk").segments
     version = transcript_version(transcript)
     async with factory() as session:
+        installation = Installation(
+            id="11111111-1111-4111-8111-111111111111", token_hash="a" * 64
+        )
         video = Video(
             video_id="aircAruvnKk",
             title="Neural networks",
@@ -110,6 +114,7 @@ async def pipeline_context():
             source_url="https://www.youtube.com/watch?v=aircAruvnKk",
         )
         job = AnalysisJob(
+            installation=installation,
             video=video,
             source_language="en",
             target_language="zh-Hans",

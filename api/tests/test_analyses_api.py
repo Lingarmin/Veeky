@@ -22,6 +22,7 @@ from app.db.models import (
     AnalysisResult,
     AnalysisJob,
     Base,
+    Installation,
     TranscriptSegment as StoredTranscriptSegment,
     TranscriptTrack,
     Translation,
@@ -58,6 +59,12 @@ class FakeTranscriptService:
 
 
 LLM_CONFIG = {"apiUrl": "https://api.example.com/v1", "apiKey": "test-key"}
+INSTALLATION_ID = "11111111-1111-4111-8111-111111111111"
+INSTALLATION_TOKEN = "installation-token-with-at-least-forty-three-characters"
+AUTH_HEADERS = {
+    "Authorization": f"Bearer {INSTALLATION_TOKEN}",
+    "X-Veeky-Installation-Id": INSTALLATION_ID,
+}
 
 
 @pytest.fixture
@@ -78,7 +85,19 @@ async def api_context(tmp_path):
     app.dependency_overrides[get_transcript_service] = lambda: FakeTranscriptService()
     app.dependency_overrides[get_job_dispatcher] = lambda: dispatched.append
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers=AUTH_HEADERS,
+    ) as client:
+        registered = await client.post(
+            "/v1/installations/register",
+            json={
+                "installationId": INSTALLATION_ID,
+                "installationToken": INSTALLATION_TOKEN,
+            },
+        )
+        assert registered.status_code == 201
         yield client, app, factory, dispatched
 
     await engine.dispose()
@@ -195,6 +214,7 @@ async def _store_history_job(
             )
             session.add(video)
         job = AnalysisJob(
+            installation_id=INSTALLATION_ID,
             video_id=video_id,
             source_language="en",
             target_language="zh-Hans",

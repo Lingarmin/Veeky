@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.core.settings import Settings, get_settings
 from app.api.analyses import router as analyses_router
+from app.security.installations import router as installations_router
 
 
 HealthCheck = Callable[[], Awaitable[None]]
@@ -106,6 +107,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    application.include_router(installations_router)
     application.include_router(analyses_router)
     application.get("/health")(health)
     return application
