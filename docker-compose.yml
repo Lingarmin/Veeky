@@ -50,6 +50,21 @@ services:
       start_period: 25s
     restart: unless-stopped
 
+  scheduler:
+    build:
+      context: ./api
+    env_file:
+      - ./api/.env
+    environment:
+      RUNNING_IN_DOCKER: "true"
+      DATABASE_URL: postgresql+asyncpg://youtube_preview:${POSTGRES_PASSWORD:-youtube_preview}@postgresql:5432/youtube_preview
+      REDIS_URL: redis://redis:6379/0
+    command: ["celery", "-A", "app.workers.tasks.celery_app", "beat", "--loglevel=INFO"]
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
   postgresql:
     image: postgres:16.9-alpine
     environment:
