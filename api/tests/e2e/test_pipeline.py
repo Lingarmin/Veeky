@@ -18,6 +18,7 @@ from app.services.transcripts import (
     TranscriptSegment,
     TranscriptTrackInfo,
 )
+from app.security.quotas import get_quota_limiter
 from app.services.translation import TranslatedSegment
 from app.workers.tasks import AnalysisPipeline
 
@@ -35,6 +36,11 @@ class FixedTranscriptService:
             ],
             available=True,
         )
+
+
+class PermissiveQuotaLimiter:
+    async def enforce(self, subject, request_class, limit):
+        return None
 
 
 class FixedTranslationProvider:
@@ -109,6 +115,7 @@ async def test_api_pipeline_returns_timestamped_transcript_and_reuses_result():
     app.dependency_overrides[get_session] = session_dependency
     app.dependency_overrides[get_transcript_service] = lambda: transcript_service
     app.dependency_overrides[get_job_dispatcher] = lambda: lambda _job_id: None
+    app.dependency_overrides[get_quota_limiter] = lambda: PermissiveQuotaLimiter()
 
     payload = {
         "videoId": "aircAruvnKk",

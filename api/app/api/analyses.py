@@ -36,6 +36,12 @@ from app.services.llm import (
 )
 from app.security.installations import require_installation
 from app.security.credentials import JobCredentialCipher
+from app.security.quotas import (
+    QuotaServiceUnavailable,
+    RateLimitExceeded,
+    RedisQuotaLimiter,
+    get_quota_limiter,
+)
 
 
 router = APIRouter(prefix="/v1")
@@ -45,6 +51,32 @@ INTERRUPTIBLE_JOB_STATUSES = {"fetching_transcript", "translating", "analyzing"}
 
 class WorkerUnavailableError(RuntimeError):
     pass
+
+
+async def enforce_write_quota(
+    installation: Installation = Depends(require_installation),
+    limiter: RedisQuotaLimiter = Depends(get_quota_limiter),
+    settings: Settings = Depends(get_settings),
+) -> None:
+    await _enforce_quota(
+        limiter,
+        installation.id,
+        "write",
+        settings.write_rate_limit_per_minute,
+    )
+
+
+async def enforce_read_quota(
+    installation: Installation = Depends(require_installation),
+    limiter: RedisQuotaLimiter = Depends(get_quota_limiter),
+    settings: Settings = Depends(get_settings),
+) -> None:
+    await _enforce_quota(
+        limiter,
+        installation.id,
+        "read",
+        settings.read_rate_limit_per_minute,
+    )
 
 
 def to_camel(value: str) -> str:
@@ -157,6 +189,7 @@ class AnalysisResultResponse(ApiModel):
 async def test_llm_connection(
     request: LlmConfigRequest,
     _: Installation = Depends(require_installation),
+    __: None = Depends(enforce_write_quota),
 ) -> LlmTestResponse:
     try:
         config = normalize_provider_config(
@@ -227,6 +260,7 @@ async def inspect_video(
     request: InspectRequest,
     transcript_service: TranscriptService = Depends(get_transcript_service),
     _: Installation = Depends(require_installation),
+    __: None = Depends(enforce_write_quota),
 ) -> InspectResponse:
     video_id = extract_youtube_video_id(request.url)
     inspection = await run_in_threadpool(
@@ -254,6 +288,7 @@ async def create_analysis(
     credential_cipher: JobCredentialCipher = Depends(get_job_credential_cipher),
     pipeline_revision: str = Depends(get_pipeline_revision),
     settings: Settings = Depends(get_settings),
+    _: None = Depends(enforce_write_quota),
 ) -> AnalysisCreateResponse:
     installation_id = installation.id
     _validate_llm_config(request.llm_config)
@@ -424,6 +459,7 @@ async def get_analysis_history(
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
     installation: Installation = Depends(require_installation),
+    _: None = Depends(enforce_read_quota),
 ) -> AnalysisHistoryResponse:
     installation_id = installation.id
     query = (
@@ -470,6 +506,7 @@ async def get_analysis_status(
     job_id: str,
     session: AsyncSession = Depends(get_session),
     installation: Installation = Depends(require_installation),
+    _: None = Depends(enforce_read_quota),
 ) -> AnalysisStatusResponse:
     installation_id = installation.id
     job = await _owned_job(session, job_id, installation_id)
@@ -486,6 +523,7 @@ async def get_analysis_result(
     job_id: str,
     session: AsyncSession = Depends(get_session),
     installation: Installation = Depends(require_installation),
+    _: None = Depends(enforce_read_quota),
 ) -> AnalysisResultResponse:
     installation_id = installation.id
     job = await _owned_job(
@@ -693,6 +731,31 @@ def _store_llm_credential(
 def _clear_llm_credential(job: AnalysisJob) -> None:
     job.llm_credential_ciphertext = None
     job.llm_credential_expires_at = None
+
+
+async def _enforce_quota(
+    limiter: RedisQuotaLimiter,
+    subject: str,
+    request_class: str,
+    limit: int,
+) -> None:
+    try:
+        await limiter.enforce(subject, request_class, limit)
+    except RateLimitExceeded as error:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "rate_limit_exceeded",
+                "message": "操作过于频繁，请稍后再试。",
+            },
+            headers={"Retry-After": str(error.retry_after)},
+        ) from error
+    except QuotaServiceUnavailable as error:
+        raise _api_error(
+            503,
+            "quota_service_unavailable",
+            "服务暂时繁忙，请稍后再试。",
+        ) from error
 
 
 def _is_video_id(video_id: str) -> bool:

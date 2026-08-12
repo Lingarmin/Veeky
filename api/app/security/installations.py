@@ -6,7 +6,7 @@ import hmac
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.exc import IntegrityError
@@ -14,10 +14,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Installation
 from app.db.session import get_session
+from app.core.settings import Settings, get_settings
+from app.security.quotas import (
+    QuotaServiceUnavailable,
+    RateLimitExceeded,
+    RedisQuotaLimiter,
+    get_quota_limiter,
+)
 
 
 router = APIRouter(prefix="/v1/installations", tags=["installations"])
 _bearer_scheme = HTTPBearer(auto_error=False)
+_REGISTRATION_RATE_LIMIT_PER_MINUTE = 10
 
 
 class RegistrationRequest(BaseModel):
@@ -63,9 +71,36 @@ def _authentication_error() -> HTTPException:
 @router.post("/register", response_model=RegistrationResponse)
 async def register_installation(
     request: RegistrationRequest,
+    http_request: Request,
     response: Response,
     session: Annotated[AsyncSession, Depends(get_session)],
+    limiter: Annotated[RedisQuotaLimiter, Depends(get_quota_limiter)],
+    _: Annotated[Settings, Depends(get_settings)],
 ) -> RegistrationResponse:
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    try:
+        await limiter.enforce(
+            client_ip,
+            "registration",
+            _REGISTRATION_RATE_LIMIT_PER_MINUTE,
+        )
+    except RateLimitExceeded as error:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "rate_limit_exceeded",
+                "message": "操作过于频繁，请稍后再试。",
+            },
+            headers={"Retry-After": str(error.retry_after)},
+        ) from error
+    except QuotaServiceUnavailable as error:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "quota_service_unavailable",
+                "message": "服务暂时繁忙，请稍后再试。",
+            },
+        ) from error
     token_hash = hash_installation_token(request.installation_token)
     installation = await session.get(Installation, request.installation_id)
     if installation is not None:

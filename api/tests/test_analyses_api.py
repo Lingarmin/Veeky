@@ -16,6 +16,7 @@ from app.api.analyses import (
     get_job_dispatcher,
     get_pipeline_revision,
     get_job_credential_cipher,
+    get_quota_limiter,
     get_session,
     get_transcript_service,
 )
@@ -37,6 +38,7 @@ from app.services.transcripts import (
     TranscriptTrackInfo,
 )
 from app.security.credentials import JobCredentialCipher
+from app.security.quotas import QuotaServiceUnavailable, RateLimitExceeded
 
 
 class FakeTranscriptService:
@@ -59,6 +61,27 @@ class FakeTranscriptService:
             segments=[TranscriptSegment(0, 0, 1500, "Hello world")],
             available=True,
         )
+
+
+class PermissiveQuotaLimiter:
+    async def enforce(self, subject, request_class, limit):
+        return None
+
+
+class FailingQuotaLimiter:
+    async def enforce(self, subject, request_class, limit):
+        raise QuotaServiceUnavailable("redis unavailable")
+
+
+class BoundaryQuotaLimiter:
+    def __init__(self):
+        self.counts = {}
+
+    async def enforce(self, subject, request_class, limit):
+        key = (subject, request_class)
+        self.counts[key] = self.counts.get(key, 0) + 1
+        if self.counts[key] > limit:
+            raise RateLimitExceeded(37)
 
 
 LLM_CONFIG = {"apiUrl": "https://api.example.com/v1", "apiKey": "test-key"}
@@ -97,6 +120,7 @@ async def api_context(tmp_path):
     app.dependency_overrides[get_job_credential_cipher] = lambda: JobCredentialCipher(
         VALID_TEST_KEY
     )
+    app.dependency_overrides[get_quota_limiter] = lambda: PermissiveQuotaLimiter()
 
     async with AsyncClient(
         transport=ASGITransport(app=app),
@@ -150,6 +174,65 @@ async def test_inspect_reports_no_caption_track(api_context):
 
     assert response.status_code == 422
     assert response.json()["detail"]["code"] == "no_caption_track"
+
+
+@pytest.mark.asyncio
+async def test_write_rate_limit_rejects_request_twenty_one_with_retry_after(api_context):
+    client, app, _, _ = api_context
+    limiter = BoundaryQuotaLimiter()
+    app.dependency_overrides[get_quota_limiter] = lambda: limiter
+
+    for _ in range(20):
+        response = await client.post(
+            "/v1/videos/inspect",
+            json={"url": "https://youtu.be/aircAruvnKk"},
+        )
+        assert response.status_code == 200
+    blocked = await client.post(
+        "/v1/videos/inspect",
+        json={"url": "https://youtu.be/aircAruvnKk"},
+    )
+
+    assert blocked.status_code == 429
+    assert blocked.json()["detail"]["code"] == "rate_limit_exceeded"
+    assert blocked.headers["Retry-After"] == "37"
+
+
+@pytest.mark.asyncio
+async def test_read_rate_limit_is_independent_per_installation(api_context):
+    client, app, _, _ = api_context
+    limiter = BoundaryQuotaLimiter()
+    app.dependency_overrides[get_quota_limiter] = lambda: limiter
+    registered = await client.post(
+        "/v1/installations/register",
+        json={
+            "installationId": OTHER_INSTALLATION_ID,
+            "installationToken": OTHER_INSTALLATION_TOKEN,
+        },
+    )
+    assert registered.status_code == 201
+
+    for _ in range(120):
+        response = await client.get("/v1/analyses/history")
+        assert response.status_code == 200
+    blocked = await client.get("/v1/analyses/history")
+    other = await client.get(
+        "/v1/analyses/history", headers=OTHER_AUTH_HEADERS
+    )
+
+    assert blocked.status_code == 429
+    assert other.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_quota_service_failure_returns_503(api_context):
+    client, app, _, _ = api_context
+    app.dependency_overrides[get_quota_limiter] = lambda: FailingQuotaLimiter()
+
+    response = await client.get("/v1/analyses/history")
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "quota_service_unavailable"
 
 
 @pytest.mark.asyncio

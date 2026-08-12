@@ -11,6 +11,7 @@ from app.core.settings import Settings
 from app.db.models import Base, Installation
 from app.db.session import get_session
 from app.main import create_app
+from app.security.quotas import get_quota_limiter
 
 
 INSTALLATION_ID = "11111111-1111-4111-8111-111111111111"
@@ -20,6 +21,11 @@ AUTH_HEADERS = {
     "Authorization": f"Bearer {INSTALLATION_TOKEN}",
     "X-Veeky-Installation-Id": INSTALLATION_ID,
 }
+
+
+class PermissiveQuotaLimiter:
+    async def enforce(self, subject, request_class, limit):
+        return None
 
 
 @pytest.fixture
@@ -35,6 +41,7 @@ async def installation_context(tmp_path):
             yield session
 
     app.dependency_overrides[get_session] = session_dependency
+    app.dependency_overrides[get_quota_limiter] = lambda: PermissiveQuotaLimiter()
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         yield client, factory
     await engine.dispose()
