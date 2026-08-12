@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -64,8 +65,17 @@ class FakeTranscriptService:
 
 
 class PermissiveQuotaLimiter:
+    def __init__(self):
+        self.locks = {}
+
     async def enforce(self, subject, request_class, limit):
         return None
+
+    @asynccontextmanager
+    async def installation_create_lock(self, installation_id):
+        lock = self.locks.setdefault(installation_id, asyncio.Lock())
+        async with lock:
+            yield
 
 
 class FailingQuotaLimiter:
@@ -120,7 +130,8 @@ async def api_context(tmp_path):
     app.dependency_overrides[get_job_credential_cipher] = lambda: JobCredentialCipher(
         VALID_TEST_KEY
     )
-    app.dependency_overrides[get_quota_limiter] = lambda: PermissiveQuotaLimiter()
+    quota_limiter = PermissiveQuotaLimiter()
+    app.dependency_overrides[get_quota_limiter] = lambda: quota_limiter
 
     async with AsyncClient(
         transport=ASGITransport(app=app),
@@ -351,6 +362,90 @@ async def test_identical_analysis_is_cached_per_installation(api_context):
             OTHER_INSTALLATION_ID,
         }
     assert dispatched == [first_a.json()["jobId"], first_b.json()["jobId"]]
+
+
+@pytest.mark.asyncio
+async def test_different_analysis_is_blocked_while_installation_has_active_job(
+    api_context,
+):
+    client, _, _, dispatched = api_context
+    first = await client.post(
+        "/v1/analyses",
+        json={
+            "videoId": "aircAruvnKk",
+            "sourceLanguage": "en",
+            "targetLanguage": "zh-Hans",
+            "llmConfig": LLM_CONFIG,
+        },
+    )
+    blocked = await client.post(
+        "/v1/analyses",
+        json={
+            "videoId": "aircAruvnKk",
+            "sourceLanguage": "en",
+            "targetLanguage": "fr",
+            "llmConfig": LLM_CONFIG,
+        },
+    )
+
+    assert first.status_code == 202
+    assert blocked.status_code == 429
+    assert blocked.json()["detail"] == {
+        "code": "analysis_concurrency_limit",
+        "message": "已有视频正在分析，请等待完成后再试。",
+    }
+    assert dispatched == [first.json()["jobId"]]
+
+
+@pytest.mark.asyncio
+async def test_active_job_limit_is_independent_per_installation(api_context):
+    client, _, _, dispatched = api_context
+    registered = await client.post(
+        "/v1/installations/register",
+        json={
+            "installationId": OTHER_INSTALLATION_ID,
+            "installationToken": OTHER_INSTALLATION_TOKEN,
+        },
+    )
+    assert registered.status_code == 201
+    payload = {
+        "videoId": "aircAruvnKk",
+        "sourceLanguage": "en",
+        "targetLanguage": "zh-Hans",
+        "llmConfig": LLM_CONFIG,
+    }
+
+    first = await client.post("/v1/analyses", json=payload)
+    other = await client.post(
+        "/v1/analyses", json=payload, headers=OTHER_AUTH_HEADERS
+    )
+
+    assert first.status_code == 202
+    assert other.status_code == 202
+    assert first.json()["jobId"] != other.json()["jobId"]
+    assert len(dispatched) == 2
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_different_analyses_create_only_one_active_job(api_context):
+    client, _, _, dispatched = api_context
+    base = {
+        "videoId": "aircAruvnKk",
+        "sourceLanguage": "en",
+        "llmConfig": LLM_CONFIG,
+    }
+
+    first, second = await asyncio.gather(
+        client.post(
+            "/v1/analyses", json={**base, "targetLanguage": "zh-Hans"}
+        ),
+        client.post("/v1/analyses", json={**base, "targetLanguage": "fr"}),
+    )
+
+    assert sorted([first.status_code, second.status_code]) == [202, 429]
+    blocked = first if first.status_code == 429 else second
+    assert blocked.json()["detail"]["code"] == "analysis_concurrency_limit"
+    assert len(dispatched) == 1
 
 
 @pytest.mark.asyncio
@@ -598,6 +693,11 @@ async def test_force_create_generates_new_jobs_and_preserves_cached_result(api_c
 
     cached = await client.post("/v1/analyses", json={**payload, "force": False})
     forced_once = await client.post("/v1/analyses", json={**payload, "force": True})
+    async with factory() as session:
+        forced_job = await session.get(AnalysisJob, forced_once.json()["jobId"])
+        forced_job.status = "completed"
+        forced_job.completed_at = datetime.now(timezone.utc)
+        await session.commit()
     forced_twice = await client.post("/v1/analyses", json={**payload, "force": True})
 
     assert cached.status_code == 200
@@ -853,7 +953,7 @@ async def test_result_returns_summary_while_translation_is_still_running(api_con
 
 @pytest.mark.asyncio
 async def test_pipeline_revision_change_creates_a_new_job(api_context):
-    client, app, _, dispatched = api_context
+    client, app, factory, dispatched = api_context
     payload = {
         "videoId": "aircAruvnKk",
         "sourceLanguage": "en",
@@ -861,6 +961,11 @@ async def test_pipeline_revision_change_creates_a_new_job(api_context):
         "llmConfig": LLM_CONFIG,
     }
     first = await client.post("/v1/analyses", json=payload)
+    async with factory() as session:
+        first_job = await session.get(AnalysisJob, first.json()["jobId"])
+        first_job.status = "completed"
+        first_job.completed_at = datetime.now(timezone.utc)
+        await session.commit()
     app.dependency_overrides[get_pipeline_revision] = lambda: "next-pipeline"
 
     second = await client.post("/v1/analyses", json=payload)

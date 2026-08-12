@@ -5,6 +5,7 @@ import math
 import pytest
 
 from app.security.quotas import (
+    InstallationLockUnavailable,
     QuotaServiceUnavailable,
     RateLimitExceeded,
     RedisQuotaLimiter,
@@ -27,6 +28,25 @@ class FakeRedis:
             return [0, min(entries.values())]
         entries[str(member)] = int(now)
         return [1, int(now)]
+
+
+class FakeLockRedis:
+    def __init__(self):
+        self.values = {}
+
+    async def set(self, key, value, *, nx, px):
+        assert nx is True
+        assert px == 5000
+        if key in self.values:
+            return None
+        self.values[key] = value
+        return True
+
+    async def eval(self, _script, _num_keys, key, owner):
+        if self.values.get(key) != owner:
+            return 0
+        del self.values[key]
+        return 1
 
 
 @pytest.mark.asyncio
@@ -76,3 +96,18 @@ async def test_quota_fails_closed_when_redis_is_unavailable():
 
     with pytest.raises(QuotaServiceUnavailable):
         await limiter.enforce("installation-a", "write", 20)
+
+
+@pytest.mark.asyncio
+async def test_installation_create_lock_is_owned_and_released():
+    redis = FakeLockRedis()
+    first = RedisQuotaLimiter(redis)
+    second = RedisQuotaLimiter(redis)
+
+    async with first.installation_create_lock("installation-a"):
+        with pytest.raises(InstallationLockUnavailable):
+            async with second.installation_create_lock("installation-a"):
+                pass
+
+    async with second.installation_create_lock("installation-a"):
+        pass

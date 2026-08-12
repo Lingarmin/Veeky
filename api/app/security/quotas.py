@@ -4,6 +4,7 @@ import math
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Protocol
 
@@ -34,10 +35,18 @@ redis.call('ZADD', key, now, member)
 redis.call('PEXPIRE', key, ttl)
 return {1, now}
 """
+_LOCK_RELEASE_SCRIPT = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
 
 
 class AsyncRedis(Protocol):
     async def eval(self, script: str, numkeys: int, *keys_and_args): ...
+
+    async def set(self, key: str, value: str, *, nx: bool, px: int): ...
 
 
 class RateLimitExceeded(RuntimeError):
@@ -47,6 +56,10 @@ class RateLimitExceeded(RuntimeError):
 
 
 class QuotaServiceUnavailable(RuntimeError):
+    pass
+
+
+class InstallationLockUnavailable(RuntimeError):
     pass
 
 
@@ -81,6 +94,24 @@ class RedisQuotaLimiter:
             return
         retry_ms = int(oldest_ms) + _WINDOW_MILLISECONDS - now_ms
         raise RateLimitExceeded(max(1, math.ceil(retry_ms / 1000)))
+
+    @asynccontextmanager
+    async def installation_create_lock(self, installation_id: str):
+        key = f"veeky:lock:analysis-create:{installation_id}"
+        owner = uuid.uuid4().hex
+        try:
+            acquired = await self.client.set(key, owner, nx=True, px=5000)
+        except Exception as error:
+            raise QuotaServiceUnavailable("quota storage unavailable") from error
+        if not acquired:
+            raise InstallationLockUnavailable("analysis creation is already locked")
+        try:
+            yield
+        finally:
+            try:
+                await self.client.eval(_LOCK_RELEASE_SCRIPT, 1, key, owner)
+            except Exception as error:
+                raise QuotaServiceUnavailable("quota storage unavailable") from error
 
 
 @lru_cache

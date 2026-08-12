@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 
@@ -41,6 +42,10 @@ class FixedTranscriptService:
 class PermissiveQuotaLimiter:
     async def enforce(self, subject, request_class, limit):
         return None
+
+    @asynccontextmanager
+    async def installation_create_lock(self, installation_id):
+        yield
 
 
 class FixedTranslationProvider:

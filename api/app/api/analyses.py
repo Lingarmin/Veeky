@@ -10,7 +10,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -39,6 +39,7 @@ from app.security.credentials import JobCredentialCipher
 from app.security.quotas import (
     QuotaServiceUnavailable,
     RateLimitExceeded,
+    InstallationLockUnavailable,
     RedisQuotaLimiter,
     get_quota_limiter,
 )
@@ -77,6 +78,23 @@ async def enforce_read_quota(
         "read",
         settings.read_rate_limit_per_minute,
     )
+
+
+async def enforce_analysis_create_lock(
+    installation: Installation = Depends(require_installation),
+    limiter: RedisQuotaLimiter = Depends(get_quota_limiter),
+):
+    try:
+        async with limiter.installation_create_lock(installation.id):
+            yield
+    except InstallationLockUnavailable as error:
+        raise _analysis_concurrency_error() from error
+    except QuotaServiceUnavailable as error:
+        raise _api_error(
+            503,
+            "quota_service_unavailable",
+            "服务暂时繁忙，请稍后再试。",
+        ) from error
 
 
 def to_camel(value: str) -> str:
@@ -289,6 +307,7 @@ async def create_analysis(
     pipeline_revision: str = Depends(get_pipeline_revision),
     settings: Settings = Depends(get_settings),
     _: None = Depends(enforce_write_quota),
+    __: None = Depends(enforce_analysis_create_lock),
 ) -> AnalysisCreateResponse:
     installation_id = installation.id
     _validate_llm_config(request.llm_config)
@@ -358,6 +377,19 @@ async def create_analysis(
         return AnalysisCreateResponse(
             job_id=existing.id, cache_hit=cache_hit, status=existing.status
         )
+
+    active_jobs = await session.scalar(
+        select(func.count())
+        .select_from(AnalysisJob)
+        .where(
+            AnalysisJob.installation_id == installation_id,
+            AnalysisJob.status.in_(
+                {"queued", "fetching_transcript", "translating", "analyzing"}
+            ),
+        )
+    )
+    if (active_jobs or 0) >= settings.max_active_jobs_per_installation:
+        raise _analysis_concurrency_error()
 
     duration_ms = max(segment.start_ms + segment.duration_ms for segment in inspection.segments)
     video = await session.get(Video, request.video_id)
@@ -756,6 +788,14 @@ async def _enforce_quota(
             "quota_service_unavailable",
             "服务暂时繁忙，请稍后再试。",
         ) from error
+
+
+def _analysis_concurrency_error() -> HTTPException:
+    return _api_error(
+        429,
+        "analysis_concurrency_limit",
+        "已有视频正在分析，请等待完成后再试。",
+    )
 
 
 def _is_video_id(video_id: str) -> bool:
