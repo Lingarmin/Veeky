@@ -1,8 +1,25 @@
 # Veeky YouTube 视频内容解析
 
-Chrome Side Panel 扩展会读取 YouTube 的公开字幕，用 LibreTranslate 生成译文，再通过结构化分析服务生成概览、章节和重点片段。任务由 FastAPI 和 Celery 在后台执行，切换标签页不会中断处理。面板只在发起分析的 YouTube 视频标签页启用。
+Veeky是一款chrome插件，启用后常驻Chrome Side Panel，扩展会读取 YouTube 的公开字幕，用 LibreTranslate 生成译文，再通过LLM服务生成概览、章节和重点片段。
+任务由 FastAPI 和 Celery 在后台执行，切换标签页不会中断处理。面板只在发起分析的 YouTube 视频标签页启用。
 
-MVP 不下载视频，不执行语音识别，也不生成关键帧。真实截图和无字幕视频转录留到第二阶段。
+当前版本不下载视频，不执行语音识别，也不生成关键帧。目前不支持无字幕视频的翻译和LLM总结。
+
+已支持功能：
+1.支持识别YouTube视频链接，检查视频字幕并进行分析；
+2.按时间顺序展示字幕，支持点击时间戳视频自动跳转（暂不支持和视频音轨自动播放）；
+3.支持视频概览总结、章节重点、精华片段解析，可点击时间戳视频直接跳转到对应部分；
+4.已分析过的视频会保存在本地，并在历史记录中可回溯，只要不清缓存会一直在；
+5.支持配置LLM模型，使用LLM服务需要用户自己提供API KEY，目前支持kimi和deepseek两家，其他模型供应商暂未集成。
+
+功能截图：
+<img width="1413" height="750" alt="概览" src="https://github.com/user-attachments/assets/60d8e336-b3b1-4783-abb4-f4534a791bf0" />
+<img width="1426" height="748" alt="重点片段" src="https://github.com/user-attachments/assets/053720d2-9281-40f6-be15-571cdb76f3b6" />
+<img width="1430" height="749" alt="字幕翻译" src="https://github.com/user-attachments/assets/b508beea-324f-4bca-97ed-a9a9fe9bbf31" />
+<img width="1418" height="749" alt="历史记录" src="https://github.com/user-attachments/assets/d82ffbc2-0a93-474e-9469-794be85bc447" />
+
+本项目是vibe coding而来，已要求AI进行用户数据隔离和安全防护，但本人非技术出生，若仍有漏洞望理解，欢迎PR和二开。
+另外此项目下载后非开箱即用，需依赖本地docker服务。
 
 ## 目录
 
