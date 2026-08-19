@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.core.settings import Settings, get_settings
 from app.api.analyses import router as analyses_router
+from app.security.installations import router as installations_router
 
 
 HealthCheck = Callable[[], Awaitable[None]]
@@ -90,6 +91,7 @@ async def health(
 def create_app(settings: Settings | None = None) -> FastAPI:
     application_settings = settings or get_settings()
     application = FastAPI(title="YouTube Preview API")
+    application.dependency_overrides[get_settings] = lambda: application_settings
     local_extension_origin_pattern = (
         r"chrome-extension://[a-p]{32}"
         if (
@@ -106,6 +108,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    application.include_router(installations_router)
     application.include_router(analyses_router)
     application.get("/health")(health)
     return application

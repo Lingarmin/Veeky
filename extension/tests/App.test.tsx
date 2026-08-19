@@ -456,6 +456,46 @@ describe("Side Panel", () => {
     expect(screen.getByRole("button", { name: "重新分析" })).toBeInTheDocument();
   });
 
+  it("retries expired task credentials with the locally stored LLM key", async () => {
+    const api = createApi();
+    api.getStatus
+      .mockResolvedValueOnce({
+        jobId: "job-1",
+        status: "failed",
+        failureCode: "llm_credentials_expired",
+        failureDetail: null,
+      })
+      .mockResolvedValueOnce({
+        jobId: "job-2",
+        status: "completed",
+        failureCode: null,
+        failureDetail: null,
+      });
+    api.createAnalysis
+      .mockResolvedValueOnce({ jobId: "job-1", cacheHit: false, status: "queued" })
+      .mockResolvedValueOnce({ jobId: "job-2", cacheHit: false, status: "queued" });
+    const user = userEvent.setup();
+    render(<App api={api} browser={createBrowser()} llmStore={createLlmStore()} pollIntervalMs={1} />);
+
+    await user.click(await screen.findByRole("button", { name: "检查当前视频字幕" }));
+    await user.click(screen.getByRole("button", { name: "分析此视频" }));
+    expect(await screen.findByText("任务凭据已过期，请点击重试。")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "重试" }));
+
+    await waitFor(() => expect(api.createAnalysis).toHaveBeenCalledTimes(2));
+    expect(api.createAnalysis).toHaveBeenLastCalledWith(expect.objectContaining({
+      videoId: "aircAruvnKk",
+      force: true,
+      llmConfig: {
+        provider: "kimi",
+        apiUrl: "https://api.example.com/v1",
+        apiKey: "test-key",
+        model: "kimi-k2.5",
+      },
+    }));
+    expect(screen.queryByRole("heading", { name: "LLM 设置" })).not.toBeInTheDocument();
+  });
+
   it("shows the overview while subtitle translation continues", async () => {
     const api = createApi();
     api.getStatus.mockResolvedValue({

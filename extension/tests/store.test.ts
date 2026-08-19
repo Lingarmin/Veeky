@@ -20,6 +20,12 @@ describe("side panel helpers", () => {
     expect(errorMessageForCode("translation_rejected")).toBe("翻译服务拒绝了请求，请检查 LLM 配置");
     expect(errorMessageForCode("llm_quota_exhausted")).toBe("LLM 账户余额不足，请充值或更换 API Key/服务商");
     expect(errorMessageForCode("llm_invalid_response")).toBe("LLM 返回格式无效，请检查模型名称和 Chat Completions 地址");
+    expect(errorMessageForCode("video_too_long")).toBe("此视频时长过长，无法分析。");
+    expect(errorMessageForCode("analysis_concurrency_limit")).toBe("已有视频正在分析，请等待完成后再试。");
+    expect(errorMessageForCode("rate_limit_exceeded")).toBe("操作过于频繁，请稍后再试。");
+    expect(errorMessageForCode("llm_credentials_expired")).toBe("任务凭据已过期，请点击重试。");
+    expect(errorMessageForCode("quota_service_unavailable")).toBe("服务暂时繁忙，请稍后再试。");
+    expect(errorMessageForCode("installation_auth_required")).toBe("插件身份验证失败，请刷新后重试。");
     expect(errorMessageForCode("unexpected")).toBe("分析没有完成，请稍后重试");
     expect(errorMessageForCode("unexpected", "LLM 连接测试失败")).toBe("LLM 连接测试失败");
   });

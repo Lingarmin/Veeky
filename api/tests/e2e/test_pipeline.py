@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 
@@ -7,7 +9,12 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from app.api.analyses import get_job_dispatcher, get_session, get_transcript_service
+from app.api.analyses import (
+    get_job_dispatcher,
+    get_session,
+    get_transcript_service,
+    get_video_metadata_service,
+)
 from app.core.settings import Settings
 from app.db.models import Base
 from app.main import create_app
@@ -17,6 +24,7 @@ from app.services.transcripts import (
     TranscriptSegment,
     TranscriptTrackInfo,
 )
+from app.security.quotas import get_quota_limiter
 from app.services.translation import TranslatedSegment
 from app.workers.tasks import AnalysisPipeline
 
@@ -34,6 +42,20 @@ class FixedTranscriptService:
             ],
             available=True,
         )
+
+
+class PermissiveQuotaLimiter:
+    async def enforce(self, subject, request_class, limit):
+        return None
+
+    @asynccontextmanager
+    async def installation_create_lock(self, installation_id):
+        yield
+
+
+class FixedVideoMetadataService:
+    def duration_ms(self, video_id):
+        return 2000
 
 
 class FixedTranslationProvider:
@@ -93,7 +115,13 @@ async def test_api_pipeline_returns_timestamped_transcript_and_reuses_result():
     factory = async_sessionmaker(engine, expire_on_commit=False)
     transcript_service = FixedTranscriptService()
     translation_provider = FixedTranslationProvider()
-    app = create_app(Settings())
+    app = create_app(
+        Settings(
+            llm_credential_encryption_key=base64.b64encode(b"v" * 32).decode(
+                "ascii"
+            )
+        )
+    )
 
     async def session_dependency() -> AsyncIterator[AsyncSession]:
         async with factory() as session:
@@ -101,7 +129,11 @@ async def test_api_pipeline_returns_timestamped_transcript_and_reuses_result():
 
     app.dependency_overrides[get_session] = session_dependency
     app.dependency_overrides[get_transcript_service] = lambda: transcript_service
+    app.dependency_overrides[get_video_metadata_service] = (
+        lambda: FixedVideoMetadataService()
+    )
     app.dependency_overrides[get_job_dispatcher] = lambda: lambda _job_id: None
+    app.dependency_overrides[get_quota_limiter] = lambda: PermissiveQuotaLimiter()
 
     payload = {
         "videoId": "aircAruvnKk",
@@ -111,8 +143,21 @@ async def test_api_pipeline_returns_timestamped_transcript_and_reuses_result():
         "llmConfig": {"apiUrl": "https://api.example.com/v1", "apiKey": "test-key"},
     }
     async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers={
+            "Authorization": "Bearer integration-test-installation-token-with-256-bits",
+            "X-Veeky-Installation-Id": "11111111-1111-4111-8111-111111111111",
+        },
     ) as client:
+        registered = await client.post(
+            "/v1/installations/register",
+            json={
+                "installationId": "11111111-1111-4111-8111-111111111111",
+                "installationToken": "integration-test-installation-token-with-256-bits",
+            },
+        )
+        assert registered.status_code == 201
         created = await client.post("/v1/analyses", json=payload)
         assert created.status_code == 202
         job_id = created.json()["jobId"]

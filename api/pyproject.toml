@@ -11,6 +11,7 @@ dependencies = [
   "alembic>=1.16,<2",
   "asyncpg>=0.30,<1",
   "celery>=5.5,<6",
+  "cryptography>=45,<46",
   "fastapi>=0.116,<1",
   "httpx>=0.28,<1",
   "pydantic-settings>=2.10,<3",
@@ -18,6 +19,7 @@ dependencies = [
   "sqlalchemy[asyncio]>=2.0.41,<3",
   "uvicorn[standard]>=0.35,<1",
   "youtube-transcript-api>=1.2,<2",
+  "yt-dlp>=2026.7,<2027",
 ]
 
 [project.optional-dependencies]

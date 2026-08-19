@@ -15,6 +15,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -29,6 +30,20 @@ def uuid_string() -> str:
 
 class Base(DeclarativeBase):
     pass
+
+
+class Installation(Base):
+    __tablename__ = "installations"
+    __table_args__ = (
+        CheckConstraint("length(token_hash) = 64", name="ck_installation_token_hash_length"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_string)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    jobs: Mapped[list[AnalysisJob]] = relationship(back_populates="installation")
 
 
 class Video(Base):
@@ -134,9 +149,23 @@ class AnalysisJob(Base):
             name="ck_analysis_job_status",
         ),
         Index("ix_analysis_jobs_video_languages", "video_id", "source_language", "target_language"),
+        Index(
+            "uq_analysis_jobs_one_active_per_installation",
+            "installation_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('queued', 'fetching_transcript', 'translating', 'analyzing')"
+            ),
+            sqlite_where=text(
+                "status IN ('queued', 'fetching_transcript', 'translating', 'analyzing')"
+            ),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_string)
+    installation_id: Mapped[str] = mapped_column(
+        ForeignKey("installations.id", ondelete="CASCADE"), index=True
+    )
     video_id: Mapped[str] = mapped_column(
         ForeignKey("videos.video_id", ondelete="CASCADE"), index=True
     )
@@ -145,12 +174,17 @@ class AnalysisJob(Base):
     transcript_version: Mapped[str] = mapped_column(String(100))
     cache_key: Mapped[str] = mapped_column(String(300), unique=True)
     llm_config: Mapped[dict[str, str] | None] = mapped_column(JSON, nullable=True)
+    llm_credential_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    llm_credential_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     status: Mapped[str] = mapped_column(String(40), default="queued")
     failure_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
     failure_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    installation: Mapped[Installation] = relationship(back_populates="jobs")
     video: Mapped[Video] = relationship(back_populates="jobs")
     result: Mapped[AnalysisResult | None] = relationship(
         back_populates="job", cascade="all, delete-orphan", uselist=False

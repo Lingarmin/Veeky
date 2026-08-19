@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import binascii
 from datetime import datetime, timezone
 
 from celery import Celery
-from sqlalchemy import select
+from cryptography.exceptions import InvalidTag
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -39,6 +41,7 @@ from app.services.translation import (
     TranslationSegment,
     LlmTranslationProvider,
 )
+from app.security.credentials import JobCredentialCipher
 
 
 settings = get_settings()
@@ -47,6 +50,12 @@ celery_app.conf.update(
     task_acks_late=True,
     task_reject_on_worker_lost=True,
     task_track_started=True,
+    beat_schedule={
+        "clear-expired-llm-credentials": {
+            "task": "maintenance.clear_expired_llm_credentials",
+            "schedule": 600.0,
+        }
+    },
 )
 
 
@@ -103,11 +112,13 @@ class AnalysisPipeline:
         transcript_service: TranscriptService,
         translation_provider: TranslationProvider,
         analysis_service: StructuredAnalysisService,
+        credential_cipher: JobCredentialCipher | None = None,
     ):
         self.session_factory = session_factory
         self.transcript_service = transcript_service
         self.translation_provider = translation_provider
         self.analysis_service = analysis_service
+        self.credential_cipher = credential_cipher
         self._uses_default_providers = False
     async def run(self, job_id: str, *, resume: bool = False) -> None:
         job = await self._claim(job_id, resume=resume)
@@ -115,12 +126,27 @@ class AnalysisPipeline:
             return
         translation_provider = self.translation_provider
         analysis_service = self.analysis_service
-        if job.llm_config and self._uses_default_providers:
-            translation_provider, analysis_service = build_llm_services(
-                dict(job.llm_config)
-            )
-
         try:
+            if self._uses_default_providers:
+                if not self._credential_is_current(job):
+                    await self._fail(job_id, "llm_credentials_expired", None)
+                    return
+                assert self.credential_cipher is not None
+                try:
+                    api_key = self.credential_cipher.decrypt(
+                        job.id, job.llm_credential_ciphertext
+                    )
+                except (ValueError, binascii.Error, InvalidTag, UnicodeDecodeError):
+                    await self._fail(job_id, "llm_credentials_expired", None)
+                    return
+                provider_config = dict(job.llm_config or {})
+                provider_config["api_key"] = api_key
+                translation_provider, analysis_service = build_llm_services(
+                    provider_config
+                )
+                api_key = ""
+                provider_config.clear()
+
             inspection = await asyncio.to_thread(
                 self.transcript_service.inspect,
                 job.video_id,
@@ -222,6 +248,7 @@ class AnalysisPipeline:
                 job_row.completed_at = datetime.now(timezone.utc)
                 job_row.failure_code = None
                 job_row.failure_detail = None
+                self._clear_credential(job_row)
                 await session.commit()
         except TranslationProviderError as error:
             await self._fail(job_id, "translation_failed", f"{error.code}: {error}")
@@ -296,7 +323,26 @@ class AnalysisPipeline:
             job.failure_code = failure_code
             job.failure_detail = failure_detail
             job.completed_at = datetime.now(timezone.utc)
+            self._clear_credential(job)
             await session.commit()
+
+    def _credential_is_current(self, job: AnalysisJob) -> bool:
+        if (
+            self.credential_cipher is None
+            or not job.llm_config
+            or not job.llm_credential_ciphertext
+            or job.llm_credential_expires_at is None
+        ):
+            return False
+        expires_at = job.llm_credential_expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        return expires_at > datetime.now(timezone.utc)
+
+    @staticmethod
+    def _clear_credential(job: AnalysisJob) -> None:
+        job.llm_credential_ciphertext = None
+        job.llm_credential_expires_at = None
 
 
 def build_default_pipeline(
@@ -332,6 +378,9 @@ def build_default_pipeline(
         TranscriptService(proxy_url=current.youtube_transcript_proxy_url),
         translation_provider,
         StructuredAnalysisService(analysis_provider),
+        credential_cipher=JobCredentialCipher(
+            current.llm_credential_encryption_key
+        ),
     )
     pipeline._uses_default_providers = True
     return pipeline
@@ -347,6 +396,39 @@ async def run_analysis_task(job_id: str, *, resume: bool = False) -> None:
         await engine.dispose()
 
 
+async def clear_expired_llm_credentials_async(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    now: datetime | None = None,
+) -> int:
+    cutoff = now or datetime.now(timezone.utc)
+    async with session_factory() as session:
+        result = await session.execute(
+            update(AnalysisJob)
+            .where(
+                AnalysisJob.llm_credential_ciphertext.is_not(None),
+                AnalysisJob.llm_credential_expires_at.is_not(None),
+                AnalysisJob.llm_credential_expires_at <= cutoff,
+            )
+            .values(
+                llm_credential_ciphertext=None,
+                llm_credential_expires_at=None,
+            )
+        )
+        await session.commit()
+        return result.rowcount
+
+
+async def run_expired_credential_cleanup() -> int:
+    current = get_settings()
+    engine = create_async_engine(current.database_url, pool_pre_ping=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        return await clear_expired_llm_credentials_async(session_factory)
+    finally:
+        await engine.dispose()
+
+
 @celery_app.task(bind=True, name="analysis.analyze_video")
 def analyze_video(task, job_id: str) -> None:
     delivery_info = task.request.delivery_info or {}
@@ -356,3 +438,8 @@ def analyze_video(task, job_id: str) -> None:
             resume=bool(delivery_info.get("redelivered")),
         )
     )
+
+
+@celery_app.task(name="maintenance.clear_expired_llm_credentials")
+def clear_expired_llm_credentials() -> int:
+    return asyncio.run(run_expired_credential_cleanup())

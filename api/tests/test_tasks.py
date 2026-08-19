@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -9,6 +12,7 @@ from app.db.models import (
     AnalysisJob,
     AnalysisResult as StoredAnalysisResult,
     Base,
+    Installation,
     TranscriptSegment as StoredSegment,
     Video,
 )
@@ -21,6 +25,11 @@ from app.services.transcripts import (
 )
 from app.services.translation import TranslatedSegment, TranslationProviderError
 from app.workers.tasks import AnalysisPipeline, build_llm_services
+from app.security.credentials import JobCredentialCipher
+from app.workers.tasks import clear_expired_llm_credentials_async
+
+
+VALID_TEST_KEY = base64.b64encode(b"v" * 32).decode("ascii")
 
 
 class FakeTranscriptService:
@@ -103,6 +112,9 @@ async def pipeline_context():
     transcript = FakeTranscriptService().inspect("aircAruvnKk").segments
     version = transcript_version(transcript)
     async with factory() as session:
+        installation = Installation(
+            id="11111111-1111-4111-8111-111111111111", token_hash="a" * 64
+        )
         video = Video(
             video_id="aircAruvnKk",
             title="Neural networks",
@@ -110,6 +122,7 @@ async def pipeline_context():
             source_url="https://www.youtube.com/watch?v=aircAruvnKk",
         )
         job = AnalysisJob(
+            installation=installation,
             video=video,
             source_language="en",
             target_language="zh-Hans",
@@ -142,6 +155,8 @@ async def test_pipeline_persists_transcript_translation_and_result(pipeline_cont
         assert job.status == "completed"
         assert job.result.one_line_summary == "神经网络从像素中学习。"
         assert segment_count == 2
+        assert job.llm_credential_ciphertext is None
+        assert job.llm_credential_expires_at is None
     assert transcript_service.calls == 1
     assert translation_provider.calls == 1
 
@@ -160,6 +175,11 @@ async def test_pipeline_uses_kimi_providers_from_job_snapshot(pipeline_context):
 @pytest.mark.asyncio
 async def test_translation_failure_preserves_original_transcript(pipeline_context):
     factory, job_id = pipeline_context
+    async with factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        job.llm_credential_ciphertext = "temporary-ciphertext"
+        job.llm_credential_expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+        await session.commit()
     pipeline = AnalysisPipeline(
         factory,
         FakeTranscriptService(),
@@ -175,6 +195,113 @@ async def test_translation_failure_preserves_original_transcript(pipeline_contex
         assert job.status == "failed"
         assert job.failure_code == "translation_failed"
         assert segment_count == 2
+        assert job.llm_credential_ciphertext is None
+        assert job.llm_credential_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_default_pipeline_fails_when_temporary_credentials_expired(
+    pipeline_context,
+):
+    factory, job_id = pipeline_context
+    cipher = JobCredentialCipher(VALID_TEST_KEY)
+    async with factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        job.llm_config = {
+            "provider": "kimi",
+            "api_url": "https://api.example.com/v1",
+            "model": "kimi-k2.5",
+        }
+        job.llm_credential_ciphertext = cipher.encrypt(job.id, "secret")
+        job.llm_credential_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        await session.commit()
+    pipeline = AnalysisPipeline(
+        factory,
+        FakeTranscriptService(),
+        FakeTranslationProvider(),
+        FakeAnalysisService(),
+        credential_cipher=cipher,
+    )
+    pipeline._uses_default_providers = True
+
+    await pipeline.run(job_id)
+
+    async with factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        assert job.status == "failed"
+        assert job.failure_code == "llm_credentials_expired"
+        assert job.llm_credential_ciphertext is None
+        assert job.llm_credential_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_default_pipeline_treats_invalid_ciphertext_as_expired_credentials(
+    pipeline_context,
+):
+    factory, job_id = pipeline_context
+    cipher = JobCredentialCipher(VALID_TEST_KEY)
+    async with factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        job.llm_config = {
+            "provider": "kimi",
+            "api_url": "https://api.example.com/v1",
+            "model": "kimi-k2.5",
+        }
+        job.llm_credential_ciphertext = "invalid-ciphertext"
+        job.llm_credential_expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+        await session.commit()
+    pipeline = AnalysisPipeline(
+        factory,
+        FakeTranscriptService(),
+        FakeTranslationProvider(),
+        FakeAnalysisService(),
+        credential_cipher=cipher,
+    )
+    pipeline._uses_default_providers = True
+
+    await pipeline.run(job_id)
+
+    async with factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        assert job.status == "failed"
+        assert job.failure_code == "llm_credentials_expired"
+        assert job.llm_credential_ciphertext is None
+        assert job.llm_credential_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_expired_credential_cleanup_clears_only_expired_secrets(pipeline_context):
+    factory, expired_job_id = pipeline_context
+    async with factory() as session:
+        expired = await session.get(AnalysisJob, expired_job_id)
+        expired.status = "failed"
+        expired.llm_credential_ciphertext = "expired"
+        expired.llm_credential_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        current = AnalysisJob(
+            installation_id=expired.installation_id,
+            video_id=expired.video_id,
+            source_language="en",
+            target_language="fr",
+            transcript_version=expired.transcript_version,
+            cache_key="current-credential",
+            llm_credential_ciphertext="current",
+            llm_credential_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        session.add(current)
+        await session.commit()
+        current_job_id = current.id
+
+    cleared = await clear_expired_llm_credentials_async(
+        factory, now=datetime.now(timezone.utc)
+    )
+
+    assert cleared == 1
+    async with factory() as session:
+        expired = await session.get(AnalysisJob, expired_job_id)
+        current = await session.get(AnalysisJob, current_job_id)
+        assert expired.llm_credential_ciphertext is None
+        assert expired.llm_credential_expires_at is None
+        assert current.llm_credential_ciphertext == "current"
 
 
 @pytest.mark.asyncio

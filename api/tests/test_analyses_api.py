@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -14,14 +16,18 @@ from app.api.analyses import (
     dispatch_analysis_job,
     get_job_dispatcher,
     get_pipeline_revision,
+    get_job_credential_cipher,
+    get_quota_limiter,
     get_session,
     get_transcript_service,
+    get_video_metadata_service,
 )
 from app.core.settings import Settings
 from app.db.models import (
     AnalysisResult,
     AnalysisJob,
     Base,
+    Installation,
     TranscriptSegment as StoredTranscriptSegment,
     TranscriptTrack,
     Translation,
@@ -33,6 +39,9 @@ from app.services.transcripts import (
     TranscriptSegment,
     TranscriptTrackInfo,
 )
+from app.security.credentials import JobCredentialCipher
+from app.security.quotas import QuotaServiceUnavailable, RateLimitExceeded
+from app.services.video_metadata import VideoMetadataError
 
 
 class FakeTranscriptService:
@@ -57,7 +66,72 @@ class FakeTranscriptService:
         )
 
 
+class FakeVideoMetadataService:
+    def __init__(self, duration_ms=1500, error=None):
+        self.duration = duration_ms
+        self.error = error
+        self.calls = []
+
+    def duration_ms(self, video_id):
+        self.calls.append(video_id)
+        if self.error:
+            raise self.error
+        return self.duration
+
+
+class PermissiveQuotaLimiter:
+    def __init__(self):
+        self.locks = {}
+
+    async def enforce(self, subject, request_class, limit):
+        return None
+
+    @asynccontextmanager
+    async def installation_create_lock(self, installation_id):
+        lock = self.locks.setdefault(installation_id, asyncio.Lock())
+        async with lock:
+            yield
+
+
+class UnlockedQuotaLimiter:
+    async def enforce(self, subject, request_class, limit):
+        return None
+
+    @asynccontextmanager
+    async def installation_create_lock(self, installation_id):
+        yield
+
+
+class FailingQuotaLimiter:
+    async def enforce(self, subject, request_class, limit):
+        raise QuotaServiceUnavailable("redis unavailable")
+
+
+class BoundaryQuotaLimiter:
+    def __init__(self):
+        self.counts = {}
+
+    async def enforce(self, subject, request_class, limit):
+        key = (subject, request_class)
+        self.counts[key] = self.counts.get(key, 0) + 1
+        if self.counts[key] > limit:
+            raise RateLimitExceeded(37)
+
+
 LLM_CONFIG = {"apiUrl": "https://api.example.com/v1", "apiKey": "test-key"}
+VALID_TEST_KEY = base64.b64encode(b"v" * 32).decode("ascii")
+INSTALLATION_ID = "11111111-1111-4111-8111-111111111111"
+INSTALLATION_TOKEN = "installation-token-with-at-least-forty-three-characters"
+AUTH_HEADERS = {
+    "Authorization": f"Bearer {INSTALLATION_TOKEN}",
+    "X-Veeky-Installation-Id": INSTALLATION_ID,
+}
+OTHER_INSTALLATION_ID = "22222222-2222-4222-8222-222222222222"
+OTHER_INSTALLATION_TOKEN = "other-installation-token-with-at-least-forty-three-characters"
+OTHER_AUTH_HEADERS = {
+    "Authorization": f"Bearer {OTHER_INSTALLATION_TOKEN}",
+    "X-Veeky-Installation-Id": OTHER_INSTALLATION_ID,
+}
 
 
 @pytest.fixture
@@ -67,7 +141,7 @@ async def api_context(tmp_path):
         await connection.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
 
-    app = create_app(Settings())
+    app = create_app(Settings(llm_credential_encryption_key=VALID_TEST_KEY))
     dispatched = []
 
     async def session_dependency() -> AsyncIterator[AsyncSession]:
@@ -76,9 +150,29 @@ async def api_context(tmp_path):
 
     app.dependency_overrides[get_session] = session_dependency
     app.dependency_overrides[get_transcript_service] = lambda: FakeTranscriptService()
+    app.dependency_overrides[get_video_metadata_service] = (
+        lambda: FakeVideoMetadataService()
+    )
     app.dependency_overrides[get_job_dispatcher] = lambda: dispatched.append
+    app.dependency_overrides[get_job_credential_cipher] = lambda: JobCredentialCipher(
+        VALID_TEST_KEY
+    )
+    quota_limiter = PermissiveQuotaLimiter()
+    app.dependency_overrides[get_quota_limiter] = lambda: quota_limiter
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers=AUTH_HEADERS,
+    ) as client:
+        registered = await client.post(
+            "/v1/installations/register",
+            json={
+                "installationId": INSTALLATION_ID,
+                "installationToken": INSTALLATION_TOKEN,
+            },
+        )
+        assert registered.status_code == 201
         yield client, app, factory, dispatched
 
     await engine.dispose()
@@ -121,6 +215,153 @@ async def test_inspect_reports_no_caption_track(api_context):
 
 
 @pytest.mark.asyncio
+async def test_inspect_allows_video_exactly_four_hours(api_context):
+    client, app, _, _ = api_context
+    app.dependency_overrides[get_video_metadata_service] = (
+        lambda: FakeVideoMetadataService(14_400_000)
+    )
+
+    response = await client.post(
+        "/v1/videos/inspect",
+        json={"url": "https://youtu.be/aircAruvnKk"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["durationMs"] == 14_400_000
+
+
+@pytest.mark.asyncio
+async def test_inspect_rejects_video_over_four_hours_before_fetching_captions(
+    api_context,
+):
+    client, app, _, _ = api_context
+    transcript = FakeTranscriptService()
+    transcript.calls = 0
+    original_inspect = transcript.inspect
+
+    def counting_inspect(*args, **kwargs):
+        transcript.calls += 1
+        return original_inspect(*args, **kwargs)
+
+    transcript.inspect = counting_inspect
+    app.dependency_overrides[get_transcript_service] = lambda: transcript
+    app.dependency_overrides[get_video_metadata_service] = (
+        lambda: FakeVideoMetadataService(14_401_000)
+    )
+
+    response = await client.post(
+        "/v1/videos/inspect",
+        json={"url": "https://youtu.be/aircAruvnKk"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "code": "video_too_long",
+        "message": "此视频时长过长，无法分析。",
+    }
+    assert transcript.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_inspect_does_not_fall_back_to_caption_duration_when_metadata_fails(
+    api_context,
+):
+    client, app, _, _ = api_context
+    app.dependency_overrides[get_video_metadata_service] = lambda: FakeVideoMetadataService(
+        error=VideoMetadataError("lookup failed")
+    )
+
+    response = await client.post(
+        "/v1/videos/inspect",
+        json={"url": "https://youtu.be/aircAruvnKk"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "video_metadata_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_create_rechecks_video_duration(api_context):
+    client, app, _, dispatched = api_context
+    app.dependency_overrides[get_video_metadata_service] = (
+        lambda: FakeVideoMetadataService(14_401_000)
+    )
+
+    response = await client.post(
+        "/v1/analyses",
+        json={
+            "videoId": "aircAruvnKk",
+            "sourceLanguage": "en",
+            "targetLanguage": "zh-Hans",
+            "llmConfig": LLM_CONFIG,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "video_too_long"
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_write_rate_limit_rejects_request_twenty_one_with_retry_after(api_context):
+    client, app, _, _ = api_context
+    limiter = BoundaryQuotaLimiter()
+    app.dependency_overrides[get_quota_limiter] = lambda: limiter
+
+    for _ in range(20):
+        response = await client.post(
+            "/v1/videos/inspect",
+            json={"url": "https://youtu.be/aircAruvnKk"},
+        )
+        assert response.status_code == 200
+    blocked = await client.post(
+        "/v1/videos/inspect",
+        json={"url": "https://youtu.be/aircAruvnKk"},
+    )
+
+    assert blocked.status_code == 429
+    assert blocked.json()["detail"]["code"] == "rate_limit_exceeded"
+    assert blocked.headers["Retry-After"] == "37"
+
+
+@pytest.mark.asyncio
+async def test_read_rate_limit_is_independent_per_installation(api_context):
+    client, app, _, _ = api_context
+    limiter = BoundaryQuotaLimiter()
+    app.dependency_overrides[get_quota_limiter] = lambda: limiter
+    registered = await client.post(
+        "/v1/installations/register",
+        json={
+            "installationId": OTHER_INSTALLATION_ID,
+            "installationToken": OTHER_INSTALLATION_TOKEN,
+        },
+    )
+    assert registered.status_code == 201
+
+    for _ in range(120):
+        response = await client.get("/v1/analyses/history")
+        assert response.status_code == 200
+    blocked = await client.get("/v1/analyses/history")
+    other = await client.get(
+        "/v1/analyses/history", headers=OTHER_AUTH_HEADERS
+    )
+
+    assert blocked.status_code == 429
+    assert other.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_quota_service_failure_returns_503(api_context):
+    client, app, _, _ = api_context
+    app.dependency_overrides[get_quota_limiter] = lambda: FailingQuotaLimiter()
+
+    response = await client.get("/v1/analyses/history")
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "quota_service_unavailable"
+
+
+@pytest.mark.asyncio
 async def test_create_requires_llm_configuration(api_context):
     client, _, _, dispatched = api_context
     response = await client.post(
@@ -131,6 +372,34 @@ async def test_create_requires_llm_configuration(api_context):
     assert response.status_code == 422
     assert response.json()["detail"]["code"] == "llm_config_required"
     assert dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_create_stores_only_encrypted_temporary_llm_credential(api_context):
+    client, _, factory, _ = api_context
+
+    response = await client.post(
+        "/v1/analyses",
+        json={
+            "videoId": "aircAruvnKk",
+            "sourceLanguage": "en",
+            "targetLanguage": "zh-Hans",
+            "llmConfig": LLM_CONFIG,
+        },
+    )
+
+    assert response.status_code == 202
+    async with factory() as session:
+        job = await session.get(AnalysisJob, response.json()["jobId"])
+        assert "api_key" not in job.llm_config
+        assert "test-key" not in job.llm_credential_ciphertext
+        assert job.llm_credential_expires_at is not None
+        assert (
+            JobCredentialCipher(VALID_TEST_KEY).decrypt(
+                job.id, job.llm_credential_ciphertext
+            )
+            == "test-key"
+        )
 
 
 @pytest.mark.asyncio
@@ -174,6 +443,177 @@ async def test_create_reuses_active_and_completed_jobs(api_context):
     assert completed.json()["cacheHit"] is True
 
 
+@pytest.mark.asyncio
+async def test_identical_analysis_is_cached_per_installation(api_context):
+    client, _, factory, dispatched = api_context
+    registered = await client.post(
+        "/v1/installations/register",
+        json={
+            "installationId": OTHER_INSTALLATION_ID,
+            "installationToken": OTHER_INSTALLATION_TOKEN,
+        },
+    )
+    assert registered.status_code == 201
+    payload = {
+        "videoId": "aircAruvnKk",
+        "sourceLanguage": "en",
+        "targetLanguage": "zh-Hans",
+        "llmConfig": LLM_CONFIG,
+    }
+
+    first_a = await client.post("/v1/analyses", json=payload)
+    second_a = await client.post("/v1/analyses", json=payload)
+    first_b = await client.post(
+        "/v1/analyses", json=payload, headers=OTHER_AUTH_HEADERS
+    )
+
+    assert second_a.json()["jobId"] == first_a.json()["jobId"]
+    assert first_b.status_code == 202
+    assert first_b.json()["jobId"] != first_a.json()["jobId"]
+    async with factory() as session:
+        jobs = (await session.scalars(select(AnalysisJob))).all()
+        assert {job.installation_id for job in jobs} == {
+            INSTALLATION_ID,
+            OTHER_INSTALLATION_ID,
+        }
+    assert dispatched == [first_a.json()["jobId"], first_b.json()["jobId"]]
+
+
+@pytest.mark.asyncio
+async def test_different_analysis_is_blocked_while_installation_has_active_job(
+    api_context,
+):
+    client, _, _, dispatched = api_context
+    first = await client.post(
+        "/v1/analyses",
+        json={
+            "videoId": "aircAruvnKk",
+            "sourceLanguage": "en",
+            "targetLanguage": "zh-Hans",
+            "llmConfig": LLM_CONFIG,
+        },
+    )
+    blocked = await client.post(
+        "/v1/analyses",
+        json={
+            "videoId": "aircAruvnKk",
+            "sourceLanguage": "en",
+            "targetLanguage": "fr",
+            "llmConfig": LLM_CONFIG,
+        },
+    )
+
+    assert first.status_code == 202
+    assert blocked.status_code == 429
+    assert blocked.json()["detail"] == {
+        "code": "analysis_concurrency_limit",
+        "message": "已有视频正在分析，请等待完成后再试。",
+    }
+    assert dispatched == [first.json()["jobId"]]
+
+
+@pytest.mark.asyncio
+async def test_active_job_limit_is_independent_per_installation(api_context):
+    client, _, _, dispatched = api_context
+    registered = await client.post(
+        "/v1/installations/register",
+        json={
+            "installationId": OTHER_INSTALLATION_ID,
+            "installationToken": OTHER_INSTALLATION_TOKEN,
+        },
+    )
+    assert registered.status_code == 201
+    payload = {
+        "videoId": "aircAruvnKk",
+        "sourceLanguage": "en",
+        "targetLanguage": "zh-Hans",
+        "llmConfig": LLM_CONFIG,
+    }
+
+    first = await client.post("/v1/analyses", json=payload)
+    other = await client.post(
+        "/v1/analyses", json=payload, headers=OTHER_AUTH_HEADERS
+    )
+
+    assert first.status_code == 202
+    assert other.status_code == 202
+    assert first.json()["jobId"] != other.json()["jobId"]
+    assert len(dispatched) == 2
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_different_analyses_create_only_one_active_job(api_context):
+    client, _, _, dispatched = api_context
+    base = {
+        "videoId": "aircAruvnKk",
+        "sourceLanguage": "en",
+        "llmConfig": LLM_CONFIG,
+    }
+
+    first, second = await asyncio.gather(
+        client.post(
+            "/v1/analyses", json={**base, "targetLanguage": "zh-Hans"}
+        ),
+        client.post("/v1/analyses", json={**base, "targetLanguage": "fr"}),
+    )
+
+    assert sorted([first.status_code, second.status_code]) == [202, 429]
+    blocked = first if first.status_code == 429 else second
+    assert blocked.json()["detail"]["code"] == "analysis_concurrency_limit"
+    assert len(dispatched) == 1
+
+
+@pytest.mark.asyncio
+async def test_history_and_job_reads_are_private_to_the_installation(api_context):
+    client, _, factory, _ = api_context
+    registered = await client.post(
+        "/v1/installations/register",
+        json={
+            "installationId": OTHER_INSTALLATION_ID,
+            "installationToken": OTHER_INSTALLATION_TOKEN,
+        },
+    )
+    assert registered.status_code == 201
+    payload = {
+        "videoId": "aircAruvnKk",
+        "sourceLanguage": "en",
+        "targetLanguage": "zh-Hans",
+        "llmConfig": LLM_CONFIG,
+    }
+    created_a = await client.post("/v1/analyses", json=payload)
+    created_b = await client.post(
+        "/v1/analyses", json=payload, headers=OTHER_AUTH_HEADERS
+    )
+    job_a = created_a.json()["jobId"]
+    job_b = created_b.json()["jobId"]
+    async with factory() as session:
+        for job_id in (job_a, job_b):
+            job = await session.get(AnalysisJob, job_id)
+            job.status = "completed"
+            job.completed_at = datetime.now(timezone.utc)
+            job.result = AnalysisResult(
+                one_line_summary=f"Summary {job_id}",
+                summary_points=[],
+                chapters=[],
+                highlights=[],
+                model_name="fake",
+                model_version="test",
+            )
+        await session.commit()
+
+    history_a = await client.get("/v1/analyses/history")
+    history_b = await client.get(
+        "/v1/analyses/history", headers=OTHER_AUTH_HEADERS
+    )
+
+    assert [item["jobId"] for item in history_a.json()["items"]] == [job_a]
+    assert [item["jobId"] for item in history_b.json()["items"]] == [job_b]
+    for path in (f"/v1/analyses/{job_b}", f"/v1/analyses/{job_b}/result"):
+        hidden = await client.get(path)
+        assert hidden.status_code == 404
+        assert hidden.json()["detail"]["code"] == "analysis_not_found"
+
+
 async def _store_history_job(
     factory,
     *,
@@ -195,6 +635,7 @@ async def _store_history_job(
             )
             session.add(video)
         job = AnalysisJob(
+            installation_id=INSTALLATION_ID,
             video_id=video_id,
             source_language="en",
             target_language="zh-Hans",
@@ -367,6 +808,11 @@ async def test_force_create_generates_new_jobs_and_preserves_cached_result(api_c
 
     cached = await client.post("/v1/analyses", json={**payload, "force": False})
     forced_once = await client.post("/v1/analyses", json={**payload, "force": True})
+    async with factory() as session:
+        forced_job = await session.get(AnalysisJob, forced_once.json()["jobId"])
+        forced_job.status = "completed"
+        forced_job.completed_at = datetime.now(timezone.utc)
+        await session.commit()
     forced_twice = await client.post("/v1/analyses", json={**payload, "force": True})
 
     assert cached.status_code == 200
@@ -427,6 +873,29 @@ async def test_concurrent_create_requests_reuse_one_job(api_context):
     assert {first.status_code, second.status_code} == {202}
     assert first.json()["jobId"] == second.json()["jobId"]
     assert dispatched == [first.json()["jobId"]]
+
+
+@pytest.mark.asyncio
+async def test_database_rejects_second_active_job_after_redis_lock_expires(api_context):
+    client, app, _, dispatched = api_context
+    app.dependency_overrides[get_quota_limiter] = lambda: UnlockedQuotaLimiter()
+    first_payload = {
+        "videoId": "aircAruvnKk",
+        "sourceLanguage": "en",
+        "targetLanguage": "zh-Hans",
+        "llmConfig": LLM_CONFIG,
+    }
+    second_payload = {**first_payload, "targetLanguage": "fr"}
+
+    first, second = await asyncio.gather(
+        client.post("/v1/analyses", json=first_payload),
+        client.post("/v1/analyses", json=second_payload),
+    )
+
+    responses = {first.status_code: first, second.status_code: second}
+    assert set(responses) == {202, 429}
+    assert responses[429].json()["detail"]["code"] == "analysis_concurrency_limit"
+    assert len(dispatched) == 1
 
 
 @pytest.mark.asyncio
@@ -622,7 +1091,7 @@ async def test_result_returns_summary_while_translation_is_still_running(api_con
 
 @pytest.mark.asyncio
 async def test_pipeline_revision_change_creates_a_new_job(api_context):
-    client, app, _, dispatched = api_context
+    client, app, factory, dispatched = api_context
     payload = {
         "videoId": "aircAruvnKk",
         "sourceLanguage": "en",
@@ -630,6 +1099,11 @@ async def test_pipeline_revision_change_creates_a_new_job(api_context):
         "llmConfig": LLM_CONFIG,
     }
     first = await client.post("/v1/analyses", json=payload)
+    async with factory() as session:
+        first_job = await session.get(AnalysisJob, first.json()["jobId"])
+        first_job.status = "completed"
+        first_job.completed_at = datetime.now(timezone.utc)
+        await session.commit()
     app.dependency_overrides[get_pipeline_revision] = lambda: "next-pipeline"
 
     second = await client.post("/v1/analyses", json=payload)
@@ -641,7 +1115,7 @@ async def test_pipeline_revision_change_creates_a_new_job(api_context):
 
 @pytest.mark.asyncio
 async def test_dispatch_failure_can_be_retried(api_context):
-    client, app, _, dispatched = api_context
+    client, app, factory, dispatched = api_context
 
     def fail_dispatch(_job_id):
         raise ConnectionError("redis unavailable")
@@ -657,6 +1131,10 @@ async def test_dispatch_failure_can_be_retried(api_context):
 
     assert failed.status_code == 503
     assert failed.json()["detail"]["code"] == "dispatch_failed"
+    async with factory() as session:
+        job = await session.scalar(select(AnalysisJob))
+        assert job.llm_credential_ciphertext is None
+        assert job.llm_credential_expires_at is None
 
     app.dependency_overrides[get_job_dispatcher] = lambda: dispatched.append
     retried = await client.post("/v1/analyses", json=payload)
@@ -700,3 +1178,5 @@ async def test_create_reports_when_the_background_worker_is_unavailable(api_cont
         )
         assert job.status == "failed"
         assert job.failure_code == "worker_unavailable"
+        assert job.llm_credential_ciphertext is None
+        assert job.llm_credential_expires_at is None
