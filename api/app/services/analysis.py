@@ -402,7 +402,8 @@ def _normalize_analysis_payload(raw: Mapping[str, Any], duration_ms: int) -> Map
         description = highlight.get("description")
         text = highlight.get("text")
         quote = highlight.get("quote")
-        excerpt_alias = text or quote
+        excerpt = highlight.get("excerpt")
+        excerpt_alias = text or quote or excerpt
         if excerpt_alias and "summary" not in highlight:
             highlight["summary"] = str(excerpt_alias)
         if excerpt_alias and "title" not in highlight:
@@ -418,6 +419,7 @@ def _normalize_analysis_payload(raw: Mapping[str, Any], duration_ms: int) -> Map
         highlight.pop("description", None)
         highlight.pop("text", None)
         highlight.pop("quote", None)
+        highlight.pop("excerpt", None)
         highlight.pop("timestamp_ms", None)
         highlight.pop("timestamp", None)
         highlights.append(highlight)

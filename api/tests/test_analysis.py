@@ -101,6 +101,20 @@ def quote_highlight_alias_payload():
     return payload
 
 
+def excerpt_highlight_alias_payload():
+    payload = valid_payload()
+    payload["highlights"] = [
+        {
+            "title": "设计是差异化因素",
+            "summary": "设计能够让产品形成明显差异",
+            "excerpt": "Design is a great differentiator.",
+            "start_ms": 1000,
+            "end_ms": 2000,
+        }
+    ]
+    return payload
+
+
 def chapter_start_end_seconds_payload():
     payload = valid_payload()
     payload["chapters"] = [
@@ -221,6 +235,21 @@ async def test_accepts_quote_highlight_alias_from_kimi_gateway():
     assert highlight.summary == "先确认问题，再拆分解决方案"
     assert highlight.original_excerpt == "先确认问题，再拆分解决方案"
     assert highlight.translated_excerpt == "先确认问题，再拆分解决方案"
+
+
+@pytest.mark.asyncio
+async def test_accepts_excerpt_highlight_alias_from_deepseek_gateway():
+    provider = FakeProvider([excerpt_highlight_alias_payload()])
+
+    result = await StructuredAnalysisService(provider, max_attempts=1).analyze(
+        source_segments(), "zh-Hans", duration_ms=2000
+    )
+
+    highlight = result.highlights[0]
+    assert highlight.title == "设计是差异化因素"
+    assert highlight.summary == "设计能够让产品形成明显差异"
+    assert highlight.original_excerpt == "Design is a great differentiator."
+    assert highlight.translated_excerpt == "Design is a great differentiator."
 
 
 @pytest.mark.asyncio
