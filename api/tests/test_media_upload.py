@@ -643,6 +643,41 @@ async def test_expired_upload_is_cleaned_and_rejects_more_parts(media_context):
 
 
 @pytest.mark.asyncio
+async def test_create_releases_expired_installation_reservations(media_context):
+    client, _, factory, media_root = media_context
+    first_id = (await create_session(client)).json()["sessionId"]
+    second_id = (await create_session(client)).json()["sessionId"]
+    await upload_part(client, first_id, 0, b"0123456789abcdef")
+    await upload_part(client, first_id, 1, b"tail")
+    completed = await client.post(
+        f"/v1/media-sessions/{first_id}/complete",
+        json={"partCount": 2, "totalBytes": 20},
+    )
+    assert completed.status_code == 200
+
+    async with factory() as session:
+        first = await session.get(MediaUploadSession, first_id)
+        second = await session.get(MediaUploadSession, second_id)
+        first_directory = media_root / first.directory_key
+        expired_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        first.expires_at = expired_at
+        second.expires_at = expired_at
+        await session.commit()
+        assert first_directory.exists()
+
+    created = await create_session(client, expected_bytes=40, part_count=3)
+
+    assert created.status_code == 201
+    async with factory() as session:
+        first = await session.get(MediaUploadSession, first_id)
+        second = await session.get(MediaUploadSession, second_id)
+        assert first.status == "expired"
+        assert first.received_bytes == 0
+        assert second.status == "expired"
+    assert not first_directory.exists()
+
+
+@pytest.mark.asyncio
 async def test_cleanup_primitive_expires_only_due_sessions(media_context):
     client, _, factory, media_root = media_context
     due_id = (await create_session(client)).json()["sessionId"]
@@ -764,6 +799,12 @@ async def test_postgres_concurrent_creates_cannot_exceed_installation_limit(
     postgres_media_context,
 ):
     factory, base_settings = postgres_media_context
+    expired_id, expired_directory = await seed_postgres_upload(factory, base_settings)
+    async with factory() as session:
+        expired = await session.get(MediaUploadSession, expired_id)
+        expired.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        await session.commit()
+
     settings = base_settings.model_copy(
         update={"max_active_media_upload_sessions_per_installation": 1}
     )
@@ -786,6 +827,12 @@ async def test_postgres_concurrent_creates_cannot_exceed_installation_limit(
     errors = [result for result in results if isinstance(result, MediaUploadError)]
     assert len(errors) == 1
     assert errors[0].code == "media_session_limit"
+
+    async with factory() as session:
+        expired = await session.get(MediaUploadSession, expired_id)
+        assert expired.status == "expired"
+        assert expired.received_bytes == 0
+    assert not expired_directory.exists()
 
     created = next(
         result for result in results if isinstance(result, MediaUploadSession)

@@ -82,6 +82,23 @@ async def create_upload_session(
         .where(Installation.id == installation_id)
         .with_for_update()
     )
+    now = utc_now()
+    expired_uploads = list(
+        await database.scalars(
+            select(MediaUploadSession)
+            .options(selectinload(MediaUploadSession.parts))
+            .where(
+                MediaUploadSession.installation_id == installation_id,
+                MediaUploadSession.expires_at <= now,
+                MediaUploadSession.status.in_(RESERVED_UPLOAD_STATES),
+            )
+            .order_by(MediaUploadSession.expires_at, MediaUploadSession.id)
+            .with_for_update()
+        )
+    )
+    for expired_upload in expired_uploads:
+        await _expire_uncommitted(database, settings, expired_upload)
+
     active_count, reserved_bytes = (
         await database.execute(
             select(
@@ -98,12 +115,16 @@ async def create_upload_session(
         )
     ).one()
     if active_count >= settings.max_active_media_upload_sessions_per_installation:
+        if expired_uploads:
+            await database.commit()
         raise _error(
             429,
             "media_session_limit",
             "installation already has the maximum active media uploads",
         )
     if reserved_bytes + expected_bytes > settings.max_media_bytes:
+        if expired_uploads:
+            await database.commit()
         raise _error(
             429,
             "media_reservation_limit",
@@ -113,9 +134,10 @@ async def create_upload_session(
         select(Video.content_id).where(Video.content_id == content_id)
     )
     if content_exists is None:
+        if expired_uploads:
+            await database.commit()
         raise _error(404, "content_not_found", "content was not found")
 
-    now = utc_now()
     upload = MediaUploadSession(
         id=str(uuid.uuid4()),
         installation_id=installation_id,
@@ -426,6 +448,15 @@ async def _expire_locked(
     settings: Settings,
     upload: MediaUploadSession,
 ) -> None:
+    await _expire_uncommitted(database, settings, upload)
+    await database.commit()
+
+
+async def _expire_uncommitted(
+    database: AsyncSession,
+    settings: Settings,
+    upload: MediaUploadSession,
+) -> None:
     try:
         await asyncio.to_thread(_remove_session_directory_sync, settings, upload)
     except OSError as error:
@@ -440,7 +471,6 @@ async def _expire_locked(
         upload.hls_manifest = None
         upload.updated_at = utc_now()
         upload.expires_at = upload.updated_at
-    await database.commit()
 
 
 async def _write_temporary_part(
