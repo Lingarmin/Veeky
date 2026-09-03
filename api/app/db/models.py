@@ -10,6 +10,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     select,
@@ -55,6 +56,9 @@ class Video(Base):
     __tablename__ = "videos"
     __table_args__ = (
         UniqueConstraint("content_id", name="uq_videos_content_id"),
+        UniqueConstraint(
+            "video_id", "content_id", name="uq_videos_video_content"
+        ),
         UniqueConstraint(
             "platform",
             "source_content_id",
@@ -108,6 +112,12 @@ class TranscriptTrack(Base):
             "is_generated",
             "transcript_version",
             name="uq_transcript_track_version",
+        ),
+        ForeignKeyConstraint(
+            ["video_id", "content_id"],
+            ["videos.video_id", "videos.content_id"],
+            name="fk_transcript_tracks_video_content_videos",
+            ondelete="CASCADE",
         ),
     )
 
@@ -195,6 +205,12 @@ class AnalysisJob(Base):
             "status IN ('queued', 'fetching_transcript', 'translating', "
             "'analyzing', 'completed', 'failed')",
             name="ck_analysis_job_status",
+        ),
+        ForeignKeyConstraint(
+            ["video_id", "content_id"],
+            ["videos.video_id", "videos.content_id"],
+            name="fk_analysis_jobs_video_content_videos",
+            ondelete="CASCADE",
         ),
         Index("ix_analysis_jobs_video_languages", "video_id", "source_language", "target_language"),
         Index(

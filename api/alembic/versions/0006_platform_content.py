@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Sequence
 
 import sqlalchemy as sa
-from alembic import op
+from alembic import context, op
 
 
 revision: str = "0006_platform_content"
@@ -18,8 +18,6 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    connection = op.get_bind()
-
     op.alter_column(
         "videos",
         "video_id",
@@ -53,20 +51,34 @@ def upgrade() -> None:
     )
     op.add_column("videos", sa.Column("media_index", sa.Integer(), nullable=True))
 
-    for row in connection.execute(sa.text("SELECT video_id FROM videos")).mappings():
-        connection.execute(
-            sa.text(
-                """
-                UPDATE videos
-                SET content_id = :content_id,
-                    platform = 'youtube',
-                    source_content_id = video_id,
-                    media_index = 1
-                WHERE video_id = :video_id
-                """
-            ),
-            {"content_id": str(uuid.uuid4()), "video_id": row["video_id"]},
+    if context.is_offline_mode():
+        op.execute(
+            """
+            UPDATE videos
+            SET content_id = gen_random_uuid()::text,
+                platform = 'youtube',
+                source_content_id = video_id,
+                media_index = 1
+            """
         )
+    else:
+        connection = op.get_bind()
+        for row in connection.execute(
+            sa.text("SELECT video_id FROM videos")
+        ).mappings():
+            connection.execute(
+                sa.text(
+                    """
+                    UPDATE videos
+                    SET content_id = :content_id,
+                        platform = 'youtube',
+                        source_content_id = video_id,
+                        media_index = 1
+                    WHERE video_id = :video_id
+                    """
+                ),
+                {"content_id": str(uuid.uuid4()), "video_id": row["video_id"]},
+            )
 
     op.alter_column("videos", "content_id", existing_type=sa.String(36), nullable=False)
     op.alter_column("videos", "platform", existing_type=sa.String(20), nullable=False)
@@ -75,6 +87,9 @@ def upgrade() -> None:
     )
     op.alter_column("videos", "media_index", existing_type=sa.Integer(), nullable=False)
     op.create_unique_constraint("uq_videos_content_id", "videos", ["content_id"])
+    op.create_unique_constraint(
+        "uq_videos_video_content", "videos", ["video_id", "content_id"]
+    )
     op.create_unique_constraint(
         "uq_videos_platform_source_media",
         "videos",
@@ -126,6 +141,22 @@ def upgrade() -> None:
         ondelete="CASCADE",
     )
     op.create_foreign_key(
+        "fk_transcript_tracks_video_content_videos",
+        "transcript_tracks",
+        "videos",
+        ["video_id", "content_id"],
+        ["video_id", "content_id"],
+        ondelete="CASCADE",
+    )
+    op.create_foreign_key(
+        "fk_analysis_jobs_video_content_videos",
+        "analysis_jobs",
+        "videos",
+        ["video_id", "content_id"],
+        ["video_id", "content_id"],
+        ondelete="CASCADE",
+    )
+    op.create_foreign_key(
         "fk_analysis_jobs_content_id_videos",
         "analysis_jobs",
         "videos",
@@ -168,6 +199,16 @@ def downgrade() -> None:
     op.drop_index("ix_analysis_jobs_content_id", table_name="analysis_jobs")
     op.drop_index("ix_transcript_tracks_content_id", table_name="transcript_tracks")
     op.drop_constraint(
+        "fk_analysis_jobs_video_content_videos",
+        "analysis_jobs",
+        type_="foreignkey",
+    )
+    op.drop_constraint(
+        "fk_transcript_tracks_video_content_videos",
+        "transcript_tracks",
+        type_="foreignkey",
+    )
+    op.drop_constraint(
         "fk_analysis_jobs_content_id_videos",
         "analysis_jobs",
         type_="foreignkey",
@@ -183,6 +224,7 @@ def downgrade() -> None:
     op.drop_constraint(
         "uq_videos_platform_source_media", "videos", type_="unique"
     )
+    op.drop_constraint("uq_videos_video_content", "videos", type_="unique")
     op.drop_constraint("uq_videos_content_id", "videos", type_="unique")
     op.drop_column("videos", "media_index")
     op.drop_column("videos", "source_content_id")

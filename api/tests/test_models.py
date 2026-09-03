@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -20,6 +21,7 @@ from app.db.models import (
 async def session():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as connection:
+        await connection.execute(text("PRAGMA foreign_keys = ON"))
         await connection.run_sync(Base.metadata.create_all)
 
     factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -95,6 +97,87 @@ async def test_videos_from_different_platforms_have_unique_content_ids(session):
     await session.commit()
 
     assert youtube.content_id != x_video.content_id
+
+
+@pytest.mark.asyncio
+async def test_transcript_track_rejects_mismatched_video_and_content_ids(session):
+    youtube = Video(
+        video_id="aircAruvnKk",
+        platform="youtube",
+        source_content_id="aircAruvnKk",
+        media_index=1,
+        title="YouTube",
+        duration_ms=1000,
+        source_url="https://www.youtube.com/watch?v=aircAruvnKk",
+    )
+    x_video = Video(
+        video_id="x:2075545587093807111:1",
+        platform="x",
+        source_content_id="2075545587093807111",
+        media_index=1,
+        title="X video",
+        duration_ms=1000,
+        source_url="https://x.com/viktoroddy/status/2075545587093807111/video/1",
+    )
+    session.add_all([youtube, x_video])
+    await session.commit()
+
+    session.add(
+        TranscriptTrack(
+            video_id=youtube.video_id,
+            content_id=x_video.content_id,
+            language_code="en",
+            language_name="English",
+            is_generated=False,
+            is_translatable=True,
+            transcript_version="sha256:mismatch",
+        )
+    )
+
+    with pytest.raises(IntegrityError):
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_analysis_job_rejects_mismatched_video_and_content_ids(session):
+    youtube = Video(
+        video_id="aircAruvnKk",
+        platform="youtube",
+        source_content_id="aircAruvnKk",
+        media_index=1,
+        title="YouTube",
+        duration_ms=1000,
+        source_url="https://www.youtube.com/watch?v=aircAruvnKk",
+    )
+    x_video = Video(
+        video_id="x:2075545587093807111:1",
+        platform="x",
+        source_content_id="2075545587093807111",
+        media_index=1,
+        title="X video",
+        duration_ms=1000,
+        source_url="https://x.com/viktoroddy/status/2075545587093807111/video/1",
+    )
+    installation = Installation(
+        id="77777777-7777-4777-8777-777777777777", token_hash="e" * 64
+    )
+    session.add_all([youtube, x_video, installation])
+    await session.commit()
+
+    session.add(
+        AnalysisJob(
+            installation_id=installation.id,
+            video_id=youtube.video_id,
+            content_id=x_video.content_id,
+            source_language="auto",
+            target_language="zh-Hans",
+            transcript_version="pending:mismatch",
+            cache_key=f"pending:{installation.id}:mismatch",
+        )
+    )
+
+    with pytest.raises(IntegrityError):
+        await session.commit()
 
 
 @pytest.mark.asyncio
