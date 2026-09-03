@@ -65,7 +65,7 @@ ContentRef
 SourceAdapter
   parse_url(url) -> ContentRef
   inspect(content_ref, source_hint) -> SourceInspection
-  acquire_transcript_or_media(...) -> source artifact
+  acquire_transcript_or_media(content_ref, source_hint) -> source artifact
 
 YouTubeAdapter
   youtube-transcript-api -> timed transcript
@@ -228,13 +228,15 @@ ASR 输出句级时间戳。过长句段按停顿和标点拆分，保持时间�
 1. `videos` 增加 UUID `content_id`、`platform`、`source_content_id` 和 `media_index`。
 2. 为现有 YouTube 记录生成 UUID，并回填 `platform=youtube`、`source_content_id=video_id`、`media_index=1`。
 3. `transcript_tracks` 和 `analysis_jobs` 增加 `content_id` 外键并回填。
-4. 新代码使用 `content_id`，旧 `video_id` 暂时保留且允许 X 记录为空。
-5. 一个稳定版本后再单独迁移和删除旧外键。本功能的首个版本不删除旧列。
+4. 旧 `video_id` 主键暂时保留并扩展到 100 字符。YouTube 继续存 11 位 ID，X 存 `x:{status_id}:{media_index}` 内部兼容键。
+5. 新代码使用 `content_id` 查询和关联，同时双写兼容键。一个稳定版本后再单独迁移主键并删除旧外键。
+6. X 任务创建时使用 `source_language=auto`、任务级临时 `transcript_version` 和 `cache_key`。ASR 完成后写入检测语言、最终字幕版本和分析缓存键。
 
 新增字段：
 
 ```text
 videos.content_id UUID unique not null
+videos.video_id varchar(100) primary key
 videos.platform varchar not null
 videos.source_content_id varchar not null
 videos.media_index integer not null
