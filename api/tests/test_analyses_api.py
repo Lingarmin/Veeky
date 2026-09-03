@@ -370,6 +370,33 @@ async def test_inspect_rejects_invalid_media_candidates(api_context, candidate):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "url": "https://x.com/viktoroddy/status/2075545587093807111",
+            "activeMediaIndex": True,
+        },
+        {
+            "url": (
+                "https://x.com/viktoroddy/status/2075545587093807111/video/1"
+            ),
+            "clientDurationMs": True,
+        },
+    ],
+)
+async def test_inspect_rejects_boolean_integer_fields(api_context, payload):
+    client, app, _, _ = api_context
+    app.dependency_overrides[get_source_registry] = lambda: SourceRegistry(
+        [FakeXAdapter()]
+    )
+
+    response = await client.post("/v1/videos/inspect", json=payload)
+
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_x_provisional_duration_cannot_overwrite_existing_content(api_context):
     client, app, factory, _ = api_context
     app.dependency_overrides[get_source_registry] = lambda: SourceRegistry(
@@ -842,6 +869,129 @@ async def test_create_rejects_invalid_content_locators(api_context, locator):
 
     assert response.status_code == 422
     assert dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_boolean_content_ref_media_index(api_context):
+    client, _, factory, dispatched = api_context
+
+    response = await client.post(
+        "/v1/analyses",
+        json={
+            "contentRef": {
+                "platform": "youtube",
+                "sourceContentId": "aircAruvnKk",
+                "mediaIndex": True,
+            },
+            "sourceLanguage": "en",
+            "llmConfig": LLM_CONFIG,
+        },
+    )
+
+    assert response.status_code == 422
+    assert dispatched == []
+    async with factory() as session:
+        assert (await session.scalars(select(Video))).all() == []
+        assert (await session.scalars(select(AnalysisJob))).all() == []
+
+
+@pytest.mark.asyncio
+async def test_create_content_ref_defaults_media_index_to_one(api_context):
+    client, _, _, dispatched = api_context
+
+    response = await client.post(
+        "/v1/analyses",
+        json={
+            "contentRef": {
+                "platform": "youtube",
+                "sourceContentId": "aircAruvnKk",
+            },
+            "sourceLanguage": "en",
+            "llmConfig": LLM_CONFIG,
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json()["contentRef"]["mediaIndex"] == 1
+    assert dispatched == [response.json()["jobId"]]
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_youtube_media_index_above_one_without_writes(api_context):
+    client, _, factory, dispatched = api_context
+
+    response = await client.post(
+        "/v1/analyses",
+        json={
+            "contentRef": {
+                "platform": "youtube",
+                "sourceContentId": "aircAruvnKk",
+                "mediaIndex": 2,
+            },
+            "sourceLanguage": "en",
+            "llmConfig": LLM_CONFIG,
+        },
+    )
+
+    assert response.status_code == 422
+    assert dispatched == []
+    async with factory() as session:
+        assert (await session.scalars(select(Video))).all() == []
+        assert (await session.scalars(select(AnalysisJob))).all() == []
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_youtube_media_index_above_one_without_mutation(
+    api_context,
+):
+    client, _, factory, dispatched = api_context
+    content_id = "33333333-3333-4333-8333-333333333333"
+    original_values = (
+        "Original title",
+        123_456,
+        "https://www.youtube.com/watch?v=aircAruvnKk",
+    )
+    async with factory() as session:
+        session.add(
+            Video(
+                video_id="aircAruvnKk",
+                content_id=content_id,
+                platform="youtube",
+                source_content_id="aircAruvnKk",
+                media_index=1,
+                title=original_values[0],
+                duration_ms=original_values[1],
+                source_url=original_values[2],
+            )
+        )
+        await session.commit()
+
+    response = await client.post(
+        "/v1/analyses",
+        json={
+            "contentRef": {
+                "platform": "youtube",
+                "sourceContentId": "aircAruvnKk",
+                "mediaIndex": 2,
+            },
+            "sourceLanguage": "en",
+            "llmConfig": LLM_CONFIG,
+        },
+    )
+
+    assert response.status_code == 422
+    assert dispatched == []
+    async with factory() as session:
+        videos = (await session.scalars(select(Video))).all()
+        assert len(videos) == 1
+        assert videos[0].content_id == content_id
+        assert (
+            videos[0].title,
+            videos[0].duration_ms,
+            videos[0].source_url,
+        ) == original_values
+        assert videos[0].media_index == 1
+        assert (await session.scalars(select(AnalysisJob))).all() == []
 
 
 @pytest.mark.asyncio

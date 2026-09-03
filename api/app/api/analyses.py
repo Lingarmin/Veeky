@@ -145,9 +145,11 @@ class InspectRequest(ApiModel):
     url: str
     preferred_languages: list[str] = Field(default_factory=list)
     active_media_index: int | None = Field(
-        default=None, ge=1, le=MAX_DATABASE_INTEGER
+        default=None, strict=True, ge=1, le=MAX_DATABASE_INTEGER
     )
-    client_duration_ms: int | None = Field(default=None, ge=0)
+    client_duration_ms: int | None = Field(
+        default=None, strict=True, ge=0, le=MAX_DATABASE_INTEGER
+    )
     media_candidates: list[MediaCandidateRequest] = Field(
         default_factory=list, max_length=50
     )
@@ -188,7 +190,9 @@ class LlmConfigRequest(ApiModel):
 class ContentRefRequest(ApiModel):
     platform: Literal["youtube", "x"]
     source_content_id: str = Field(min_length=1, max_length=100)
-    media_index: int = Field(default=1, ge=1, le=MAX_DATABASE_INTEGER)
+    media_index: int = Field(
+        default=1, strict=True, ge=1, le=MAX_DATABASE_INTEGER
+    )
 
     def to_domain(self) -> ContentRef:
         return ContentRef(
@@ -1031,6 +1035,8 @@ def _validate_content_ref(ref: ContentRef) -> None:
     if not 1 <= ref.media_index <= MAX_DATABASE_INTEGER:
         raise _api_error(422, "invalid_content_ref", "视频内容引用无效")
     if ref.platform == "youtube":
+        if ref.media_index != 1:
+            raise _api_error(422, "invalid_content_ref", "视频内容引用无效")
         _validate_video_id(ref.source_content_id)
     elif (
         not ref.source_content_id.isascii()
