@@ -12,6 +12,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    select,
     String,
     Text,
     UniqueConstraint,
@@ -26,6 +27,10 @@ def utc_now() -> datetime:
 
 def uuid_string() -> str:
     return str(uuid.uuid4())
+
+
+def legacy_source_content_id(context: Any) -> str:
+    return str(context.get_current_parameters()["video_id"])
 
 
 class Base(DeclarativeBase):
@@ -48,17 +53,50 @@ class Installation(Base):
 
 class Video(Base):
     __tablename__ = "videos"
+    __table_args__ = (
+        UniqueConstraint("content_id", name="uq_videos_content_id"),
+        UniqueConstraint(
+            "platform",
+            "source_content_id",
+            "media_index",
+            name="uq_videos_platform_source_media",
+        ),
+    )
 
-    video_id: Mapped[str] = mapped_column(String(11), primary_key=True)
+    video_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    content_id: Mapped[str] = mapped_column(String(36), default=uuid_string)
+    platform: Mapped[str] = mapped_column(String(20), default="youtube")
+    source_content_id: Mapped[str] = mapped_column(
+        String(100), default=legacy_source_content_id
+    )
+    media_index: Mapped[int] = mapped_column(Integer, default=1)
     title: Mapped[str] = mapped_column(String(500))
     duration_ms: Mapped[int] = mapped_column(Integer)
     source_url: Mapped[str] = mapped_column(String(1000))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     tracks: Mapped[list[TranscriptTrack]] = relationship(
-        back_populates="video", cascade="all, delete-orphan"
+        back_populates="video",
+        cascade="all, delete-orphan",
+        foreign_keys="TranscriptTrack.video_id",
     )
-    jobs: Mapped[list[AnalysisJob]] = relationship(back_populates="video")
+    content_tracks: Mapped[list[TranscriptTrack]] = relationship(
+        back_populates="content",
+        foreign_keys="TranscriptTrack.content_id",
+    )
+    jobs: Mapped[list[AnalysisJob]] = relationship(
+        back_populates="video", foreign_keys="AnalysisJob.video_id"
+    )
+    content_jobs: Mapped[list[AnalysisJob]] = relationship(
+        back_populates="content", foreign_keys="AnalysisJob.content_id"
+    )
+
+
+def content_id_for_video(context: Any) -> str:
+    video_id = context.get_current_parameters()["video_id"]
+    return context.connection.execute(
+        select(Video.content_id).where(Video.video_id == video_id)
+    ).scalar_one()
 
 
 class TranscriptTrack(Base):
@@ -77,6 +115,11 @@ class TranscriptTrack(Base):
     video_id: Mapped[str] = mapped_column(
         ForeignKey("videos.video_id", ondelete="CASCADE"), index=True
     )
+    content_id: Mapped[str] = mapped_column(
+        ForeignKey("videos.content_id", ondelete="CASCADE"),
+        index=True,
+        default=content_id_for_video,
+    )
     language_code: Mapped[str] = mapped_column(String(35))
     language_name: Mapped[str] = mapped_column(String(120))
     is_generated: Mapped[bool] = mapped_column(Boolean)
@@ -84,7 +127,12 @@ class TranscriptTrack(Base):
     transcript_version: Mapped[str] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
-    video: Mapped[Video] = relationship(back_populates="tracks")
+    video: Mapped[Video] = relationship(
+        back_populates="tracks", foreign_keys=[video_id]
+    )
+    content: Mapped[Video] = relationship(
+        back_populates="content_tracks", foreign_keys=[content_id]
+    )
     segments: Mapped[list[TranscriptSegment]] = relationship(
         back_populates="track", cascade="all, delete-orphan"
     )
@@ -169,10 +217,15 @@ class AnalysisJob(Base):
     video_id: Mapped[str] = mapped_column(
         ForeignKey("videos.video_id", ondelete="CASCADE"), index=True
     )
+    content_id: Mapped[str] = mapped_column(
+        ForeignKey("videos.content_id", ondelete="CASCADE"),
+        index=True,
+        default=content_id_for_video,
+    )
     source_language: Mapped[str] = mapped_column(String(35))
     target_language: Mapped[str] = mapped_column(String(35))
     transcript_version: Mapped[str] = mapped_column(String(100))
-    cache_key: Mapped[str] = mapped_column(String(300), unique=True)
+    cache_key: Mapped[str] = mapped_column(String(500), unique=True)
     llm_config: Mapped[dict[str, str] | None] = mapped_column(JSON, nullable=True)
     llm_credential_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
     llm_credential_expires_at: Mapped[datetime | None] = mapped_column(
@@ -185,7 +238,12 @@ class AnalysisJob(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     installation: Mapped[Installation] = relationship(back_populates="jobs")
-    video: Mapped[Video] = relationship(back_populates="jobs")
+    video: Mapped[Video] = relationship(
+        back_populates="jobs", foreign_keys=[video_id]
+    )
+    content: Mapped[Video] = relationship(
+        back_populates="content_jobs", foreign_keys=[content_id]
+    )
     result: Mapped[AnalysisResult | None] = relationship(
         back_populates="job", cascade="all, delete-orphan", uselist=False
     )

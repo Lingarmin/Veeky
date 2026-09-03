@@ -71,6 +71,33 @@ async def test_translation_cache_key_is_unique(session):
 
 
 @pytest.mark.asyncio
+async def test_videos_from_different_platforms_have_unique_content_ids(session):
+    youtube = Video(
+        video_id="aircAruvnKk",
+        platform="youtube",
+        source_content_id="aircAruvnKk",
+        media_index=1,
+        title="YouTube",
+        duration_ms=1000,
+        source_url="https://www.youtube.com/watch?v=aircAruvnKk",
+    )
+    x_video = Video(
+        video_id="x:2075545587093807111:1",
+        platform="x",
+        source_content_id="2075545587093807111",
+        media_index=1,
+        title="X video",
+        duration_ms=1000,
+        source_url="https://x.com/viktoroddy/status/2075545587093807111/video/1",
+    )
+    session.add_all([youtube, x_video])
+
+    await session.commit()
+
+    assert youtube.content_id != x_video.content_id
+
+
+@pytest.mark.asyncio
 async def test_translation_cache_allows_same_version_from_different_providers(session):
     video = Video(
         video_id="aircAruvnKk",
@@ -115,9 +142,15 @@ async def test_analysis_job_starts_queued_and_uses_utc_timestamp(session):
     installation = Installation(
         id="11111111-1111-4111-8111-111111111111", token_hash="a" * 64
     )
+    video = Video(
+        video_id="aircAruvnKk",
+        title="But what is a neural network?",
+        duration_ms=1_159_000,
+        source_url="https://www.youtube.com/watch?v=aircAruvnKk",
+    )
     job = AnalysisJob(
         installation=installation,
-        video_id="aircAruvnKk",
+        video=video,
         source_language="en",
         target_language="zh-Hans",
         transcript_version="sha256:abc",
@@ -174,9 +207,15 @@ async def test_analysis_job_belongs_to_installation_and_stores_encrypted_credent
     installation = Installation(
         id="22222222-2222-4222-8222-222222222222", token_hash="b" * 64
     )
+    video = Video(
+        video_id="aircAruvnKk",
+        title="But what is a neural network?",
+        duration_ms=1_159_000,
+        source_url="https://www.youtube.com/watch?v=aircAruvnKk",
+    )
     job = AnalysisJob(
         installation=installation,
-        video_id="aircAruvnKk",
+        video=video,
         source_language="en",
         target_language="zh-Hans",
         transcript_version="sha256:abc",
