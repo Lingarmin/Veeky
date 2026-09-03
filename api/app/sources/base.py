@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, Protocol, Sequence
-
-if TYPE_CHECKING:
-    from app.services.transcripts import TranscriptInspection
+from typing import Literal, Protocol, Sequence
 
 
 Platform = Literal["youtube", "x"]
@@ -27,6 +24,25 @@ class TranscriptTrackInfo:
     language_name: str
     is_generated: bool
     is_translatable: bool
+
+
+@dataclass(frozen=True)
+class TranscriptSegment:
+    sequence: int
+    start_ms: int
+    duration_ms: int
+    text: str
+
+
+@dataclass(frozen=True)
+class TranscriptInspection:
+    video_id: str
+    tracks: list[TranscriptTrackInfo]
+    selected: TranscriptTrackInfo | None = None
+    segments: list[TranscriptSegment] = field(default_factory=list)
+    available: bool = False
+    failure_code: str | None = None
+    failure_detail: str | None = None
 
 
 @dataclass(slots=True)
@@ -64,13 +80,27 @@ class UnsupportedSourceUrl(ValueError):
     pass
 
 
+class UnsupportedSourcePlatform(LookupError):
+    pass
+
+
+class SourceRegistryConfigurationError(ValueError):
+    pass
+
+
 class SourceVideoTooLong(ValueError):
     pass
 
 
 class SourceRegistry:
     def __init__(self, adapters: list[SourceAdapter]):
-        self._adapters = {adapter.platform: adapter for adapter in adapters}
+        self._adapters: dict[Platform, SourceAdapter] = {}
+        for adapter in adapters:
+            if adapter.platform in self._adapters:
+                raise SourceRegistryConfigurationError(
+                    f"Duplicate source adapter for platform: {adapter.platform}"
+                )
+            self._adapters[adapter.platform] = adapter
 
     def parse(
         self, url: str, active_media_index: int | None = None
@@ -78,6 +108,11 @@ class SourceRegistry:
         for adapter in self._adapters.values():
             ref = adapter.parse_url(url, active_media_index=active_media_index)
             if ref is not None:
+                if ref.platform != adapter.platform:
+                    raise SourceRegistryConfigurationError(
+                        f"Source adapter {adapter.platform} returned content "
+                        f"for platform {ref.platform}"
+                    )
                 return ref
         raise UnsupportedSourceUrl("仅支持 YouTube 和 x.com 视频链接")
 
@@ -85,4 +120,6 @@ class SourceRegistry:
         try:
             return self._adapters[platform]
         except KeyError as error:
-            raise LookupError(f"No source adapter registered for {platform}") from error
+            raise UnsupportedSourcePlatform(
+                f"No source adapter registered for platform: {platform}"
+            ) from error

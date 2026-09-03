@@ -27,10 +27,13 @@ from app.services.transcripts import TranscriptService, transcript_version
 from app.services.video_metadata import VideoMetadataError, VideoMetadataService
 from app.sources.base import (
     ContentRef,
+    Platform,
     SourceAdapter,
     SourceInspection,
     SourceRegistry,
+    SourceRegistryConfigurationError,
     SourceVideoTooLong,
+    UnsupportedSourcePlatform,
     UnsupportedSourceUrl,
 )
 from app.sources.youtube import YouTubeAdapter, parse_youtube_url
@@ -323,7 +326,9 @@ async def inspect_video(
         raise _api_error(
             422, "invalid_youtube_url", "请输入有效的 YouTube 视频链接"
         ) from error
-    adapter = source_registry.adapter_for(ref.platform)
+    except SourceRegistryConfigurationError as error:
+        raise _source_adapter_unavailable() from error
+    adapter = _source_adapter(source_registry, ref.platform)
     inspection = await _inspect_source(adapter, ref, request.preferred_languages)
     assert inspection.selected_language is not None
     return InspectResponse(
@@ -356,7 +361,7 @@ async def create_analysis(
     _validate_llm_config(request.llm_config)
     _validate_video_id(request.video_id)
     ref = ContentRef(platform="youtube", source_content_id=request.video_id)
-    adapter = source_registry.adapter_for(ref.platform)
+    adapter = _source_adapter(source_registry, ref.platform)
     source_inspection = await _inspect_source(
         adapter, ref, [request.source_language]
     )
@@ -869,6 +874,21 @@ async def _inspect_source(
             "当前视频没有可读取字幕",
         )
     return inspection
+
+
+def _source_adapter(registry: SourceRegistry, platform: Platform) -> SourceAdapter:
+    try:
+        return registry.adapter_for(platform)
+    except UnsupportedSourcePlatform as error:
+        raise _source_adapter_unavailable() from error
+
+
+def _source_adapter_unavailable() -> HTTPException:
+    return _api_error(
+        500,
+        "source_adapter_unavailable",
+        "暂时无法处理该视频来源",
+    )
 
 
 def _is_video_id(video_id: str) -> bool:

@@ -1,6 +1,16 @@
+from typing import get_type_hints
+
 import pytest
 
-from app.sources.base import ContentRef, SourceRegistry, UnsupportedSourceUrl
+from app.sources.base import (
+    ContentRef,
+    SourceAdapter,
+    SourceRegistry,
+    SourceRegistryConfigurationError,
+    TranscriptInspection,
+    UnsupportedSourcePlatform,
+    UnsupportedSourceUrl,
+)
 from app.sources.x import parse_x_url
 from app.sources.youtube import parse_youtube_url
 
@@ -76,3 +86,47 @@ def test_registry_rejects_urls_not_supported_by_an_adapter():
         UnsupportedSourceUrl, match="仅支持 YouTube 和 x.com 视频链接"
     ):
         SourceRegistry([]).parse("https://example.com/video")
+
+
+def test_registry_rejects_duplicate_platform_adapters():
+    class FakeAdapter:
+        platform = "youtube"
+
+        def parse_url(self, url, active_media_index=None):
+            return None
+
+    with pytest.raises(SourceRegistryConfigurationError) as error:
+        SourceRegistry([FakeAdapter(), FakeAdapter()])
+
+    assert str(error.value) == "Duplicate source adapter for platform: youtube"
+
+
+def test_registry_rejects_parser_result_for_a_different_platform():
+    class FakeAdapter:
+        platform = "youtube"
+
+        def parse_url(self, url, active_media_index=None):
+            return ContentRef("x", "2075545587093807111")
+
+    with pytest.raises(SourceRegistryConfigurationError) as error:
+        SourceRegistry([FakeAdapter()]).parse("https://example.com/video")
+
+    assert str(error.value) == (
+        "Source adapter youtube returned content for platform x"
+    )
+
+
+def test_registry_lookup_rejects_unregistered_platform():
+    with pytest.raises(UnsupportedSourcePlatform) as error:
+        SourceRegistry([]).adapter_for("x")
+
+    assert str(error.value) == "No source adapter registered for platform: x"
+
+
+def test_source_adapter_runtime_type_hints_are_resolvable():
+    try:
+        hints = get_type_hints(SourceAdapter.acquire_transcript)
+    except NameError as error:
+        pytest.fail(f"SourceAdapter type hints are not resolvable: {error}")
+
+    assert hints["return"] is TranscriptInspection

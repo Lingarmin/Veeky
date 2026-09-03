@@ -243,6 +243,33 @@ async def test_inspect_routes_youtube_to_adapter(api_context):
 
 
 @pytest.mark.asyncio
+async def test_inspect_does_not_expose_registry_configuration_errors(api_context):
+    class MismatchedAdapter:
+        platform = "youtube"
+
+        def parse_url(self, url, active_media_index=None):
+            from app.sources.base import ContentRef
+
+            return ContentRef("x", "2075545587093807111")
+
+    client, app, _, _ = api_context
+    app.dependency_overrides[get_source_registry] = lambda: SourceRegistry(
+        [MismatchedAdapter()]
+    )
+
+    response = await client.post(
+        "/v1/videos/inspect",
+        json={"url": "https://www.youtube.com/watch?v=aircAruvnKk"},
+    )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == {
+        "code": "source_adapter_unavailable",
+        "message": "暂时无法处理该视频来源",
+    }
+
+
+@pytest.mark.asyncio
 async def test_inspect_reports_no_caption_track(api_context):
     client, app, _, _ = api_context
     app.dependency_overrides[get_transcript_service] = lambda: FakeTranscriptService(False)

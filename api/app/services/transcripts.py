@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import hashlib
 from time import sleep as blocking_sleep
 from typing import Any, Callable, Iterable, Sequence
@@ -22,26 +21,12 @@ from youtube_transcript_api._errors import (
 )
 from youtube_transcript_api.proxies import GenericProxyConfig
 
-from app.sources.base import TranscriptTrackInfo
+from app.sources.base import (
+    TranscriptInspection,
+    TranscriptSegment,
+    TranscriptTrackInfo,
+)
 
-
-@dataclass(frozen=True)
-class TranscriptSegment:
-    sequence: int
-    start_ms: int
-    duration_ms: int
-    text: str
-
-
-@dataclass(frozen=True)
-class TranscriptInspection:
-    video_id: str
-    tracks: list[TranscriptTrackInfo]
-    selected: TranscriptTrackInfo | None = None
-    segments: list[TranscriptSegment] = field(default_factory=list)
-    available: bool = False
-    failure_code: str | None = None
-    failure_detail: str | None = None
 
 class TranscriptService:
     def __init__(
