@@ -19,12 +19,14 @@ LEGACY_INSTALLATION_ID = "00000000-0000-4000-8000-000000000000"
 VIDEO_ID = "aircAruvnKk"
 TRACK_ID = "22222222-2222-4222-8222-222222222222"
 SEGMENT_ID = "33333333-3333-4333-8333-333333333333"
+TRANSLATION_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 JOB_ID = "44444444-4444-4444-8444-444444444444"
 RESULT_ID = "55555555-5555-4555-8555-555555555555"
 X_VIDEO_ID = "x:2075545587093807111:1"
 X_CONTENT_ID = "66666666-6666-4666-8666-666666666666"
 X_TRACK_ID = "77777777-7777-4777-8777-777777777777"
 X_SEGMENT_ID = "88888888-8888-4888-8888-888888888888"
+X_TRANSLATION_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 X_JOB_ID = "99999999-9999-4999-8999-999999999999"
 X_RESULT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
@@ -130,6 +132,17 @@ async def _insert_youtube_history(connection: asyncpg.Connection) -> None:
     )
     await connection.execute(
         """
+        INSERT INTO translations (
+            id, track_id, target_language, provider, provider_version,
+            transcript_version, segments, created_at
+        ) VALUES ($1, $2, 'zh-Hans', 'fixture', 'v1', 'sha256:migration',
+                  '[{"text": "迁移译文"}]'::json, NOW())
+        """,
+        TRANSLATION_ID,
+        TRACK_ID,
+    )
+    await connection.execute(
+        """
         INSERT INTO analysis_jobs (
             id, installation_id, video_id, source_language, target_language,
             transcript_version, cache_key, status, created_at, completed_at
@@ -197,6 +210,17 @@ async def _insert_x_history(connection: asyncpg.Connection) -> None:
     )
     await connection.execute(
         """
+        INSERT INTO translations (
+            id, track_id, target_language, provider, provider_version,
+            transcript_version, segments, created_at
+        ) VALUES ($1, $2, 'zh-Hans', 'fixture', 'v1', 'pending:x-migration',
+                  '[{"text": "X migration translation"}]'::json, NOW())
+        """,
+        X_TRANSLATION_ID,
+        X_TRACK_ID,
+    )
+    await connection.execute(
+        """
         INSERT INTO analysis_jobs (
             id, installation_id, video_id, content_id, source_language,
             target_language, transcript_version, cache_key, status,
@@ -228,11 +252,14 @@ async def _fetch_history(connection: asyncpg.Connection) -> asyncpg.Record:
         """
         SELECT v.video_id, v.title, v.source_url,
                t.language_name, t.transcript_version, s.text AS transcript_text,
+               tr.provider AS translation_provider,
+               tr.segments AS translation_segments,
                j.status, j.cache_key, j.source_language,
                r.one_line_summary, r.summary_points, r.chapters, r.highlights
         FROM videos v
         JOIN transcript_tracks t ON t.video_id = v.video_id
         JOIN transcript_segments s ON s.track_id = t.id
+        JOIN translations tr ON tr.track_id = t.id
         JOIN analysis_jobs j ON j.video_id = v.video_id
         JOIN analysis_results r ON r.job_id = j.id
         WHERE v.video_id = $1
@@ -294,6 +321,9 @@ async def test_platform_content_migration_preserves_youtube_history_on_round_tri
         )
         upgraded_history = dict(await _fetch_history(connection))
         await _insert_x_history(connection)
+        x_translation_count = await connection.fetchval(
+            "SELECT COUNT(*) FROM translations WHERE id = $1", X_TRANSLATION_ID
+        )
     finally:
         await connection.close()
 
@@ -312,6 +342,10 @@ async def test_platform_content_migration_preserves_youtube_history_on_round_tri
     assert json.loads(upgraded_history["highlights"]) == [
         {"title": "Migration highlight", "start_ms": 100}
     ]
+    assert json.loads(upgraded_history["translation_segments"]) == [
+        {"text": "迁移译文"}
+    ]
+    assert x_translation_count == 1
 
     _alembic(migration_database_url, "downgrade", "0005_one_active_job")
 
@@ -324,12 +358,14 @@ async def test_platform_content_migration_preserves_youtube_history_on_round_tri
                 (SELECT COUNT(*) FROM videos WHERE video_id = $1) AS videos,
                 (SELECT COUNT(*) FROM transcript_tracks WHERE id = $2) AS tracks,
                 (SELECT COUNT(*) FROM transcript_segments WHERE id = $3) AS segments,
-                (SELECT COUNT(*) FROM analysis_jobs WHERE id = $4) AS jobs,
-                (SELECT COUNT(*) FROM analysis_results WHERE id = $5) AS results
+                (SELECT COUNT(*) FROM translations WHERE id = $4) AS translations,
+                (SELECT COUNT(*) FROM analysis_jobs WHERE id = $5) AS jobs,
+                (SELECT COUNT(*) FROM analysis_results WHERE id = $6) AS results
             """,
             X_VIDEO_ID,
             X_TRACK_ID,
             X_SEGMENT_ID,
+            X_TRANSLATION_ID,
             X_JOB_ID,
             X_RESULT_ID,
         )
@@ -337,4 +373,4 @@ async def test_platform_content_migration_preserves_youtube_history_on_round_tri
         await connection.close()
 
     assert downgraded_history == expected_history
-    assert tuple(x_row_counts) == (0, 0, 0, 0, 0)
+    assert tuple(x_row_counts) == (0, 0, 0, 0, 0, 0)
