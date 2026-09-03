@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -276,6 +277,95 @@ async def test_downloader_maps_timeout_without_exposing_query(tmp_path: Path):
 
     assert "secret" not in str(error.value)
     assert error.value.__cause__ is None
+    assert_no_download_artifacts(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_downloader_deadline_includes_dns_resolution(tmp_path: Path):
+    async def resolver_that_never_returns(_hostname: str) -> list[str]:
+        await asyncio.Event().wait()
+        return [PUBLIC_IPV4]
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200))
+    ) as client:
+        with pytest.raises(MediaDownloadTimeout) as error:
+            await asyncio.wait_for(
+                MediaDownloader(
+                    client=client,
+                    max_bytes=16,
+                    timeout_seconds=0.01,
+                    resolver=resolver_that_never_returns,
+                ).download(
+                    "https://video.twimg.com/file.mp4?token=secret",
+                    tmp_path / "media.mp4",
+                ),
+                timeout=0.2,
+            )
+
+    assert "secret" not in str(error.value)
+    assert error.value.__cause__ is None
+    assert_no_download_artifacts(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_downloader_uses_one_deadline_across_redirects_and_streaming(
+    tmp_path: Path,
+):
+    class FakeClock:
+        def __init__(self) -> None:
+            self.now = 0.0
+
+        def __call__(self) -> float:
+            return self.now
+
+        def advance(self, seconds: float) -> None:
+            self.now += seconds
+
+    class AdvancingStream(httpx.AsyncByteStream):
+        def __init__(self, clock: FakeClock) -> None:
+            self.clock = clock
+            self.chunks_read = 0
+
+        async def __aiter__(self):
+            for chunk in (b"first", b"second", b"must-not-be-read"):
+                self.clock.advance(2)
+                self.chunks_read += 1
+                yield chunk
+
+    clock = FakeClock()
+    stream = AdvancingStream(clock)
+    request_timeouts: list[float] = []
+    requests = 0
+
+    async def resolver(_hostname: str) -> list[str]:
+        clock.advance(2)
+        return [PUBLIC_IPV4]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        request_timeouts.append(request.extensions["timeout"]["read"])
+        if requests == 1:
+            clock.advance(3)
+            return httpx.Response(302, headers={"Location": "/final.mp4"})
+        return httpx.Response(200, stream=stream)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(MediaDownloadTimeout):
+            await MediaDownloader(
+                client=client,
+                max_bytes=64,
+                timeout_seconds=10,
+                resolver=resolver,
+                clock=clock,
+            ).download(
+                "https://video.twimg.com/file.mp4",
+                tmp_path / "media.mp4",
+            )
+
+    assert request_timeouts == pytest.approx([8, 3])
+    assert stream.chunks_read == 2
     assert_no_download_artifacts(tmp_path)
 
 
