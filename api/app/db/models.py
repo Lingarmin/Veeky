@@ -321,6 +321,7 @@ class MediaUploadSession(Base):
             "status",
         ),
         Index("ix_media_upload_sessions_expires_at", "expires_at"),
+        Index("ix_media_upload_sessions_content_id", "content_id"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_string)
@@ -335,10 +336,7 @@ class MediaUploadSession(Base):
     received_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     media_kind: Mapped[str] = mapped_column(String(10))
     part_count: Mapped[int] = mapped_column(Integer)
-    part_size_bytes: Mapped[int] = mapped_column(Integer)
-    uploaded_parts: Mapped[dict[str, dict[str, int | str]]] = mapped_column(
-        JSON, default=dict
-    )
+    part_size_bytes: Mapped[int] = mapped_column(BigInteger)
     hls_manifest: Mapped[dict[str, list[int]] | None] = mapped_column(
         JSON, nullable=True
     )
@@ -353,3 +351,30 @@ class MediaUploadSession(Base):
     content: Mapped[Video] = relationship(
         back_populates="media_upload_sessions", foreign_keys=[content_id]
     )
+    parts: Mapped[list[MediaUploadPart]] = relationship(
+        back_populates="upload_session",
+        cascade="all, delete-orphan",
+        order_by="MediaUploadPart.part_number",
+        lazy="selectin",
+    )
+
+
+class MediaUploadPart(Base):
+    __tablename__ = "media_upload_parts"
+    __table_args__ = (
+        CheckConstraint("part_number >= 0", name="ck_media_upload_part_number"),
+        CheckConstraint("byte_size > 0", name="ck_media_upload_part_byte_size"),
+        CheckConstraint(
+            "length(sha256) = 64", name="ck_media_upload_part_sha256_length"
+        ),
+    )
+
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("media_upload_sessions.id", ondelete="CASCADE"), primary_key=True
+    )
+    part_number: Mapped[int] = mapped_column(Integer, primary_key=True)
+    byte_size: Mapped[int] = mapped_column(BigInteger)
+    sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    upload_session: Mapped[MediaUploadSession] = relationship(back_populates="parts")

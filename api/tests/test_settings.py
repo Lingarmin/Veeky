@@ -26,6 +26,7 @@ def test_media_settings_have_bounded_defaults():
     assert settings.media_download_timeout_seconds == 1800
     assert settings.media_upload_session_ttl_seconds == 7200
     assert settings.media_chunk_bytes == 8 * 1024 * 1024
+    assert settings.max_active_media_upload_sessions_per_installation == 1
     assert settings.asr_job_timeout_seconds == 21600
     assert settings.media_temp_root == "/var/lib/veeky/media"
 
@@ -36,6 +37,7 @@ def test_media_settings_allow_environment_overrides(monkeypatch):
     monkeypatch.setenv("MEDIA_DOWNLOAD_TIMEOUT_SECONDS", "30")
     monkeypatch.setenv("MEDIA_UPLOAD_SESSION_TTL_SECONDS", "60")
     monkeypatch.setenv("MEDIA_CHUNK_BYTES", "256")
+    monkeypatch.setenv("MAX_ACTIVE_MEDIA_UPLOAD_SESSIONS_PER_INSTALLATION", "2")
     monkeypatch.setenv("ASR_JOB_TIMEOUT_SECONDS", "120")
     monkeypatch.setenv("MEDIA_TEMP_ROOT", "/tmp/veeky-test-media")
 
@@ -46,6 +48,7 @@ def test_media_settings_allow_environment_overrides(monkeypatch):
     assert settings.media_download_timeout_seconds == 30
     assert settings.media_upload_session_ttl_seconds == 60
     assert settings.media_chunk_bytes == 256
+    assert settings.max_active_media_upload_sessions_per_installation == 2
     assert settings.asr_job_timeout_seconds == 120
     assert settings.media_temp_root == "/tmp/veeky-test-media"
 
@@ -58,6 +61,7 @@ def test_media_settings_allow_environment_overrides(monkeypatch):
         "media_download_timeout_seconds",
         "media_upload_session_ttl_seconds",
         "media_chunk_bytes",
+        "max_active_media_upload_sessions_per_installation",
         "asr_job_timeout_seconds",
     ],
 )

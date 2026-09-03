@@ -27,8 +27,7 @@ def upgrade() -> None:
         sa.Column("received_bytes", sa.BigInteger(), nullable=False),
         sa.Column("media_kind", sa.String(length=10), nullable=False),
         sa.Column("part_count", sa.Integer(), nullable=False),
-        sa.Column("part_size_bytes", sa.Integer(), nullable=False),
-        sa.Column("uploaded_parts", sa.JSON(), nullable=False),
+        sa.Column("part_size_bytes", sa.BigInteger(), nullable=False),
         sa.Column("hls_manifest", sa.JSON(), nullable=True),
         sa.Column("directory_key", sa.String(length=36), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
@@ -83,9 +82,40 @@ def upgrade() -> None:
         "media_upload_sessions",
         ["expires_at"],
     )
+    op.create_index(
+        "ix_media_upload_sessions_content_id",
+        "media_upload_sessions",
+        ["content_id"],
+    )
+    op.create_table(
+        "media_upload_parts",
+        sa.Column("session_id", sa.String(length=36), nullable=False),
+        sa.Column("part_number", sa.Integer(), nullable=False),
+        sa.Column("byte_size", sa.BigInteger(), nullable=False),
+        sa.Column("sha256", sa.String(length=64), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.CheckConstraint(
+            "part_number >= 0", name="ck_media_upload_part_number"
+        ),
+        sa.CheckConstraint("byte_size > 0", name="ck_media_upload_part_byte_size"),
+        sa.CheckConstraint(
+            "length(sha256) = 64", name="ck_media_upload_part_sha256_length"
+        ),
+        sa.ForeignKeyConstraint(
+            ["session_id"],
+            ["media_upload_sessions.id"],
+            name="fk_media_upload_parts_session_id_media_upload_sessions",
+            ondelete="CASCADE",
+        ),
+        sa.PrimaryKeyConstraint("session_id", "part_number"),
+    )
 
 
 def downgrade() -> None:
+    op.drop_table("media_upload_parts")
+    op.drop_index(
+        "ix_media_upload_sessions_content_id", table_name="media_upload_sessions"
+    )
     op.drop_index(
         "ix_media_upload_sessions_expires_at", table_name="media_upload_sessions"
     )

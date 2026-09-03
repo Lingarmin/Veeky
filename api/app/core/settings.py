@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     media_download_timeout_seconds: PositiveInt = 1800
     media_upload_session_ttl_seconds: PositiveInt = 7200
     media_chunk_bytes: PositiveInt = 8 * 1024 * 1024
+    max_active_media_upload_sessions_per_installation: PositiveInt = 1
     asr_job_timeout_seconds: PositiveInt = 21600
     media_temp_root: str = "/var/lib/veeky/media"
     llm_credential_encryption_key: SecretStr | None = None

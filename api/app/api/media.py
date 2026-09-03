@@ -1,19 +1,22 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import re
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
-from pydantic import Field
+from pydantic import ConfigDict, Field, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.analyses import ApiModel
+from app.api.analyses import ApiModel, enforce_write_quota
 from app.core.settings import Settings, get_settings
 from app.db.models import Installation, MediaUploadSession
 from app.db.session import get_session
 from app.security.installations import require_installation
 from app.services.media_upload import (
+    MAX_PART_COUNT,
     MediaArtifact,
     MediaUploadError,
     complete_upload,
@@ -26,6 +29,7 @@ from app.services.media_upload import (
 
 router = APIRouter(prefix="/v1/media-sessions", tags=["media"])
 _SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
+MAX_COMPLETION_BODY_BYTES = 1024 * 1024
 
 
 class MediaSessionCreateRequest(ApiModel):
@@ -54,10 +58,20 @@ class MediaSessionCreateResponse(MediaSessionResponse):
     pass
 
 
+class HlsManifestRequest(ApiModel):
+    model_config = ConfigDict(**ApiModel.model_config, extra="forbid")
+
+    parts: list[Annotated[int, Field(strict=True, ge=0)]] = Field(
+        max_length=MAX_PART_COUNT
+    )
+
+
 class MediaSessionCompleteRequest(ApiModel):
-    part_count: int = Field(strict=True)
-    total_bytes: int = Field(strict=True)
-    manifest: dict[str, Any] | None = None
+    model_config = ConfigDict(**ApiModel.model_config, extra="forbid")
+
+    part_count: int = Field(strict=True, ge=1, le=MAX_PART_COUNT)
+    total_bytes: int = Field(strict=True, ge=1)
+    manifest: HlsManifestRequest | None = None
 
 
 class MediaArtifactResponse(ApiModel):
@@ -75,6 +89,7 @@ async def create_media_session(
     database: AsyncSession = Depends(get_session),
     installation: Installation = Depends(require_installation),
     settings: Settings = Depends(get_settings),
+    _: None = Depends(enforce_write_quota),
 ) -> MediaSessionCreateResponse:
     try:
         upload = await create_upload_session(
@@ -116,6 +131,7 @@ async def upload_media_part(
     installation: Installation = Depends(require_installation),
     settings: Settings = Depends(get_settings),
     content_sha256: str | None = Header(default=None, alias="X-Content-SHA256"),
+    _: None = Depends(enforce_write_quota),
 ) -> Response:
     try:
         upload = await get_owned_upload(
@@ -155,22 +171,24 @@ async def upload_media_part(
 @router.post("/{session_id}/complete", response_model=MediaArtifactResponse)
 async def complete_media_session(
     session_id: str,
-    request: MediaSessionCompleteRequest,
+    http_request: Request,
     database: AsyncSession = Depends(get_session),
     installation: Installation = Depends(require_installation),
     settings: Settings = Depends(get_settings),
+    _: None = Depends(enforce_write_quota),
 ) -> MediaArtifactResponse:
     try:
         upload = await get_owned_upload(
             database, settings, session_id, installation.id
         )
+        request = await _read_completion_request(http_request)
         artifact = await complete_upload(
             database,
             settings,
             upload,
             request.part_count,
             request.total_bytes,
-            request.manifest,
+            request.manifest.model_dump() if request.manifest is not None else None,
         )
     except MediaUploadError as error:
         raise _http_error(error) from error
@@ -183,10 +201,11 @@ async def delete_media_session(
     database: AsyncSession = Depends(get_session),
     installation: Installation = Depends(require_installation),
     settings: Settings = Depends(get_settings),
+    _: None = Depends(enforce_write_quota),
 ) -> Response:
     try:
         upload = await get_owned_upload(
-            database, settings, session_id, installation.id, reconcile=False
+            database, settings, session_id, installation.id, expire=False
         )
         await delete_upload(database, settings, upload)
     except MediaUploadError as error:
@@ -204,7 +223,7 @@ def _session_response(upload: MediaUploadSession) -> MediaSessionCreateResponse:
         received_bytes=upload.received_bytes,
         part_size_bytes=upload.part_size_bytes,
         part_count=upload.part_count,
-        uploaded_parts=sorted(int(value) for value in upload.uploaded_parts),
+        uploaded_parts=[part.part_number for part in upload.parts],
         created_at=upload.created_at,
         updated_at=upload.updated_at,
         expires_at=upload.expires_at,
@@ -225,4 +244,55 @@ def _http_error(error: MediaUploadError) -> HTTPException:
     return HTTPException(
         status_code=error.status_code,
         detail={"code": error.code, "message": error.message},
+    )
+
+
+async def _read_completion_request(request: Request) -> MediaSessionCompleteRequest:
+    declared_length = request.headers.get("content-length")
+    if declared_length is not None:
+        try:
+            if int(declared_length) > MAX_COMPLETION_BODY_BYTES:
+                raise _completion_body_too_large()
+        except ValueError:
+            raise _invalid_completion_body() from None
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > MAX_COMPLETION_BODY_BYTES:
+            raise _completion_body_too_large()
+        body.extend(chunk)
+    try:
+        payload = await asyncio.to_thread(json.loads, bytes(body))
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+        raise _invalid_completion_body() from None
+    try:
+        return MediaSessionCompleteRequest.model_validate(payload)
+    except ValidationError as error:
+        if any(item["loc"] and item["loc"][0] == "manifest" for item in error.errors()):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "invalid_hls_manifest",
+                    "message": "HLS manifest is invalid",
+                },
+            ) from None
+        raise _invalid_completion_body() from None
+
+
+def _completion_body_too_large() -> HTTPException:
+    return HTTPException(
+        status_code=413,
+        detail={
+            "code": "completion_body_too_large",
+            "message": "completion body exceeds the size limit",
+        },
+    )
+
+
+def _invalid_completion_body() -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail={
+            "code": "invalid_completion_body",
+            "message": "completion body is malformed or invalid",
+        },
     )
