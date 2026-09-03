@@ -15,6 +15,7 @@ class UnsafeMediaUrl(ValueError):
 ResolvedAddresses = Iterable[str]
 ResolverResult = ResolvedAddresses | Awaitable[ResolvedAddresses]
 Resolver = Callable[[str], ResolverResult]
+IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 
 
 async def _resolve_public_addresses(hostname: str) -> list[str]:
@@ -32,7 +33,7 @@ async def validate_x_media_url(
     url: str,
     *,
     resolver: Resolver | None = None,
-) -> None:
+) -> frozenset[IPAddress]:
     try:
         parsed = urlsplit(url)
         port = parsed.port
@@ -62,18 +63,16 @@ async def validate_x_media_url(
     if not addresses:
         raise UnsafeMediaUrl("media host could not be safely resolved")
 
+    validated_addresses: set[IPAddress] = set()
     for raw_address in addresses:
         try:
             address = ipaddress.ip_address(raw_address)
         except ValueError as error:
             raise UnsafeMediaUrl("media host could not be safely resolved") from error
-        if (
-            address.is_loopback
-            or address.is_private
-            or address.is_link_local
-            or address.is_multicast
-            or address.is_reserved
-            or address.is_unspecified
-        ):
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+            address = address.ipv4_mapped
+        if not address.is_global or address.is_multicast:
             raise UnsafeMediaUrl("media host resolved to a disallowed address")
+        validated_addresses.add(address)
 
+    return frozenset(validated_addresses)
