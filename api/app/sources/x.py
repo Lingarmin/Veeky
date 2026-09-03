@@ -27,7 +27,10 @@ def parse_x_url(
         return None
 
     route_media_index = match.group("media_index")
-    media_index = int(route_media_index) if route_media_index else active_media_index
+    try:
+        media_index = int(route_media_index) if route_media_index else active_media_index
+    except ValueError:
+        return None
     if not isinstance(media_index, int) or isinstance(media_index, bool) or media_index <= 0:
         return None
 

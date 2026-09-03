@@ -20,12 +20,26 @@ def test_parses_x_video_route():
 
 
 def test_bare_x_status_requires_active_media_index():
+    url = "https://x.com/viktoroddy/status/2075545587093807111"
+
+    assert parse_x_url(url) is None
     assert (
         parse_x_url(
-            "https://x.com/viktoroddy/status/2075545587093807111",
+            url,
             active_media_index=2,
         ).media_index
         == 2
+    )
+
+
+def test_rejects_x_route_media_index_too_large_to_parse():
+    media_index = "1" * 5_000
+
+    assert (
+        parse_x_url(
+            f"https://x.com/viktoroddy/status/2075545587093807111/video/{media_index}"
+        )
+        is None
     )
 
 
