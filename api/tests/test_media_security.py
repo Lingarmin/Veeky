@@ -394,18 +394,86 @@ async def test_httpx_media_log_filter_leaves_non_media_urls_unchanged(caplog):
 
 
 @pytest.mark.asyncio
-async def test_httpx_media_log_filter_is_installed_once():
+@pytest.mark.parametrize(
+    ("logger_name", "return_value"),
+    [
+        (
+            "httpcore.http11",
+            (
+                b"HTTP/1.1",
+                302,
+                b"Found",
+                [
+                    (b"Location", b"/final.mp4?token=http11-secret#part"),
+                    (b"X-Debug", b"keep?token=visible"),
+                ],
+            ),
+        ),
+        (
+            "httpcore.http2",
+            (
+                302,
+                [
+                    (b"location", b"/final.mp4?token=http2-secret#part"),
+                    (b"x-debug", b"keep?token=visible"),
+                ],
+            ),
+        ),
+    ],
+)
+async def test_httpcore_media_logs_redact_location_queries(
+    caplog,
+    logger_name: str,
+    return_value: tuple,
+):
+    media_client = media_download_module.build_media_http_client()
+    await media_client.aclose()
+
+    with caplog.at_level(logging.DEBUG, logger=logger_name):
+        logging.getLogger(logger_name).debug(
+            f"receive_response_headers.complete return_value={return_value!r}"
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages
+    assert all("http11-secret" not in message for message in messages)
+    assert all("http2-secret" not in message for message in messages)
+    assert any("keep?token=visible" in message for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_httpcore_filter_does_not_change_other_loggers(caplog):
+    media_client = media_download_module.build_media_http_client()
+    await media_client.aclose()
+    return_value = (
+        b"HTTP/1.1",
+        302,
+        b"Found",
+        [(b"Location", b"/final.mp4?token=visible")],
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="httpcore.connection"):
+        logging.getLogger("httpcore.connection").debug(
+            f"receive_response_headers.complete return_value={return_value!r}"
+        )
+
+    assert any("token=visible" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_media_log_filters_are_installed_once():
     first_client = media_download_module.build_media_http_client()
     second_client = media_download_module.build_media_http_client()
     await first_client.aclose()
     await second_client.aclose()
 
-    installed_filters = [
-        log_filter
-        for log_filter in logging.getLogger("httpx").filters
-        if getattr(log_filter, "_media_url_filter", False)
-    ]
-    assert len(installed_filters) == 1
+    for logger_name in ("httpx", "httpcore.http11", "httpcore.http2"):
+        installed_filters = [
+            log_filter
+            for log_filter in logging.getLogger(logger_name).filters
+            if getattr(log_filter, "_media_url_filter", False)
+        ]
+        assert len(installed_filters) == 1
 
 
 def test_media_download_job_prefix_is_available_to_periodic_cleanup():
@@ -492,6 +560,104 @@ async def test_httpcore_connects_to_pinned_authority_and_verifies_original_tls_n
     assert backend.stream.tls_hostname == "video.twimg.com"
     assert backend.stream.check_hostname is True
     assert b"Host: video.twimg.com\r\n" in b"".join(backend.stream.writes)
+
+
+@pytest.mark.asyncio
+async def test_httpcore_redirect_logs_are_redacted_without_changing_redirect(
+    tmp_path: Path,
+    caplog,
+):
+    class ScriptedStream(httpcore.AsyncNetworkStream):
+        def __init__(self, response: bytes) -> None:
+            self.response = response
+            self.response_sent = False
+            self.writes: list[bytes] = []
+
+        async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+            if self.response_sent:
+                return b""
+            self.response_sent = True
+            return self.response
+
+        async def write(self, buffer: bytes, timeout: float | None = None) -> None:
+            self.writes.append(buffer)
+
+        async def aclose(self) -> None:
+            return None
+
+        async def start_tls(
+            self,
+            ssl_context: ssl.SSLContext,
+            server_hostname: str | None = None,
+            timeout: float | None = None,
+        ) -> httpcore.AsyncNetworkStream:
+            return self
+
+        def get_extra_info(self, info: str):
+            return None
+
+    class ScriptedBackend(httpcore.AsyncNetworkBackend):
+        def __init__(self) -> None:
+            self.responses = [
+                (
+                    b"HTTP/1.1 302 Found\r\n"
+                    b"Location: /final.mp4?token=redirect-secret\r\n"
+                    b"Content-Length: 0\r\n"
+                    b"Connection: close\r\n\r\n"
+                ),
+                (
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Length: 5\r\n"
+                    b"Connection: close\r\n\r\n"
+                    b"media"
+                ),
+            ]
+            self.streams: list[ScriptedStream] = []
+
+        async def connect_tcp(
+            self,
+            host: str,
+            port: int,
+            timeout: float | None = None,
+            local_address: str | None = None,
+            socket_options=None,
+        ) -> httpcore.AsyncNetworkStream:
+            stream = ScriptedStream(self.responses.pop(0))
+            self.streams.append(stream)
+            return stream
+
+        async def connect_unix_socket(self, *args, **kwargs):
+            raise AssertionError("Unix sockets are not allowed")
+
+        async def sleep(self, seconds: float) -> None:
+            return None
+
+    backend = ScriptedBackend()
+    inner_transport = httpx.AsyncHTTPTransport(
+        verify=ssl.create_default_context(),
+        trust_env=False,
+    )
+    inner_transport._pool._network_backend = backend
+    destination = tmp_path / "media.mp4"
+
+    with caplog.at_level(logging.DEBUG, logger="httpcore.http11"):
+        await MediaDownloader(
+            inner_transport=inner_transport,
+            max_bytes=16,
+            resolver=resolver_returning(PUBLIC_IPV4),
+        ).download(
+            "https://video.twimg.com/start.mp4",
+            destination,
+        )
+
+    requests = b"".join(
+        write for stream in backend.streams for write in stream.writes
+    )
+    assert b"GET /final.mp4?token=redirect-secret HTTP/1.1" in requests
+    assert destination.read_bytes() == b"media"
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("receive_response_headers.complete" in message for message in messages)
+    assert all("redirect-secret" not in message for message in messages)
 
 
 @pytest.mark.asyncio

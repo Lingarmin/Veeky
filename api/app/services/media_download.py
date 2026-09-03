@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import ipaddress
 import logging
@@ -8,7 +9,7 @@ import secrets
 import time
 from collections.abc import Callable
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
@@ -20,6 +21,11 @@ PINNED_IP_EXTENSION = "veeky_pinned_ip"
 MEDIA_DOWNLOAD_JOB_PREFIX = ".media-download-"
 MEDIA_CONNECT_TIMEOUT_SECONDS = 10.0
 _HTTPX_REQUEST_LOG_MESSAGE = 'HTTP Request: %s %s "%s %d %s"'
+_HTTPCORE_RESPONSE_LOG_PREFIX = "receive_response_headers.complete return_value="
+_HTTPCORE_RESPONSE_HEADER_INDEXES = {
+    "httpcore.http11": 3,
+    "httpcore.http2": 1,
+}
 
 
 class _HTTPXMediaUrlFilter(logging.Filter):
@@ -45,14 +51,91 @@ class _HTTPXMediaUrlFilter(logging.Filter):
 _HTTPX_MEDIA_URL_FILTER = _HTTPXMediaUrlFilter()
 
 
-def _install_httpx_media_log_filter() -> None:
+class _HTTPCoreMediaLocationFilter(logging.Filter):
+    _media_url_filter = True
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        header_index = _HTTPCORE_RESPONSE_HEADER_INDEXES.get(record.name)
+        if (
+            header_index is None
+            or record.args
+            or not isinstance(record.msg, str)
+            or not record.msg.startswith(_HTTPCORE_RESPONSE_LOG_PREFIX)
+        ):
+            return True
+
+        try:
+            return_value = ast.literal_eval(
+                record.msg.removeprefix(_HTTPCORE_RESPONSE_LOG_PREFIX)
+            )
+        except (SyntaxError, ValueError):
+            return True
+        if (
+            not isinstance(return_value, tuple)
+            or len(return_value) <= header_index
+            or not isinstance(return_value[header_index], (list, tuple))
+        ):
+            return True
+
+        headers = return_value[header_index]
+        redacted_headers = []
+        changed = False
+        for header in headers:
+            if (
+                isinstance(header, tuple)
+                and len(header) == 2
+                and isinstance(header[0], bytes)
+                and isinstance(header[1], bytes)
+                and header[0].lower() == b"location"
+            ):
+                redacted_value = self._redact_location(header[1])
+                redacted_headers.append((header[0], redacted_value))
+                changed = changed or redacted_value != header[1]
+            else:
+                redacted_headers.append(header)
+        if not changed:
+            return True
+
+        redacted_return_value = list(return_value)
+        redacted_return_value[header_index] = type(headers)(redacted_headers)
+        record.msg = (
+            _HTTPCORE_RESPONSE_LOG_PREFIX + repr(tuple(redacted_return_value))
+        )
+        return True
+
+    @staticmethod
+    def _redact_location(value: bytes) -> bytes:
+        try:
+            parsed = urlsplit(value)
+            return parsed._replace(query=b"", fragment=b"").geturl()
+        except (TypeError, UnicodeDecodeError, ValueError):
+            delimiters = [
+                index
+                for marker in (b"?", b"#")
+                if (index := value.find(marker)) >= 0
+            ]
+            return value[: min(delimiters)] if delimiters else value
+
+
+_HTTPCORE_MEDIA_LOCATION_FILTER = _HTTPCoreMediaLocationFilter()
+
+
+def _install_media_log_filters() -> None:
     httpx_logger = logging.getLogger("httpx")
-    if any(
+    if not any(
         getattr(log_filter, "_media_url_filter", False)
         for log_filter in httpx_logger.filters
     ):
-        return
-    httpx_logger.addFilter(_HTTPX_MEDIA_URL_FILTER)
+        httpx_logger.addFilter(_HTTPX_MEDIA_URL_FILTER)
+
+    for logger_name in _HTTPCORE_RESPONSE_HEADER_INDEXES:
+        httpcore_logger = logging.getLogger(logger_name)
+        if any(
+            getattr(log_filter, "_media_url_filter", False)
+            for log_filter in httpcore_logger.filters
+        ):
+            continue
+        httpcore_logger.addFilter(_HTTPCORE_MEDIA_LOCATION_FILTER)
 
 
 class MediaDownloadError(RuntimeError):
@@ -114,7 +197,7 @@ def build_media_http_client(
     *,
     inner_transport: httpx.AsyncBaseTransport | None = None,
 ) -> httpx.AsyncClient:
-    _install_httpx_media_log_filter()
+    _install_media_log_filters()
     return httpx.AsyncClient(
         transport=PinnedMediaTransport(inner_transport=inner_transport),
         trust_env=False,
