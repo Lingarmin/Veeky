@@ -1,4 +1,6 @@
-from app.sources.base import ContentRef
+import pytest
+
+from app.sources.base import ContentRef, SourceRegistry, UnsupportedSourceUrl
 from app.sources.x import parse_x_url
 from app.sources.youtube import parse_youtube_url
 
@@ -52,3 +54,25 @@ def test_content_ref_has_unambiguous_key():
         platform="x", source_content_id="2075545587093807111", media_index=1
     )
     assert ref.stable_key == "x:2075545587093807111:1"
+
+
+def test_registry_routes_urls_through_registered_adapter():
+    class FakeAdapter:
+        platform = "youtube"
+
+        def parse_url(self, url, active_media_index=None):
+            return parse_youtube_url(url)
+
+    registry = SourceRegistry([FakeAdapter()])
+
+    assert registry.parse(
+        "https://www.youtube.com/watch?v=aircAruvnKk"
+    ) == ContentRef("youtube", "aircAruvnKk")
+    assert registry.adapter_for("youtube").platform == "youtube"
+
+
+def test_registry_rejects_urls_not_supported_by_an_adapter():
+    with pytest.raises(
+        UnsupportedSourceUrl, match="仅支持 YouTube 和 x.com 视频链接"
+    ):
+        SourceRegistry([]).parse("https://example.com/video")

@@ -22,13 +22,7 @@ from youtube_transcript_api._errors import (
 )
 from youtube_transcript_api.proxies import GenericProxyConfig
 
-
-@dataclass(frozen=True)
-class TranscriptTrackInfo:
-    language_code: str
-    language_name: str
-    is_generated: bool
-    is_translatable: bool
+from app.sources.base import TranscriptTrackInfo
 
 
 @dataclass(frozen=True)

@@ -31,6 +31,9 @@ from app.services.analysis import (
 )
 from app.services.llm import build_llm_client
 from app.services.transcripts import TranscriptService, transcript_version
+from app.services.video_metadata import VideoMetadataService
+from app.sources.base import ContentRef, SourceRegistry
+from app.sources.youtube import YouTubeAdapter
 from app.services.translation import (
     CachedTranslationService,
     LibreTranslateProvider,
@@ -109,13 +112,27 @@ class AnalysisPipeline:
     def __init__(
         self,
         session_factory: async_sessionmaker[AsyncSession],
-        transcript_service: TranscriptService,
+        source_registry: SourceRegistry | TranscriptService,
         translation_provider: TranslationProvider,
         analysis_service: StructuredAnalysisService,
         credential_cipher: JobCredentialCipher | None = None,
     ):
         self.session_factory = session_factory
-        self.transcript_service = transcript_service
+        if isinstance(source_registry, SourceRegistry):
+            self.source_registry = source_registry
+        else:
+            current = get_settings()
+            self.source_registry = SourceRegistry(
+                [
+                    YouTubeAdapter(
+                        source_registry,
+                        VideoMetadataService(
+                            proxy_url=current.youtube_transcript_proxy_url
+                        ),
+                        max_duration_seconds=current.max_video_duration_seconds,
+                    )
+                ]
+            )
         self.translation_provider = translation_provider
         self.analysis_service = analysis_service
         self.credential_cipher = credential_cipher
@@ -147,9 +164,14 @@ class AnalysisPipeline:
                 api_key = ""
                 provider_config.clear()
 
-            inspection = await asyncio.to_thread(
-                self.transcript_service.inspect,
-                job.video_id,
+            ref = ContentRef(
+                platform=job.video.platform,
+                source_content_id=job.video.source_content_id,
+                media_index=job.video.media_index,
+            )
+            source_adapter = self.source_registry.adapter_for(ref.platform)
+            inspection = await source_adapter.acquire_transcript(
+                ref,
                 [job.source_language],
             )
             if not inspection.available:
@@ -375,7 +397,19 @@ def build_default_pipeline(
     )
     pipeline = AnalysisPipeline(
         session_factory,
-        TranscriptService(proxy_url=current.youtube_transcript_proxy_url),
+        SourceRegistry(
+            [
+                YouTubeAdapter(
+                    TranscriptService(
+                        proxy_url=current.youtube_transcript_proxy_url
+                    ),
+                    VideoMetadataService(
+                        proxy_url=current.youtube_transcript_proxy_url
+                    ),
+                    max_duration_seconds=current.max_video_duration_seconds,
+                )
+            ]
+        ),
         translation_provider,
         StructuredAnalysisService(analysis_provider),
         credential_cipher=JobCredentialCipher(

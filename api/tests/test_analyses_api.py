@@ -19,6 +19,7 @@ from app.api.analyses import (
     get_job_credential_cipher,
     get_quota_limiter,
     get_session,
+    get_source_registry,
     get_transcript_service,
     get_video_metadata_service,
 )
@@ -42,6 +43,7 @@ from app.services.transcripts import (
 from app.security.credentials import JobCredentialCipher
 from app.security.quotas import QuotaServiceUnavailable, RateLimitExceeded
 from app.services.video_metadata import VideoMetadataError
+from app.sources.base import SourceInspection, SourceRegistry
 
 
 class FakeTranscriptService:
@@ -199,6 +201,45 @@ async def test_inspect_returns_readable_tracks(api_context):
     assert response.json()["videoId"] == "aircAruvnKk"
     assert response.json()["tracks"][0]["languageCode"] == "en"
     assert response.json()["tracks"][0]["isGenerated"] is False
+
+
+@pytest.mark.asyncio
+async def test_inspect_routes_youtube_to_adapter(api_context):
+    class FakeYouTubeAdapter:
+        platform = "youtube"
+
+        def parse_url(self, url, active_media_index=None):
+            from app.sources.youtube import parse_youtube_url
+
+            return parse_youtube_url(url)
+
+        async def inspect(self, ref, preferred_languages):
+            assert ref.source_content_id == "aircAruvnKk"
+            return SourceInspection(
+                ref=ref,
+                duration_ms=1500,
+                source_status="ready",
+                transcript_source="youtube_caption",
+                tracks=[TranscriptTrackInfo("en", "English", False, True)],
+                selected_language="en",
+            )
+
+    client, app, _, _ = api_context
+    app.dependency_overrides[get_source_registry] = lambda: SourceRegistry(
+        [FakeYouTubeAdapter()]
+    )
+
+    response = await client.post(
+        "/v1/videos/inspect",
+        json={"url": "https://www.youtube.com/watch?v=aircAruvnKk"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["contentRef"] == {
+        "platform": "youtube",
+        "sourceContentId": "aircAruvnKk",
+        "mediaIndex": 1,
+    }
 
 
 @pytest.mark.asyncio

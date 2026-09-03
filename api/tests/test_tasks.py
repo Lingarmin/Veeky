@@ -24,6 +24,7 @@ from app.services.transcripts import (
     transcript_version,
 )
 from app.services.translation import TranslatedSegment, TranslationProviderError
+from app.sources.base import ContentRef, SourceRegistry
 from app.workers.tasks import AnalysisPipeline, build_llm_services
 from app.security.credentials import JobCredentialCipher
 from app.workers.tasks import clear_expired_llm_credentials_async
@@ -159,6 +160,40 @@ async def test_pipeline_persists_transcript_translation_and_result(pipeline_cont
         assert job.llm_credential_expires_at is None
     assert transcript_service.calls == 1
     assert translation_provider.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_pipeline_resolves_youtube_adapter_before_transcript_acquisition(
+    pipeline_context,
+):
+    factory, job_id = pipeline_context
+
+    class FakeYouTubeAdapter:
+        platform = "youtube"
+
+        def __init__(self):
+            self.refs = []
+
+        def parse_url(self, url, active_media_index=None):
+            return None
+
+        async def acquire_transcript(self, ref, preferred_languages):
+            self.refs.append(ref)
+            return FakeTranscriptService().inspect(
+                ref.source_content_id, preferred_languages
+            )
+
+    adapter = FakeYouTubeAdapter()
+    pipeline = AnalysisPipeline(
+        factory,
+        SourceRegistry([adapter]),
+        FakeTranslationProvider(),
+        FakeAnalysisService(),
+    )
+
+    await pipeline.run(job_id)
+
+    assert adapter.refs == [ContentRef("youtube", "aircAruvnKk")]
 
 
 @pytest.mark.asyncio

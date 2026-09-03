@@ -4,11 +4,9 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 import hashlib
 from typing import Any
-from urllib.parse import parse_qs, urlparse
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -25,8 +23,17 @@ from app.db.models import (
 )
 from app.db.session import get_session
 from app.core.settings import Settings, get_settings
-from app.services.transcripts import TranscriptInspection, TranscriptService, transcript_version
+from app.services.transcripts import TranscriptService, transcript_version
 from app.services.video_metadata import VideoMetadataError, VideoMetadataService
+from app.sources.base import (
+    ContentRef,
+    SourceAdapter,
+    SourceInspection,
+    SourceRegistry,
+    SourceVideoTooLong,
+    UnsupportedSourceUrl,
+)
+from app.sources.youtube import YouTubeAdapter, parse_youtube_url
 from app.services.translation import provider_translation_version
 from app.services.llm import (
     LLM_PROVIDER_DEFAULTS,
@@ -119,8 +126,15 @@ class TrackResponse(ApiModel):
     is_translatable: bool
 
 
+class ContentRefResponse(ApiModel):
+    platform: str
+    source_content_id: str
+    media_index: int
+
+
 class InspectResponse(ApiModel):
     video_id: str
+    content_ref: ContentRefResponse
     duration_ms: int
     tracks: list[TrackResponse]
     selected_language: str
@@ -241,6 +255,22 @@ def get_video_metadata_service(
     return VideoMetadataService(proxy_url=settings.youtube_transcript_proxy_url)
 
 
+def get_source_registry(
+    transcript_service: TranscriptService = Depends(get_transcript_service),
+    metadata_service: VideoMetadataService = Depends(get_video_metadata_service),
+    settings: Settings = Depends(get_settings),
+) -> SourceRegistry:
+    return SourceRegistry(
+        [
+            YouTubeAdapter(
+                transcript_service,
+                metadata_service,
+                max_duration_seconds=settings.max_video_duration_seconds,
+            )
+        ]
+    )
+
+
 def dispatch_analysis_job(job_id: str) -> object:
     from app.workers.tasks import analyze_video, celery_app
 
@@ -283,24 +313,28 @@ def get_pipeline_revision(settings: Settings = Depends(get_settings)) -> str:
 @router.post("/videos/inspect", response_model=InspectResponse)
 async def inspect_video(
     request: InspectRequest,
-    transcript_service: TranscriptService = Depends(get_transcript_service),
-    metadata_service: VideoMetadataService = Depends(get_video_metadata_service),
-    settings: Settings = Depends(get_settings),
+    source_registry: SourceRegistry = Depends(get_source_registry),
     _: Installation = Depends(require_installation),
     __: None = Depends(enforce_write_quota),
 ) -> InspectResponse:
-    video_id = extract_youtube_video_id(request.url)
-    duration_ms = await _video_duration_ms(metadata_service, video_id, settings)
-    inspection = await run_in_threadpool(
-        transcript_service.inspect, video_id, request.preferred_languages
-    )
-    _require_available_transcript(inspection)
-    assert inspection.selected is not None
+    try:
+        ref = source_registry.parse(request.url)
+    except UnsupportedSourceUrl as error:
+        raise _api_error(
+            422, "invalid_youtube_url", "请输入有效的 YouTube 视频链接"
+        ) from error
+    adapter = source_registry.adapter_for(ref.platform)
+    inspection = await _inspect_source(adapter, ref, request.preferred_languages)
+    assert inspection.selected_language is not None
     return InspectResponse(
-        video_id=video_id,
-        duration_ms=duration_ms,
-        tracks=[TrackResponse.model_validate(track, from_attributes=True) for track in inspection.tracks],
-        selected_language=inspection.selected.language_code,
+        video_id=ref.source_content_id,
+        content_ref=ContentRefResponse.model_validate(ref, from_attributes=True),
+        duration_ms=inspection.duration_ms,
+        tracks=[
+            TrackResponse.model_validate(track, from_attributes=True)
+            for track in inspection.tracks
+        ],
+        selected_language=inspection.selected_language,
     )
 
 
@@ -309,8 +343,7 @@ async def create_analysis(
     request: AnalysisCreateRequest,
     response: Response,
     session: AsyncSession = Depends(get_session),
-    transcript_service: TranscriptService = Depends(get_transcript_service),
-    metadata_service: VideoMetadataService = Depends(get_video_metadata_service),
+    source_registry: SourceRegistry = Depends(get_source_registry),
     dispatcher: JobDispatcher = Depends(get_job_dispatcher),
     installation: Installation = Depends(require_installation),
     credential_cipher: JobCredentialCipher = Depends(get_job_credential_cipher),
@@ -322,15 +355,17 @@ async def create_analysis(
     installation_id = installation.id
     _validate_llm_config(request.llm_config)
     _validate_video_id(request.video_id)
-    duration_ms = await _video_duration_ms(
-        metadata_service, request.video_id, settings
+    ref = ContentRef(platform="youtube", source_content_id=request.video_id)
+    adapter = source_registry.adapter_for(ref.platform)
+    source_inspection = await _inspect_source(
+        adapter, ref, [request.source_language]
     )
-    inspection = await run_in_threadpool(
-        transcript_service.inspect, request.video_id, [request.source_language]
-    )
-    _require_available_transcript(inspection)
+    inspection = source_inspection.transcript
+    if inspection is None:
+        raise RuntimeError("source adapter did not return transcript data")
     if inspection.selected is None or inspection.selected.language_code != request.source_language:
         raise _api_error(422, "source_language_unavailable", "所选字幕语言不可读取")
+    duration_ms = source_inspection.duration_ms
 
     version = transcript_version(inspection.segments)
     cache_key = analysis_cache_key(
@@ -682,22 +717,10 @@ async def get_analysis_result(
 
 
 def extract_youtube_video_id(url: str) -> str:
-    try:
-        parsed = urlparse(url)
-    except ValueError as error:
-        raise _api_error(422, "invalid_youtube_url", "请输入有效的 YouTube 视频链接") from error
-    host = (parsed.hostname or "").lower()
-    video_id = ""
-    if host in {"youtu.be", "www.youtu.be"}:
-        video_id = parsed.path.strip("/").split("/")[0]
-    elif host == "youtube.com" or host.endswith(".youtube.com"):
-        if parsed.path == "/watch":
-            video_id = parse_qs(parsed.query).get("v", [""])[0]
-        elif parsed.path.startswith("/shorts/"):
-            video_id = parsed.path.split("/")[2]
-    if parsed.scheme not in {"http", "https"} or not _is_video_id(video_id):
+    ref = parse_youtube_url(url)
+    if ref is None:
         raise _api_error(422, "invalid_youtube_url", "请输入有效的 YouTube 视频链接")
-    return video_id
+    return ref.source_content_id
 
 
 def analysis_cache_key(
@@ -820,39 +843,36 @@ def _analysis_concurrency_error() -> HTTPException:
     )
 
 
-async def _video_duration_ms(
-    service: VideoMetadataService,
-    video_id: str,
-    settings: Settings,
-) -> int:
+async def _inspect_source(
+    adapter: SourceAdapter,
+    ref: ContentRef,
+    preferred_languages: list[str],
+) -> SourceInspection:
     try:
-        duration_ms = await run_in_threadpool(service.duration_ms, video_id)
+        inspection = await adapter.inspect(ref, preferred_languages)
     except VideoMetadataError as error:
         raise _api_error(
             502,
             "video_metadata_unavailable",
             "暂时无法读取视频时长，请稍后再试。",
         ) from error
-    if duration_ms > settings.max_video_duration_seconds * 1000:
+    except SourceVideoTooLong as error:
         raise _api_error(
             422,
             "video_too_long",
             "此视频时长过长，无法分析。",
-        )
-    return duration_ms
-
-
-def _is_video_id(video_id: str) -> bool:
-    return len(video_id) == 11 and all(character.isalnum() or character in "-_" for character in video_id)
-
-
-def _require_available_transcript(inspection: TranscriptInspection) -> None:
-    if not inspection.available:
+        ) from error
+    if inspection.source_status == "unavailable":
         raise _api_error(
             422,
             inspection.failure_code or "transcript_unavailable",
             "当前视频没有可读取字幕",
         )
+    return inspection
+
+
+def _is_video_id(video_id: str) -> bool:
+    return len(video_id) == 11 and all(character.isalnum() or character in "-_" for character in video_id)
 
 
 def _api_error(status_code: int, code: str, message: str) -> HTTPException:
