@@ -190,6 +190,13 @@ async def test_api_pipeline_returns_timestamped_transcript_and_reuses_result():
         "jobId": job_id,
         "cacheHit": True,
         "status": "completed",
+        "contentId": result.json()["contentId"],
+        "contentRef": {
+            "platform": "youtube",
+            "sourceContentId": "aircAruvnKk",
+            "mediaIndex": 1,
+        },
+        "videoId": "aircAruvnKk",
     }
     assert translation_provider.calls == 1
     await engine.dispose()

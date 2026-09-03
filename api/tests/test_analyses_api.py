@@ -81,6 +81,34 @@ class FakeVideoMetadataService:
         return self.duration
 
 
+class FakeXAdapter:
+    platform = "x"
+
+    def parse_url(self, url, active_media_index=None):
+        from app.sources.x import parse_x_url
+
+        return parse_x_url(url, active_media_index=active_media_index)
+
+    async def inspect(self, ref, preferred_languages):
+        automatic = TranscriptTrackInfo("auto", "Automatic", True, False)
+        transcript = TranscriptInspection(
+            video_id=ref.stable_key,
+            tracks=[],
+            selected=automatic,
+            segments=[TranscriptSegment(0, 0, 1500, "Hello from X")],
+            available=True,
+        )
+        return SourceInspection(
+            ref=ref,
+            duration_ms=0,
+            source_status="ready",
+            transcript_source="faster_whisper",
+            tracks=[],
+            selected_language="auto",
+            transcript=transcript,
+        )
+
+
 class PermissiveQuotaLimiter:
     def __init__(self):
         self.locks = {}
@@ -240,6 +268,63 @@ async def test_inspect_routes_youtube_to_adapter(api_context):
         "sourceContentId": "aircAruvnKk",
         "mediaIndex": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_inspect_returns_platform_neutral_x_contract(api_context):
+    client, app, _, _ = api_context
+    app.dependency_overrides[get_source_registry] = lambda: SourceRegistry(
+        [FakeXAdapter()]
+    )
+
+    response = await client.post(
+        "/v1/videos/inspect",
+        json={
+            "url": "https://x.com/viktoroddy/status/2075545587093807111",
+            "activeMediaIndex": 1,
+            "clientDurationMs": 1_283_000,
+            "mediaCandidates": [
+                {
+                    "url": "https://video.twimg.com/amplify_video/file.mp4",
+                    "kind": "mp4",
+                    "capturedAt": 1_788_419_200_000,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["videoId"] is None
+    assert body["contentId"]
+    assert body["contentRef"] == {
+        "platform": "x",
+        "sourceContentId": "2075545587093807111",
+        "mediaIndex": 1,
+    }
+    assert body["durationMs"] == 1_283_000
+    assert body["sourceStatus"] == "ready"
+    assert body["transcriptSource"] == "faster_whisper"
+    assert body["availableLanguages"] == []
+    assert body["selectedLanguage"] == "auto"
+
+
+@pytest.mark.asyncio
+async def test_inspect_limits_media_candidates_to_fifty(api_context):
+    client, app, _, _ = api_context
+    app.dependency_overrides[get_source_registry] = lambda: SourceRegistry(
+        [FakeXAdapter()]
+    )
+
+    response = await client.post(
+        "/v1/videos/inspect",
+        json={
+            "url": "https://x.com/viktoroddy/status/2075545587093807111/video/1",
+            "mediaCandidates": [{} for _ in range(51)],
+        },
+    )
+
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -471,6 +556,56 @@ async def test_create_stores_only_encrypted_temporary_llm_credential(api_context
 
 
 @pytest.mark.asyncio
+async def test_legacy_youtube_create_returns_content_identity(api_context):
+    client, _, _, _ = api_context
+
+    response = await client.post(
+        "/v1/analyses",
+        json={
+            "videoId": "aircAruvnKk",
+            "sourceLanguage": "en",
+            "llmConfig": LLM_CONFIG,
+        },
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["videoId"] == "aircAruvnKk"
+    assert body["contentId"]
+    assert body["contentRef"] == {
+        "platform": "youtube",
+        "sourceContentId": "aircAruvnKk",
+        "mediaIndex": 1,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "locator",
+    [
+        {},
+        {
+            "videoId": "aircAruvnKk",
+            "contentRef": {
+                "platform": "youtube",
+                "sourceContentId": "aircAruvnKk",
+            },
+        },
+    ],
+)
+async def test_create_requires_exactly_one_content_locator(api_context, locator):
+    client, _, _, dispatched = api_context
+
+    response = await client.post(
+        "/v1/analyses",
+        json={**locator, "sourceLanguage": "en", "llmConfig": LLM_CONFIG},
+    )
+
+    assert response.status_code == 422
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
 async def test_llm_test_rejects_invalid_url_without_network_call(api_context):
     client, _, _, _ = api_context
     response = await client.post(
@@ -680,6 +815,93 @@ async def test_history_and_job_reads_are_private_to_the_installation(api_context
         hidden = await client.get(path)
         assert hidden.status_code == 404
         assert hidden.json()["detail"]["code"] == "analysis_not_found"
+
+
+@pytest.mark.asyncio
+async def test_x_analysis_uses_content_id_for_history_without_weakening_ownership(
+    api_context,
+):
+    client, app, factory, _ = api_context
+    app.dependency_overrides[get_source_registry] = lambda: SourceRegistry(
+        [FakeXAdapter()]
+    )
+    registered = await client.post(
+        "/v1/installations/register",
+        json={
+            "installationId": OTHER_INSTALLATION_ID,
+            "installationToken": OTHER_INSTALLATION_TOKEN,
+        },
+    )
+    assert registered.status_code == 201
+
+    inspected = await client.post(
+        "/v1/videos/inspect",
+        json={
+            "url": "https://x.com/viktoroddy/status/2075545587093807111/video/1",
+            "clientDurationMs": 1_283_000,
+        },
+    )
+    content_id = inspected.json()["contentId"]
+    created = await client.post(
+        "/v1/analyses",
+        json={
+            "contentRef": {
+                "platform": "x",
+                "sourceContentId": "2075545587093807111",
+                "mediaIndex": 1,
+            },
+            "targetLanguage": "zh-Hans",
+            "title": "X fixture",
+            "llmConfig": LLM_CONFIG,
+        },
+    )
+
+    assert created.status_code == 202
+    assert created.json()["videoId"] is None
+    assert created.json()["contentId"] == content_id
+    assert created.json()["contentRef"] == {
+        "platform": "x",
+        "sourceContentId": "2075545587093807111",
+        "mediaIndex": 1,
+    }
+    job_id = created.json()["jobId"]
+    async with factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        assert job.content_id == content_id
+        video = await session.get(Video, job.video_id)
+        assert video.platform == "x"
+        assert job.source_language == "auto"
+        job.status = "completed"
+        job.completed_at = datetime.now(timezone.utc)
+        job.result = AnalysisResult(
+            one_line_summary="X summary",
+            summary_points=[],
+            chapters=[],
+            highlights=[],
+            model_name="fake",
+            model_version="test",
+        )
+        await session.commit()
+
+    history = await client.get(
+        "/v1/analyses/history", params={"contentId": content_id}
+    )
+    assert history.status_code == 200
+    assert [item["jobId"] for item in history.json()["items"]] == [job_id]
+    assert history.json()["items"][0]["videoId"] is None
+    assert history.json()["items"][0]["contentRef"] == created.json()["contentRef"]
+
+    result = await client.get(f"/v1/analyses/{job_id}/result")
+    assert result.status_code == 200
+    assert result.json()["contentId"] == content_id
+    assert result.json()["videoId"] is None
+    assert result.json()["contentRef"] == created.json()["contentRef"]
+
+    hidden = await client.get(
+        f"/v1/analyses/{job_id}/result", headers=OTHER_AUTH_HEADERS
+    )
+    assert hidden.status_code == 404
+    assert hidden.json()["detail"]["code"] == "analysis_not_found"
 
 
 async def _store_history_job(
@@ -919,7 +1141,18 @@ async def test_create_requeues_an_interrupted_in_progress_job(api_context):
     resumed = await client.post("/v1/analyses", json=payload)
 
     assert resumed.status_code == 202
-    assert resumed.json() == {"jobId": job_id, "cacheHit": False, "status": "queued"}
+    assert resumed.json() == {
+        "jobId": job_id,
+        "cacheHit": False,
+        "status": "queued",
+        "contentId": resumed.json()["contentId"],
+        "contentRef": {
+            "platform": "youtube",
+            "sourceContentId": "aircAruvnKk",
+            "mediaIndex": 1,
+        },
+        "videoId": "aircAruvnKk",
+    }
     assert dispatched == [job_id, job_id]
 
 

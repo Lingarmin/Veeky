@@ -3,11 +3,11 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 import hashlib
-from typing import Any
+from typing import Any, Literal
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -120,6 +120,9 @@ class ApiModel(BaseModel):
 class InspectRequest(ApiModel):
     url: str
     preferred_languages: list[str] = Field(default_factory=list)
+    active_media_index: int | None = Field(default=None, ge=1)
+    client_duration_ms: int | None = Field(default=None, ge=0)
+    media_candidates: list[dict[str, Any]] = Field(default_factory=list, max_length=50)
 
 
 class TrackResponse(ApiModel):
@@ -130,15 +133,19 @@ class TrackResponse(ApiModel):
 
 
 class ContentRefResponse(ApiModel):
-    platform: str
+    platform: Platform
     source_content_id: str
     media_index: int
 
 
 class InspectResponse(ApiModel):
-    video_id: str
+    content_id: str
     content_ref: ContentRefResponse
+    video_id: str | None
     duration_ms: int
+    source_status: str
+    transcript_source: str
+    available_languages: list[TrackResponse]
     tracks: list[TrackResponse]
     selected_language: str
 
@@ -150,13 +157,42 @@ class LlmConfigRequest(ApiModel):
     model: str | None = Field(default=None, max_length=120)
 
 
+class ContentRefRequest(ApiModel):
+    platform: Literal["youtube", "x"]
+    source_content_id: str
+    media_index: int = Field(default=1, ge=1)
+
+    def to_domain(self) -> ContentRef:
+        return ContentRef(
+            platform=self.platform,
+            source_content_id=self.source_content_id,
+            media_index=self.media_index,
+        )
+
+
 class AnalysisCreateRequest(ApiModel):
-    video_id: str
-    source_language: str
+    content_id: str | None = None
+    content_ref: ContentRefRequest | None = None
+    video_id: str | None = None
+    source_language: str | None = None
     target_language: str = "zh-Hans"
     title: str | None = None
     llm_config: LlmConfigRequest | None = None
+    media_url: str | None = None
+    media_session_id: str | None = None
     force: bool = False
+
+    @model_validator(mode="after")
+    def require_one_content_locator(self) -> AnalysisCreateRequest:
+        locator_count = sum(
+            value is not None
+            for value in (self.content_id, self.content_ref, self.video_id)
+        )
+        if locator_count != 1:
+            raise ValueError(
+                "Exactly one of contentId, contentRef, or videoId is required"
+            )
+        return self
 
 
 class LlmTestResponse(ApiModel):
@@ -168,6 +204,9 @@ class AnalysisCreateResponse(ApiModel):
     job_id: str
     cache_hit: bool
     status: str
+    content_id: str
+    content_ref: ContentRefResponse
+    video_id: str | None
 
 
 class AnalysisStatusResponse(ApiModel):
@@ -179,7 +218,9 @@ class AnalysisStatusResponse(ApiModel):
 
 class AnalysisHistoryItemResponse(ApiModel):
     job_id: str
-    video_id: str
+    content_id: str
+    content_ref: ContentRefResponse
+    video_id: str | None
     video_title: str
     duration_ms: int
     source_language: str
@@ -204,7 +245,9 @@ class TranscriptSegmentResponse(ApiModel):
 
 class AnalysisResultResponse(ApiModel):
     job_id: str
-    video_id: str
+    content_id: str
+    content_ref: ContentRefResponse
+    video_id: str | None
     video_title: str
     duration_ms: int
     source_language: str
@@ -316,12 +359,15 @@ def get_pipeline_revision(settings: Settings = Depends(get_settings)) -> str:
 @router.post("/videos/inspect", response_model=InspectResponse)
 async def inspect_video(
     request: InspectRequest,
+    session: AsyncSession = Depends(get_session),
     source_registry: SourceRegistry = Depends(get_source_registry),
     _: Installation = Depends(require_installation),
     __: None = Depends(enforce_write_quota),
 ) -> InspectResponse:
     try:
-        ref = source_registry.parse(request.url)
+        ref = source_registry.parse(
+            request.url, active_media_index=request.active_media_index
+        )
     except UnsupportedSourceUrl as error:
         raise _api_error(
             422, "invalid_youtube_url", "请输入有效的 YouTube 视频链接"
@@ -330,16 +376,44 @@ async def inspect_video(
         raise _source_adapter_unavailable() from error
     adapter = _source_adapter(source_registry, ref.platform)
     inspection = await _inspect_source(adapter, ref, request.preferred_languages)
-    assert inspection.selected_language is not None
+    duration_ms = (
+        request.client_duration_ms
+        if ref.platform == "x" and request.client_duration_ms is not None
+        else inspection.duration_ms
+    )
+    video = await _find_video_by_ref(session, ref)
+    if video is None:
+        video = _new_video(
+            ref,
+            title=_default_video_title(ref),
+            duration_ms=duration_ms,
+            source_url=request.url,
+        )
+        session.add(video)
+    else:
+        video.duration_ms = duration_ms
+        video.source_url = request.url
+    await session.commit()
+    await session.refresh(video)
+
+    selected_language = (
+        "auto" if ref.platform == "x" else inspection.selected_language
+    )
+    assert selected_language is not None
+    tracks = [
+        TrackResponse.model_validate(track, from_attributes=True)
+        for track in inspection.tracks
+    ]
     return InspectResponse(
-        video_id=ref.source_content_id,
+        content_id=video.content_id,
         content_ref=ContentRefResponse.model_validate(ref, from_attributes=True),
-        duration_ms=inspection.duration_ms,
-        tracks=[
-            TrackResponse.model_validate(track, from_attributes=True)
-            for track in inspection.tracks
-        ],
-        selected_language=inspection.selected_language,
+        video_id=_legacy_video_id(video),
+        duration_ms=duration_ms,
+        source_status=inspection.source_status,
+        transcript_source=inspection.transcript_source,
+        available_languages=[] if ref.platform == "x" else tracks,
+        tracks=tracks,
+        selected_language=selected_language,
     )
 
 
@@ -359,24 +433,41 @@ async def create_analysis(
 ) -> AnalysisCreateResponse:
     installation_id = installation.id
     _validate_llm_config(request.llm_config)
-    _validate_video_id(request.video_id)
-    ref = ContentRef(platform="youtube", source_content_id=request.video_id)
+    ref, video = await _resolve_content_locator(session, request)
     adapter = _source_adapter(source_registry, ref.platform)
+    preferred_languages = [request.source_language] if request.source_language else []
     source_inspection = await _inspect_source(
-        adapter, ref, [request.source_language]
+        adapter, ref, preferred_languages
     )
     inspection = source_inspection.transcript
     if inspection is None:
         raise RuntimeError("source adapter did not return transcript data")
-    if inspection.selected is None or inspection.selected.language_code != request.source_language:
+    source_language = request.source_language or source_inspection.selected_language
+    if (
+        source_language is None
+        or inspection.selected is None
+        or inspection.selected.language_code != source_language
+    ):
         raise _api_error(422, "source_language_unavailable", "所选字幕语言不可读取")
-    duration_ms = source_inspection.duration_ms
-
+    duration_ms = source_inspection.duration_ms or (video.duration_ms if video else 0)
+    video_is_new = video is None
+    if video is None:
+        video = _new_video(
+            ref,
+            title=request.title or _default_video_title(ref),
+            duration_ms=duration_ms,
+            source_url=_source_url(ref),
+        )
+    else:
+        if request.title:
+            video.title = request.title
+        if source_inspection.duration_ms:
+            video.duration_ms = source_inspection.duration_ms
     version = transcript_version(inspection.segments)
     cache_key = analysis_cache_key(
         installation_id,
-        request.video_id,
-        request.source_language,
+        ref.stable_key,
+        source_language,
         request.target_language,
         version,
         f"{pipeline_revision}|{request.llm_config.provider}|{request.llm_config.model or ''}|{normalize_chat_completions_url(request.llm_config.api_url)}",
@@ -428,7 +519,10 @@ async def create_analysis(
         cache_hit = existing.status == "completed"
         response.status_code = 200 if cache_hit else 202
         return AnalysisCreateResponse(
-            job_id=existing.id, cache_hit=cache_hit, status=existing.status
+            job_id=existing.id,
+            cache_hit=cache_hit,
+            status=existing.status,
+            **_content_identity(video),
         )
 
     active_jobs = await session.scalar(
@@ -444,26 +538,17 @@ async def create_analysis(
     if (active_jobs or 0) >= settings.max_active_jobs_per_installation:
         raise _analysis_concurrency_error()
 
-    video = await session.get(Video, request.video_id)
-    if video is None:
-        video = Video(
-            video_id=request.video_id,
-            title=request.title or f"YouTube video {request.video_id}",
-            duration_ms=duration_ms,
-            source_url=f"https://www.youtube.com/watch?v={request.video_id}",
-        )
+    if video_is_new:
         session.add(video)
-    elif request.title:
-        video.title = request.title
-        video.duration_ms = duration_ms
 
     if existing is None:
         job_id = str(uuid.uuid4())
         job = AnalysisJob(
             id=job_id,
             installation_id=installation_id,
-            video_id=request.video_id,
-            source_language=request.source_language,
+            video_id=video.video_id,
+            content_id=video.content_id,
+            source_language=source_language,
             target_language=request.target_language,
             transcript_version=version,
             cache_key=cache_key,
@@ -513,11 +598,16 @@ async def create_analysis(
             if active_job is not None:
                 raise _analysis_concurrency_error()
             raise
+        concurrent_video = await session.scalar(
+            select(Video).where(Video.content_id == concurrent.content_id)
+        )
+        assert concurrent_video is not None
         response.status_code = 200 if concurrent.status == "completed" else 202
         return AnalysisCreateResponse(
             job_id=concurrent.id,
             cache_hit=concurrent.status == "completed",
             status=concurrent.status,
+            **_content_identity(concurrent_video),
         )
     await session.refresh(job)
     try:
@@ -543,11 +633,17 @@ async def create_analysis(
         await session.commit()
         raise _api_error(503, "dispatch_failed", "后台任务暂时无法启动，请重试") from error
     response.status_code = 202
-    return AnalysisCreateResponse(job_id=job.id, cache_hit=False, status=job.status)
+    return AnalysisCreateResponse(
+        job_id=job.id,
+        cache_hit=False,
+        status=job.status,
+        **_content_identity(video),
+    )
 
 
 @router.get("/analyses/history", response_model=AnalysisHistoryResponse)
 async def get_analysis_history(
+    content_id: str | None = Query(default=None, alias="contentId"),
     video_id: str | None = Query(default=None, alias="videoId"),
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
@@ -558,7 +654,7 @@ async def get_analysis_history(
     installation_id = installation.id
     query = (
         select(AnalysisJob, Video, AnalysisResult)
-        .join(Video, Video.video_id == AnalysisJob.video_id)
+        .join(Video, Video.content_id == AnalysisJob.content_id)
         .join(AnalysisResult, AnalysisResult.job_id == AnalysisJob.id)
         .where(
             AnalysisJob.status == "completed",
@@ -566,8 +662,12 @@ async def get_analysis_history(
             AnalysisJob.installation_id == installation_id,
         )
     )
+    if content_id is not None:
+        query = query.where(AnalysisJob.content_id == content_id)
     if video_id is not None:
-        query = query.where(AnalysisJob.video_id == video_id)
+        query = query.where(
+            Video.platform == "youtube", Video.source_content_id == video_id
+        )
     rows = (
         await session.execute(
             query.order_by(AnalysisJob.completed_at.desc(), AnalysisJob.id.desc())
@@ -579,7 +679,7 @@ async def get_analysis_history(
         items=[
             AnalysisHistoryItemResponse(
                 job_id=job.id,
-                video_id=job.video_id,
+                **_content_identity(video),
                 video_title=video.title,
                 duration_ms=video.duration_ms,
                 source_language=job.source_language,
@@ -638,7 +738,7 @@ async def get_analysis_result(
         select(TranscriptTrack)
         .options(selectinload(TranscriptTrack.segments))
         .where(
-            TranscriptTrack.video_id == job.video_id,
+            TranscriptTrack.content_id == job.content_id,
             TranscriptTrack.language_code == job.source_language,
             TranscriptTrack.transcript_version == version,
         )
@@ -689,7 +789,7 @@ async def get_analysis_result(
     result: AnalysisResult | None = job.result
     return AnalysisResultResponse(
         job_id=job.id,
-        video_id=job.video_id,
+        **_content_identity(job.video),
         video_title=job.video.title,
         duration_ms=job.video.duration_ms,
         source_language=job.source_language,
@@ -728,9 +828,96 @@ def extract_youtube_video_id(url: str) -> str:
     return ref.source_content_id
 
 
+async def _resolve_content_locator(
+    session: AsyncSession, request: AnalysisCreateRequest
+) -> tuple[ContentRef, Video | None]:
+    if request.content_id is not None:
+        video = await session.scalar(
+            select(Video).where(Video.content_id == request.content_id)
+        )
+        if video is None:
+            raise _api_error(404, "content_not_found", "没有找到这个视频内容")
+        return _video_content_ref(video), video
+
+    if request.content_ref is not None:
+        ref = request.content_ref.to_domain()
+        _validate_content_ref(ref)
+    else:
+        assert request.video_id is not None
+        _validate_video_id(request.video_id)
+        ref = ContentRef(platform="youtube", source_content_id=request.video_id)
+    return ref, await _find_video_by_ref(session, ref)
+
+
+async def _find_video_by_ref(
+    session: AsyncSession, ref: ContentRef
+) -> Video | None:
+    return await session.scalar(
+        select(Video).where(
+            Video.platform == ref.platform,
+            Video.source_content_id == ref.source_content_id,
+            Video.media_index == ref.media_index,
+        )
+    )
+
+
+def _new_video(
+    ref: ContentRef,
+    *,
+    title: str,
+    duration_ms: int,
+    source_url: str,
+) -> Video:
+    return Video(
+        video_id=(ref.source_content_id if ref.platform == "youtube" else ref.stable_key),
+        content_id=str(uuid.uuid4()),
+        platform=ref.platform,
+        source_content_id=ref.source_content_id,
+        media_index=ref.media_index,
+        title=title,
+        duration_ms=duration_ms,
+        source_url=source_url,
+    )
+
+
+def _default_video_title(ref: ContentRef) -> str:
+    platform_name = "YouTube" if ref.platform == "youtube" else "X"
+    return f"{platform_name} video {ref.source_content_id}"
+
+
+def _source_url(ref: ContentRef) -> str:
+    if ref.platform == "youtube":
+        return f"https://www.youtube.com/watch?v={ref.source_content_id}"
+    return (
+        f"https://x.com/i/status/{ref.source_content_id}/video/{ref.media_index}"
+    )
+
+
+def _video_content_ref(video: Video) -> ContentRef:
+    return ContentRef(
+        platform=video.platform,
+        source_content_id=video.source_content_id,
+        media_index=video.media_index,
+    )
+
+
+def _legacy_video_id(video: Video) -> str | None:
+    return video.source_content_id if video.platform == "youtube" else None
+
+
+def _content_identity(video: Video) -> dict[str, Any]:
+    return {
+        "content_id": video.content_id,
+        "content_ref": ContentRefResponse.model_validate(
+            _video_content_ref(video), from_attributes=True
+        ),
+        "video_id": _legacy_video_id(video),
+    }
+
+
 def analysis_cache_key(
     installation_id: str,
-    video_id: str,
+    content_key: str,
     source_language: str,
     target_language: str,
     transcript_version: str,
@@ -740,7 +927,7 @@ def analysis_cache_key(
     return ":".join(
         [
             installation_id,
-            video_id,
+            content_key,
             source_language,
             target_language,
             transcript_version,
@@ -773,6 +960,13 @@ async def _owned_job(
 def _validate_video_id(video_id: str) -> None:
     if not _is_video_id(video_id):
         raise _api_error(422, "invalid_video_id", "视频 ID 无效")
+
+
+def _validate_content_ref(ref: ContentRef) -> None:
+    if ref.platform == "youtube":
+        _validate_video_id(ref.source_content_id)
+    elif not ref.source_content_id.isdigit():
+        raise _api_error(422, "invalid_content_ref", "视频内容引用无效")
 
 
 def _validate_llm_config(config: LlmConfigRequest | None) -> None:

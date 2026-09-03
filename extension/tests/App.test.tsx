@@ -6,24 +6,47 @@ import { App } from "../src/sidepanel/App";
 import type { AnalysisApi } from "../src/sidepanel/api";
 import type { BrowserBridge } from "../src/sidepanel/browser";
 
+const youtubeContentId = "33333333-3333-4333-8333-333333333333";
+const youtubeContentRef = {
+  platform: "youtube" as const,
+  sourceContentId: "aircAruvnKk",
+  mediaIndex: 1,
+};
+
 function createApi() {
   return {
     inspect: vi.fn<AnalysisApi["inspect"]>(async () => ({
+      contentId: youtubeContentId,
+      contentRef: youtubeContentRef,
       videoId: "aircAruvnKk",
       durationMs: 2000,
+      sourceStatus: "ready",
+      transcriptSource: "youtube_caption",
+      availableLanguages: [
+        { languageCode: "en", languageName: "English", isGenerated: false, isTranslatable: true },
+      ],
       tracks: [
         { languageCode: "en", languageName: "English", isGenerated: false, isTranslatable: true },
       ],
       selectedLanguage: "en",
     })),
     testLlm: vi.fn<AnalysisApi["testLlm"]>(async () => ({ ok: true, message: "连接成功" })),
-    createAnalysis: vi.fn<AnalysisApi["createAnalysis"]>(async () => ({ jobId: "job-1", cacheHit: false, status: "queued" })),
+    createAnalysis: vi.fn<AnalysisApi["createAnalysis"]>(async () => ({
+      jobId: "job-1",
+      cacheHit: false,
+      status: "queued",
+      contentId: youtubeContentId,
+      contentRef: youtubeContentRef,
+      videoId: "aircAruvnKk",
+    })),
     getHistory: vi.fn<AnalysisApi["getHistory"]>(async () => ({ items: [], hasMore: false })),
     getStatus: vi.fn<AnalysisApi["getStatus"]>(async () => ({
       jobId: "job-1", status: "completed", failureCode: null, failureDetail: null,
     })),
     getResult: vi.fn<AnalysisApi["getResult"]>(async () => ({
       jobId: "job-1",
+      contentId: youtubeContentId,
+      contentRef: youtubeContentRef,
       videoId: "aircAruvnKk",
       videoTitle: "But what is a neural network?",
       durationMs: 2000,
@@ -79,6 +102,8 @@ function createBrowser() {
 
 const historyItem = {
   jobId: "job-history",
+  contentId: youtubeContentId,
+  contentRef: youtubeContentRef,
   videoId: "aircAruvnKk",
   videoTitle: "Neural networks",
   durationMs: 754_000,
@@ -90,6 +115,22 @@ const historyItem = {
 };
 
 describe("Side Panel", () => {
+  it("accepts content references in the analysis API contract", async () => {
+    const api = createApi();
+
+    await api.createAnalysis({
+      contentRef: youtubeContentRef,
+      sourceLanguage: "en",
+      targetLanguage: "zh-Hans",
+      title: "Neural networks",
+      llmConfig: await createLlmStore().load(),
+    });
+
+    expect(api.createAnalysis).toHaveBeenCalledWith(expect.objectContaining({
+      contentRef: youtubeContentRef,
+    }));
+  });
+
   it("keeps header actions without repeating the Veeky brand", async () => {
     render(<App api={createApi()} browser={createBrowser()} llmStore={createLlmStore()} pollIntervalMs={1} />);
 
@@ -472,8 +513,14 @@ describe("Side Panel", () => {
         failureDetail: null,
       });
     api.createAnalysis
-      .mockResolvedValueOnce({ jobId: "job-1", cacheHit: false, status: "queued" })
-      .mockResolvedValueOnce({ jobId: "job-2", cacheHit: false, status: "queued" });
+      .mockResolvedValueOnce({
+        jobId: "job-1", cacheHit: false, status: "queued",
+        contentId: youtubeContentId, contentRef: youtubeContentRef, videoId: "aircAruvnKk",
+      })
+      .mockResolvedValueOnce({
+        jobId: "job-2", cacheHit: false, status: "queued",
+        contentId: youtubeContentId, contentRef: youtubeContentRef, videoId: "aircAruvnKk",
+      });
     const user = userEvent.setup();
     render(<App api={api} browser={createBrowser()} llmStore={createLlmStore()} pollIntervalMs={1} />);
 
@@ -559,8 +606,15 @@ describe("Side Panel", () => {
   it("checks a replacement YouTube link and opens it when analysis starts", async () => {
     const api = createApi();
     api.inspect.mockResolvedValueOnce({
+      contentId: "44444444-4444-4444-8444-444444444444",
+      contentRef: { platform: "youtube", sourceContentId: "BpOsHF5Oj_I", mediaIndex: 1 },
       videoId: "BpOsHF5Oj_I",
       durationMs: 120_000,
+      sourceStatus: "ready",
+      transcriptSource: "youtube_caption",
+      availableLanguages: [
+        { languageCode: "en", languageName: "English", isGenerated: true, isTranslatable: true },
+      ],
       tracks: [{ languageCode: "en", languageName: "English", isGenerated: true, isTranslatable: true }],
       selectedLanguage: "en",
     });

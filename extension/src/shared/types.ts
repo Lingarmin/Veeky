@@ -6,6 +6,18 @@ export type JobStatus =
   | "completed"
   | "failed";
 
+export interface ContentRef {
+  platform: "youtube" | "x";
+  sourceContentId: string;
+  mediaIndex: number;
+}
+
+export interface ContentContext {
+  contentId: string;
+  contentRef: ContentRef;
+  videoId: string | null;
+}
+
 export interface AnalyzedTab {
   tabId: number;
   videoId: string;
@@ -39,9 +51,11 @@ export interface CaptionTrack {
   isTranslatable: boolean;
 }
 
-export interface VideoInspection {
-  videoId: string;
+export interface VideoInspection extends ContentContext {
   durationMs: number;
+  sourceStatus: "ready" | "play_required" | "media_required" | "unavailable";
+  transcriptSource: "youtube_caption" | "faster_whisper";
+  availableLanguages: CaptionTrack[];
   tracks: CaptionTrack[];
   selectedLanguage: string;
 }
@@ -73,9 +87,8 @@ export interface TranscriptSegment {
   translated: string | null;
 }
 
-export interface AnalysisResult {
+export interface AnalysisResult extends ContentContext {
   jobId: string;
-  videoId: string;
   videoTitle: string;
   durationMs: number;
   sourceLanguage: string;
@@ -92,9 +105,8 @@ export interface AnalysisResult {
   modelVersion: string;
 }
 
-export interface AnalysisHistoryItem {
+export interface AnalysisHistoryItem extends ContentContext {
   jobId: string;
-  videoId: string;
   videoTitle: string;
   durationMs: number;
   sourceLanguage: string;

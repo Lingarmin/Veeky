@@ -294,6 +294,7 @@ export function App({
     setJobStatus("queued");
     try {
       const videoId = inspection.videoId;
+      if (!videoId) throw new Error("X content controls are not available yet");
       setFailedAnalysis({
         videoId,
         sourceLanguage,
@@ -338,20 +339,22 @@ export function App({
     setPhase("processing");
     setJobStatus("queued");
     try {
-      if (result.videoId !== context.videoId) {
-        await browser.seek(context.tabId, result.videoId, 0);
+      const videoId = result.videoId;
+      if (!videoId) throw new Error("X content controls are not available yet");
+      if (videoId !== context.videoId) {
+        await browser.seek(context.tabId, videoId, 0);
       }
       const created = await api.createAnalysis({
-        videoId: result.videoId,
+        videoId,
         sourceLanguage: result.sourceLanguage,
         targetLanguage: result.targetLanguage,
         title: result.videoTitle,
         llmConfig,
         force: true,
       });
-      await browser.registerAnalysis(context.tabId, result.videoId, created.jobId);
+      await browser.registerAnalysis(context.tabId, videoId, created.jobId);
       setResultFromHistory(false);
-      void poll(created.jobId, result.videoId);
+      void poll(created.jobId, videoId);
     } catch (requestError) {
       setError(errorMessageForCode(errorCode(requestError)));
       setPhase("error");

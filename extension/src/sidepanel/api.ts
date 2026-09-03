@@ -2,6 +2,8 @@ import type {
   AnalysisResult,
   AnalysisHistoryResponse,
   AnalysisStatus,
+  ContentContext,
+  ContentRef,
   JobStatus,
   VideoInspection,
 } from "../shared/types";
@@ -11,24 +13,53 @@ import {
   type InstallationIdentityStore,
 } from "./identity";
 
-export interface AnalysisCreateResponse {
+export interface AnalysisCreateResponse extends ContentContext {
   jobId: string;
   cacheHit: boolean;
   status: JobStatus;
 }
 
+export interface MediaCandidateInput {
+  url: string;
+  kind: "mp4" | "hls" | "segment";
+  capturedAt: number;
+}
+
+export interface InspectInput {
+  url: string;
+  preferredLanguages?: string[];
+  activeMediaIndex?: number;
+  clientDurationMs?: number;
+  mediaCandidates?: MediaCandidateInput[];
+}
+
+type ContentLocator =
+  | { contentId: string; contentRef?: never; videoId?: never }
+  | { contentRef: ContentRef; contentId?: never; videoId?: never }
+  | { videoId: string; contentId?: never; contentRef?: never };
+
+export type AnalysisCreateInput = ContentLocator & {
+  sourceLanguage?: string;
+  targetLanguage?: string;
+  title?: string;
+  llmConfig: { provider: string; apiUrl: string; apiKey: string; model: string };
+  mediaUrl?: string;
+  mediaSessionId?: string;
+  force?: boolean;
+};
+
+export interface AnalysisHistoryInput {
+  contentId?: string;
+  videoId?: string;
+  limit?: number;
+  offset?: number;
+}
+
 export interface AnalysisApi {
   testLlm(config: { provider: string; apiUrl: string; apiKey: string; model: string }): Promise<{ ok: boolean; message: string }>;
-  inspect(url: string): Promise<VideoInspection>;
-  createAnalysis(input: {
-    videoId: string;
-    sourceLanguage: string;
-    targetLanguage: string;
-    title: string;
-    llmConfig: { provider: string; apiUrl: string; apiKey: string; model: string };
-    force?: boolean;
-  }): Promise<AnalysisCreateResponse>;
-  getHistory(input?: { videoId?: string; limit?: number; offset?: number }): Promise<AnalysisHistoryResponse>;
+  inspect(input: string | InspectInput): Promise<VideoInspection>;
+  createAnalysis(input: AnalysisCreateInput): Promise<AnalysisCreateResponse>;
+  getHistory(input?: AnalysisHistoryInput): Promise<AnalysisHistoryResponse>;
   getStatus(jobId: string): Promise<AnalysisStatus>;
   getResult(jobId: string): Promise<AnalysisResult>;
 }
@@ -55,9 +86,9 @@ export function createApi(
       method: "POST",
       body: JSON.stringify(config),
     }),
-    inspect: (url) => request(`${baseUrl}/v1/videos/inspect`, identityStore, {
+    inspect: (input) => request(`${baseUrl}/v1/videos/inspect`, identityStore, {
       method: "POST",
-      body: JSON.stringify({ url }),
+      body: JSON.stringify(typeof input === "string" ? { url: input } : input),
     }),
     createAnalysis: (input) => request(`${baseUrl}/v1/analyses`, identityStore, {
       method: "POST",
@@ -65,6 +96,7 @@ export function createApi(
     }),
     getHistory: (input = {}) => {
       const query = new URLSearchParams();
+      if (input.contentId) query.set("contentId", input.contentId);
       if (input.videoId) query.set("videoId", input.videoId);
       if (input.limit !== undefined) query.set("limit", String(input.limit));
       if (input.offset !== undefined) query.set("offset", String(input.offset));
