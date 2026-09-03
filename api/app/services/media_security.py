@@ -26,14 +26,14 @@ async def _resolve_public_addresses(hostname: str) -> list[str]:
         type=socket.SOCK_STREAM,
         proto=socket.IPPROTO_TCP,
     )
-    return list({answer[4][0] for answer in answers})
+    return list(dict.fromkeys(answer[4][0] for answer in answers))
 
 
 async def validate_x_media_url(
     url: str,
     *,
     resolver: Resolver | None = None,
-) -> frozenset[IPAddress]:
+) -> tuple[IPAddress, ...]:
     try:
         parsed = urlsplit(url)
         port = parsed.port
@@ -63,7 +63,8 @@ async def validate_x_media_url(
     if not addresses:
         raise UnsafeMediaUrl("media host could not be safely resolved")
 
-    validated_addresses: set[IPAddress] = set()
+    validated_addresses: list[IPAddress] = []
+    seen_addresses: set[IPAddress] = set()
     for raw_address in addresses:
         try:
             address = ipaddress.ip_address(raw_address)
@@ -73,6 +74,8 @@ async def validate_x_media_url(
             address = address.ipv4_mapped
         if not address.is_global or address.is_multicast:
             raise UnsafeMediaUrl("media host resolved to a disallowed address")
-        validated_addresses.add(address)
+        if address not in seen_addresses:
+            seen_addresses.add(address)
+            validated_addresses.append(address)
 
-    return frozenset(validated_addresses)
+    return tuple(validated_addresses)

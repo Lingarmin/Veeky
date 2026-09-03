@@ -6,8 +6,7 @@ import logging
 import os
 import secrets
 import time
-from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -19,6 +18,41 @@ from app.services.media_security import Resolver, validate_x_media_url
 logger = logging.getLogger(__name__)
 PINNED_IP_EXTENSION = "veeky_pinned_ip"
 MEDIA_DOWNLOAD_JOB_PREFIX = ".media-download-"
+MEDIA_CONNECT_TIMEOUT_SECONDS = 10.0
+_HTTPX_REQUEST_LOG_MESSAGE = 'HTTP Request: %s %s "%s %d %s"'
+
+
+class _HTTPXMediaUrlFilter(logging.Filter):
+    _media_url_filter = True
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if (
+            record.name != "httpx"
+            or record.msg != _HTTPX_REQUEST_LOG_MESSAGE
+            or not isinstance(record.args, tuple)
+            or len(record.args) < 2
+            or not isinstance(record.args[1], httpx.URL)
+            or record.args[1].host != "video.twimg.com"
+        ):
+            return True
+
+        arguments = list(record.args)
+        arguments[1] = arguments[1].copy_with(query=None, fragment=None)
+        record.args = tuple(arguments)
+        return True
+
+
+_HTTPX_MEDIA_URL_FILTER = _HTTPXMediaUrlFilter()
+
+
+def _install_httpx_media_log_filter() -> None:
+    httpx_logger = logging.getLogger("httpx")
+    if any(
+        getattr(log_filter, "_media_url_filter", False)
+        for log_filter in httpx_logger.filters
+    ):
+        return
+    httpx_logger.addFilter(_HTTPX_MEDIA_URL_FILTER)
 
 
 class MediaDownloadError(RuntimeError):
@@ -76,9 +110,13 @@ class PinnedMediaTransport(httpx.AsyncBaseTransport):
         await self._inner_transport.aclose()
 
 
-def build_media_http_client() -> httpx.AsyncClient:
+def build_media_http_client(
+    *,
+    inner_transport: httpx.AsyncBaseTransport | None = None,
+) -> httpx.AsyncClient:
+    _install_httpx_media_log_filter()
     return httpx.AsyncClient(
-        transport=PinnedMediaTransport(),
+        transport=PinnedMediaTransport(inner_transport=inner_transport),
         trust_env=False,
         follow_redirects=False,
     )
@@ -90,7 +128,7 @@ class MediaDownloader:
     def __init__(
         self,
         *,
-        client: httpx.AsyncClient | None = None,
+        inner_transport: httpx.AsyncBaseTransport | None = None,
         max_bytes: int,
         timeout_seconds: float = 1800,
         max_redirects: int = 5,
@@ -103,7 +141,7 @@ class MediaDownloader:
             raise ValueError("timeout_seconds must be positive")
         if max_redirects < 0:
             raise ValueError("max_redirects cannot be negative")
-        self._client = client
+        self._inner_transport = inner_transport
         self._max_bytes = max_bytes
         self._timeout_seconds = timeout_seconds
         self._max_redirects = max_redirects
@@ -122,7 +160,9 @@ class MediaDownloader:
             job_name, job_fd = self._create_job_directory(parent_fd)
             try:
                 async with asyncio.timeout(self._remaining_seconds(deadline)):
-                    async with self._client_for_download() as client:
+                    async with build_media_http_client(
+                        inner_transport=self._inner_transport
+                    ) as client:
                         await self._stream_to_file(
                             client,
                             url,
@@ -200,14 +240,6 @@ class MediaDownloader:
                 ) from None
         raise MediaDownloadError("could not create media download directory")
 
-    @asynccontextmanager
-    async def _client_for_download(self) -> AsyncIterator[httpx.AsyncClient]:
-        if self._client is not None:
-            yield self._client
-            return
-        async with build_media_http_client() as client:
-            yield client
-
     def _remaining_seconds(self, deadline: float) -> float:
         remaining = deadline - self._clock()
         if remaining <= 0:
@@ -231,34 +263,59 @@ class MediaDownloader:
                         resolver=self._resolver,
                     )
                 self._remaining_seconds(deadline)
-                pinned_address = min(
-                    addresses,
-                    key=lambda address: (address.version, int(address)),
-                )
-                async with client.stream(
-                    "GET",
-                    current_url,
-                    headers={"Accept-Encoding": "identity"},
-                    follow_redirects=False,
-                    timeout=self._remaining_seconds(deadline),
-                    extensions={PINNED_IP_EXTENSION: pinned_address.compressed},
-                ) as response:
-                    self._remaining_seconds(deadline)
-                    if response.status_code in self._REDIRECT_STATUSES:
-                        if redirects >= self._max_redirects:
-                            raise MediaDownloadError("media redirect limit exceeded")
-                        location = response.headers.get("Location")
-                        if not location:
-                            raise MediaDownloadError("media redirect had no location")
-                        current_url = urljoin(str(response.url), location)
-                        redirects += 1
+                redirected = False
+                for address_index, pinned_address in enumerate(addresses):
+                    remaining = self._remaining_seconds(deadline)
+                    request_timeout = httpx.Timeout(
+                        remaining,
+                        connect=min(remaining, MEDIA_CONNECT_TIMEOUT_SECONDS),
+                    )
+                    request = client.build_request(
+                        "GET",
+                        current_url,
+                        headers={"Accept-Encoding": "identity"},
+                        timeout=request_timeout,
+                        extensions={
+                            PINNED_IP_EXTENSION: pinned_address.compressed
+                        },
+                    )
+                    try:
+                        response = await client.send(
+                            request,
+                            stream=True,
+                            follow_redirects=False,
+                        )
+                    except (httpx.ConnectError, httpx.ConnectTimeout):
+                        if address_index == len(addresses) - 1:
+                            raise
                         continue
 
-                    response.raise_for_status()
-                    self._validate_content_encoding(response)
-                    self._validate_content_length(response)
-                    await self._write_bounded(response, job_fd, deadline)
-                    return
+                    try:
+                        self._remaining_seconds(deadline)
+                        if response.status_code in self._REDIRECT_STATUSES:
+                            if redirects >= self._max_redirects:
+                                raise MediaDownloadError(
+                                    "media redirect limit exceeded"
+                                )
+                            location = response.headers.get("Location")
+                            if not location:
+                                raise MediaDownloadError(
+                                    "media redirect had no location"
+                                )
+                            current_url = urljoin(str(response.url), location)
+                            redirects += 1
+                            redirected = True
+                            break
+
+                        response.raise_for_status()
+                        self._validate_content_encoding(response)
+                        self._validate_content_length(response)
+                        await self._write_bounded(response, job_fd, deadline)
+                        return
+                    finally:
+                        await response.aclose()
+                if redirected:
+                    continue
         except httpx.TimeoutException:
             raise MediaDownloadTimeout("media download timed out") from None
         except httpx.HTTPStatusError as error:

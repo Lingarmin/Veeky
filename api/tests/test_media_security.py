@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import gzip
 import ipaddress
+import inspect
 import logging
 import os
 import shutil
@@ -74,7 +75,7 @@ async def test_x_media_url_accepts_the_exact_https_host(url: str):
         resolver=resolver_returning(PUBLIC_IPV4),
     )
 
-    assert addresses == frozenset({ipaddress.ip_address(PUBLIC_IPV4)})
+    assert addresses == (ipaddress.ip_address(PUBLIC_IPV4),)
 
 
 @pytest.mark.asyncio
@@ -122,7 +123,24 @@ async def test_x_media_url_normalizes_a_global_ipv4_mapped_address():
         resolver=resolver_returning("::ffff:8.8.8.8"),
     )
 
-    assert addresses == frozenset({ipaddress.ip_address("8.8.8.8")})
+    assert addresses == (ipaddress.ip_address("8.8.8.8"),)
+
+
+@pytest.mark.asyncio
+async def test_x_media_url_preserves_resolver_order_and_removes_duplicates():
+    addresses = await validate_x_media_url(
+        "https://video.twimg.com/file.mp4",
+        resolver=resolver_returning(
+            "2606:4700:4700::1111",
+            PUBLIC_IPV4,
+            "2606:4700:4700::1111",
+        ),
+    )
+
+    assert addresses == (
+        ipaddress.ip_address("2606:4700:4700::1111"),
+        ipaddress.ip_address(PUBLIC_IPV4),
+    )
 
 
 @pytest.mark.asyncio
@@ -181,6 +199,213 @@ async def test_default_media_client_does_not_trust_environment_proxies():
 
 def test_downloader_can_use_its_secure_production_client():
     MediaDownloader(max_bytes=16)
+
+
+def test_downloader_does_not_accept_a_prebuilt_http_client():
+    assert "client" not in inspect.signature(MediaDownloader).parameters
+
+
+@pytest.mark.asyncio
+async def test_downloader_tries_validated_ipv4_then_ipv6_addresses(tmp_path: Path):
+    attempted_hosts: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        attempted_hosts.append(request.url.host)
+        if request.url.host == PUBLIC_IPV4:
+            raise httpx.ConnectError("unreachable", request=request)
+        return streaming_response(b"media")
+
+    destination = tmp_path / "media.mp4"
+    await MediaDownloader(
+        inner_transport=httpx.MockTransport(handler),
+        max_bytes=16,
+        resolver=resolver_returning(PUBLIC_IPV4, "2606:4700:4700::1111"),
+    ).download("https://video.twimg.com/file.mp4", destination)
+
+    assert attempted_hosts == [PUBLIC_IPV4, "2606:4700:4700::1111"]
+    assert destination.read_bytes() == b"media"
+
+
+@pytest.mark.asyncio
+async def test_downloader_tries_multiple_ipv6_addresses_in_resolver_order(
+    tmp_path: Path,
+):
+    attempted_hosts: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        attempted_hosts.append(request.url.host)
+        if len(attempted_hosts) == 1:
+            raise httpx.ConnectTimeout("unreachable", request=request)
+        return streaming_response(b"media")
+
+    destination = tmp_path / "media.mp4"
+    await MediaDownloader(
+        inner_transport=httpx.MockTransport(handler),
+        max_bytes=16,
+        resolver=resolver_returning(
+            "2606:4700:4700::1111",
+            "2001:4860:4860::8888",
+        ),
+    ).download("https://video.twimg.com/file.mp4", destination)
+
+    assert attempted_hosts == [
+        "2606:4700:4700::1111",
+        "2001:4860:4860::8888",
+    ]
+    assert destination.read_bytes() == b"media"
+
+
+@pytest.mark.asyncio
+async def test_downloader_does_not_try_another_address_after_http_response(
+    tmp_path: Path,
+):
+    attempted_hosts: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        attempted_hosts.append(request.url.host)
+        return httpx.Response(403)
+
+    with pytest.raises(MediaDownloadError, match="403"):
+        await MediaDownloader(
+            inner_transport=httpx.MockTransport(handler),
+            max_bytes=16,
+            resolver=resolver_returning(PUBLIC_IPV4, "1.1.1.1"),
+        ).download(
+            "https://video.twimg.com/file.mp4",
+            tmp_path / "media.mp4",
+        )
+
+    assert attempted_hosts == [PUBLIC_IPV4]
+
+
+@pytest.mark.asyncio
+async def test_downloader_does_not_retry_connect_error_after_response_headers(
+    tmp_path: Path,
+):
+    attempted_hosts: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        attempted_hosts.append(request.url.host)
+
+        class FailingResponseStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                raise httpx.ConnectError("stream failed", request=request)
+                yield b""
+
+        return httpx.Response(200, stream=FailingResponseStream())
+
+    with pytest.raises(MediaDownloadError, match="request failed"):
+        await MediaDownloader(
+            inner_transport=httpx.MockTransport(handler),
+            max_bytes=16,
+            resolver=resolver_returning(PUBLIC_IPV4, "1.1.1.1"),
+        ).download(
+            "https://video.twimg.com/file.mp4",
+            tmp_path / "media.mp4",
+        )
+
+    assert attempted_hosts == [PUBLIC_IPV4]
+
+
+@pytest.mark.asyncio
+async def test_downloader_bounds_each_address_connect_timeout(tmp_path: Path):
+    request_timeouts: list[dict[str, float | None]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        request_timeouts.append(request.extensions["timeout"])
+        return streaming_response(b"media")
+
+    await MediaDownloader(
+        inner_transport=httpx.MockTransport(handler),
+        max_bytes=16,
+        timeout_seconds=1800,
+        resolver=resolver_returning(PUBLIC_IPV4),
+    ).download(
+        "https://video.twimg.com/file.mp4",
+        tmp_path / "media.mp4",
+    )
+
+    assert request_timeouts[0]["connect"] < request_timeouts[0]["read"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "forbidden", "redirect"])
+async def test_httpx_media_logs_redact_signed_queries_without_changing_requests(
+    tmp_path: Path,
+    caplog,
+    outcome: str,
+):
+    requested_urls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        if outcome == "forbidden":
+            return httpx.Response(403)
+        if outcome == "redirect" and len(requested_urls) == 1:
+            return httpx.Response(
+                302,
+                headers={"Location": "/final.mp4?token=redirect-secret"},
+            )
+        return streaming_response(b"media")
+
+    downloader = MediaDownloader(
+        inner_transport=httpx.MockTransport(handler),
+        max_bytes=16,
+        resolver=resolver_returning(PUBLIC_IPV4),
+    )
+    with caplog.at_level(logging.INFO, logger="httpx"):
+        if outcome == "forbidden":
+            with pytest.raises(MediaDownloadError, match="403"):
+                await downloader.download(
+                    "https://video.twimg.com/file.mp4?token=initial-secret",
+                    tmp_path / "media.mp4",
+                )
+        else:
+            await downloader.download(
+                "https://video.twimg.com/file.mp4?token=initial-secret",
+                tmp_path / "media.mp4",
+            )
+
+    assert "initial-secret" in requested_urls[0]
+    if outcome == "redirect":
+        assert "redirect-secret" in requested_urls[1]
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages
+    assert all("initial-secret" not in message for message in messages)
+    assert all("redirect-secret" not in message for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_httpx_media_log_filter_leaves_non_media_urls_unchanged(caplog):
+    media_client = media_download_module.build_media_http_client()
+    await media_client.aclose()
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200)
+
+    with caplog.at_level(logging.INFO, logger="httpx"):
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            trust_env=False,
+        ) as client:
+            await client.get("https://example.com/file?token=visible")
+
+    assert any("token=visible" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_httpx_media_log_filter_is_installed_once():
+    first_client = media_download_module.build_media_http_client()
+    second_client = media_download_module.build_media_http_client()
+    await first_client.aclose()
+    await second_client.aclose()
+
+    installed_filters = [
+        log_filter
+        for log_filter in logging.getLogger("httpx").filters
+        if getattr(log_filter, "_media_url_filter", False)
+    ]
+    assert len(installed_filters) == 1
 
 
 def test_media_download_job_prefix_is_available_to_periodic_cleanup():
@@ -287,16 +512,12 @@ async def test_downloader_pins_each_redirect_to_its_validated_ip(tmp_path: Path)
             return httpx.Response(302, headers={"Location": "/final.mp4"})
         return streaming_response(b"media")
 
-    transport = media_download_module.PinnedMediaTransport(
-        inner_transport=httpx.MockTransport(handler)
-    )
     destination = tmp_path / "media.mp4"
-    async with httpx.AsyncClient(transport=transport, trust_env=False) as client:
-        await MediaDownloader(
-            client=client,
-            max_bytes=16,
-            resolver=resolver,
-        ).download("https://video.twimg.com/start.mp4", destination)
+    await MediaDownloader(
+        inner_transport=httpx.MockTransport(handler),
+        max_bytes=16,
+        resolver=resolver,
+    ).download("https://video.twimg.com/start.mp4", destination)
 
     assert resolver_calls == 2
     assert connected_hosts == [PUBLIC_IPV4, "1.1.1.1"]
@@ -315,20 +536,19 @@ async def test_downloader_revalidates_a_redirect_before_requesting_it(tmp_path: 
             headers={"Location": "https://example.com/private.mp4"},
         )
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        downloader = MediaDownloader(
-            client=client,
-            max_bytes=16,
-            resolver=resolver_returning(PUBLIC_IPV4),
+    downloader = MediaDownloader(
+        inner_transport=httpx.MockTransport(handler),
+        max_bytes=16,
+        resolver=resolver_returning(PUBLIC_IPV4),
+    )
+
+    with pytest.raises(UnsafeMediaUrl):
+        await downloader.download(
+            "https://video.twimg.com/start.mp4",
+            tmp_path / "media.mp4",
         )
 
-        with pytest.raises(UnsafeMediaUrl):
-            await downloader.download(
-                "https://video.twimg.com/start.mp4",
-                tmp_path / "media.mp4",
-            )
-
-    assert requested_hosts == ["video.twimg.com"]
+    assert requested_hosts == [PUBLIC_IPV4]
     assert_no_download_artifacts(tmp_path)
 
 
@@ -351,18 +571,17 @@ async def test_downloader_re_resolves_the_host_after_every_redirect(tmp_path: Pa
             headers={"Location": "https://video.twimg.com/final.mp4"},
         )
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        downloader = MediaDownloader(
-            client=client,
-            max_bytes=16,
-            resolver=changing_resolver,
-        )
+    downloader = MediaDownloader(
+        inner_transport=httpx.MockTransport(handler),
+        max_bytes=16,
+        resolver=changing_resolver,
+    )
 
-        with pytest.raises(UnsafeMediaUrl):
-            await downloader.download(
-                "https://video.twimg.com/start.mp4",
-                tmp_path / "media.mp4",
-            )
+    with pytest.raises(UnsafeMediaUrl):
+        await downloader.download(
+            "https://video.twimg.com/start.mp4",
+            tmp_path / "media.mp4",
+        )
 
     assert resolved == 2
     assert requests == 1
@@ -384,12 +603,11 @@ async def test_downloader_streams_to_an_atomic_destination(tmp_path: Path):
         return streaming_response(b"sixteen-byte-mp4")
 
     destination = tmp_path / "media.mp4"
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        result = await MediaDownloader(
-            client=client,
-            max_bytes=16,
-            resolver=resolver_returning(PUBLIC_IPV4),
-        ).download("https://video.twimg.com/start.mp4", destination)
+    result = await MediaDownloader(
+        inner_transport=httpx.MockTransport(handler),
+        max_bytes=16,
+        resolver=resolver_returning(PUBLIC_IPV4),
+    ).download("https://video.twimg.com/start.mp4", destination)
 
     assert result == destination
     assert destination.read_bytes() == b"sixteen-byte-mp4"
@@ -413,16 +631,15 @@ async def test_downloader_stops_and_removes_partial_file_over_limit(tmp_path: Pa
     async def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, stream=stream)
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(MediaTooLarge):
-            await MediaDownloader(
-                client=client,
-                max_bytes=16,
-                resolver=resolver_returning(PUBLIC_IPV4),
-            ).download(
-                "https://video.twimg.com/file.mp4",
-                tmp_path / "media.mp4",
-            )
+    with pytest.raises(MediaTooLarge):
+        await MediaDownloader(
+            inner_transport=httpx.MockTransport(handler),
+            max_bytes=16,
+            resolver=resolver_returning(PUBLIC_IPV4),
+        ).download(
+            "https://video.twimg.com/file.mp4",
+            tmp_path / "media.mp4",
+        )
 
     assert_no_download_artifacts(tmp_path)
     assert stream.chunks_read == 2
@@ -439,16 +656,15 @@ async def test_downloader_rejects_oversized_content_length_before_streaming(
             content=b"",
         )
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(MediaTooLarge):
-            await MediaDownloader(
-                client=client,
-                max_bytes=16,
-                resolver=resolver_returning(PUBLIC_IPV4),
-            ).download(
-                "https://video.twimg.com/file.mp4",
-                tmp_path / "media.mp4",
-            )
+    with pytest.raises(MediaTooLarge):
+        await MediaDownloader(
+            inner_transport=httpx.MockTransport(handler),
+            max_bytes=16,
+            resolver=resolver_returning(PUBLIC_IPV4),
+        ).download(
+            "https://video.twimg.com/file.mp4",
+            tmp_path / "media.mp4",
+        )
 
     assert_no_download_artifacts(tmp_path)
 
@@ -467,16 +683,15 @@ async def test_downloader_rejects_compressed_media_and_requests_identity(
             content=gzip.compress(b"small body"),
         )
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(MediaDownloadError, match="encoding"):
-            await MediaDownloader(
-                client=client,
-                max_bytes=1024,
-                resolver=resolver_returning(PUBLIC_IPV4),
-            ).download(
-                "https://video.twimg.com/file.mp4",
-                tmp_path / "media.mp4",
-            )
+    with pytest.raises(MediaDownloadError, match="encoding"):
+        await MediaDownloader(
+            inner_transport=httpx.MockTransport(handler),
+            max_bytes=1024,
+            resolver=resolver_returning(PUBLIC_IPV4),
+        ).download(
+            "https://video.twimg.com/file.mp4",
+            tmp_path / "media.mp4",
+        )
 
     assert accept_encodings == ["identity"]
     assert_no_download_artifacts(tmp_path)
@@ -487,17 +702,16 @@ async def test_downloader_maps_timeout_without_exposing_query(tmp_path: Path):
     async def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("timeout", request=request)
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(MediaDownloadTimeout) as error:
-            await MediaDownloader(
-                client=client,
-                max_bytes=16,
-                timeout_seconds=1,
-                resolver=resolver_returning(PUBLIC_IPV4),
-            ).download(
-                "https://video.twimg.com/file.mp4?token=secret",
-                tmp_path / "media.mp4",
-            )
+    with pytest.raises(MediaDownloadTimeout) as error:
+        await MediaDownloader(
+            inner_transport=httpx.MockTransport(handler),
+            max_bytes=16,
+            timeout_seconds=1,
+            resolver=resolver_returning(PUBLIC_IPV4),
+        ).download(
+            "https://video.twimg.com/file.mp4?token=secret",
+            tmp_path / "media.mp4",
+        )
 
     assert "secret" not in str(error.value)
     assert error.value.__cause__ is None
@@ -510,22 +724,21 @@ async def test_downloader_deadline_includes_dns_resolution(tmp_path: Path):
         await asyncio.Event().wait()
         return [PUBLIC_IPV4]
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(lambda _request: httpx.Response(200))
-    ) as client:
-        with pytest.raises(MediaDownloadTimeout) as error:
-            await asyncio.wait_for(
-                MediaDownloader(
-                    client=client,
-                    max_bytes=16,
-                    timeout_seconds=0.01,
-                    resolver=resolver_that_never_returns,
-                ).download(
-                    "https://video.twimg.com/file.mp4?token=secret",
-                    tmp_path / "media.mp4",
+    with pytest.raises(MediaDownloadTimeout) as error:
+        await asyncio.wait_for(
+            MediaDownloader(
+                inner_transport=httpx.MockTransport(
+                    lambda _request: httpx.Response(200)
                 ),
-                timeout=0.2,
-            )
+                max_bytes=16,
+                timeout_seconds=0.01,
+                resolver=resolver_that_never_returns,
+            ).download(
+                "https://video.twimg.com/file.mp4?token=secret",
+                tmp_path / "media.mp4",
+            ),
+            timeout=0.2,
+        )
 
     assert "secret" not in str(error.value)
     assert error.value.__cause__ is None
@@ -575,18 +788,17 @@ async def test_downloader_uses_one_deadline_across_redirects_and_streaming(
             return httpx.Response(302, headers={"Location": "/final.mp4"})
         return httpx.Response(200, stream=stream)
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(MediaDownloadTimeout):
-            await MediaDownloader(
-                client=client,
-                max_bytes=64,
-                timeout_seconds=10,
-                resolver=resolver,
-                clock=clock,
-            ).download(
-                "https://video.twimg.com/file.mp4",
-                tmp_path / "media.mp4",
-            )
+    with pytest.raises(MediaDownloadTimeout):
+        await MediaDownloader(
+            inner_transport=httpx.MockTransport(handler),
+            max_bytes=64,
+            timeout_seconds=10,
+            resolver=resolver,
+            clock=clock,
+        ).download(
+            "https://video.twimg.com/file.mp4",
+            tmp_path / "media.mp4",
+        )
 
     assert request_timeouts == pytest.approx([8, 3])
     assert stream.chunks_read == 2
@@ -598,16 +810,15 @@ async def test_downloader_maps_http_error_without_exposing_query(tmp_path: Path)
     async def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(403, text="request token=secret was rejected")
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(MediaDownloadError) as error:
-            await MediaDownloader(
-                client=client,
-                max_bytes=16,
-                resolver=resolver_returning(PUBLIC_IPV4),
-            ).download(
-                "https://video.twimg.com/file.mp4?token=secret",
-                tmp_path / "media.mp4",
-            )
+    with pytest.raises(MediaDownloadError) as error:
+        await MediaDownloader(
+            inner_transport=httpx.MockTransport(handler),
+            max_bytes=16,
+            resolver=resolver_returning(PUBLIC_IPV4),
+        ).download(
+            "https://video.twimg.com/file.mp4?token=secret",
+            tmp_path / "media.mp4",
+        )
 
     assert "secret" not in str(error.value)
     assert "403" in str(error.value)
@@ -627,17 +838,16 @@ async def test_downloader_enforces_redirect_limit(tmp_path: Path):
             headers={"Location": f"/redirect-{calls}.mp4"},
         )
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(MediaDownloadError, match="redirect limit"):
-            await MediaDownloader(
-                client=client,
-                max_bytes=16,
-                max_redirects=2,
-                resolver=resolver_returning(PUBLIC_IPV4),
-            ).download(
-                "https://video.twimg.com/file.mp4",
-                tmp_path / "media.mp4",
-            )
+    with pytest.raises(MediaDownloadError, match="redirect limit"):
+        await MediaDownloader(
+            inner_transport=httpx.MockTransport(handler),
+            max_bytes=16,
+            max_redirects=2,
+            resolver=resolver_returning(PUBLIC_IPV4),
+        ).download(
+            "https://video.twimg.com/file.mp4",
+            tmp_path / "media.mp4",
+        )
 
     assert calls == 3
     assert_no_download_artifacts(tmp_path)
@@ -654,16 +864,15 @@ async def test_downloader_refuses_an_existing_destination(tmp_path: Path):
         requests += 1
         return httpx.Response(200, content=b"replacement")
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(MediaDownloadError, match="destination already exists"):
-            await MediaDownloader(
-                client=client,
-                max_bytes=16,
-                resolver=resolver_returning(PUBLIC_IPV4),
-            ).download(
-                "https://video.twimg.com/file.mp4",
-                destination,
-            )
+    with pytest.raises(MediaDownloadError, match="destination already exists"):
+        await MediaDownloader(
+            inner_transport=httpx.MockTransport(handler),
+            max_bytes=16,
+            resolver=resolver_returning(PUBLIC_IPV4),
+        ).download(
+            "https://video.twimg.com/file.mp4",
+            destination,
+        )
 
     assert destination.read_bytes() == b"keep-me"
     assert requests == 0
@@ -686,16 +895,15 @@ async def test_downloader_does_not_overwrite_a_destination_created_at_commit(
     async def handler(_request: httpx.Request) -> httpx.Response:
         return streaming_response(b"download")
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(MediaDownloadError, match="destination already exists"):
-            await MediaDownloader(
-                client=client,
-                max_bytes=16,
-                resolver=resolver_returning(PUBLIC_IPV4),
-            ).download(
-                "https://video.twimg.com/file.mp4",
-                destination,
-            )
+    with pytest.raises(MediaDownloadError, match="destination already exists"):
+        await MediaDownloader(
+            inner_transport=httpx.MockTransport(handler),
+            max_bytes=16,
+            resolver=resolver_returning(PUBLIC_IPV4),
+        ).download(
+            "https://video.twimg.com/file.mp4",
+            destination,
+        )
 
     assert destination.read_bytes() == b"racer"
     assert list(tmp_path.iterdir()) == [destination]
@@ -724,16 +932,15 @@ async def test_downloader_does_not_follow_a_parent_directory_symlink_swap(
     async def handler(_request: httpx.Request) -> httpx.Response:
         return streaming_response(b"download")
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(MediaDownloadError, match="destination directory changed"):
-            await MediaDownloader(
-                client=client,
-                max_bytes=16,
-                resolver=resolver_returning(PUBLIC_IPV4),
-            ).download(
-                "https://video.twimg.com/file.mp4",
-                destination,
-            )
+    with pytest.raises(MediaDownloadError, match="destination directory changed"):
+        await MediaDownloader(
+            inner_transport=httpx.MockTransport(handler),
+            max_bytes=16,
+            resolver=resolver_returning(PUBLIC_IPV4),
+        ).download(
+            "https://video.twimg.com/file.mp4",
+            destination,
+        )
 
     assert list(attacker_directory.iterdir()) == []
     assert list(moved_trusted_directory.iterdir()) == []
@@ -746,18 +953,17 @@ async def test_downloader_rejects_a_symlinked_destination_directory(tmp_path: Pa
     linked_directory = tmp_path / "linked"
     linked_directory.symlink_to(real_directory, target_is_directory=True)
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(lambda _request: httpx.Response(200))
-    ) as client:
-        with pytest.raises(MediaDownloadError, match="destination directory"):
-            await MediaDownloader(
-                client=client,
-                max_bytes=16,
-                resolver=resolver_returning(PUBLIC_IPV4),
-            ).download(
-                "https://video.twimg.com/file.mp4",
-                linked_directory / "media.mp4",
-            )
+    with pytest.raises(MediaDownloadError, match="destination directory"):
+        await MediaDownloader(
+            inner_transport=httpx.MockTransport(
+                lambda _request: httpx.Response(200)
+            ),
+            max_bytes=16,
+            resolver=resolver_returning(PUBLIC_IPV4),
+        ).download(
+            "https://video.twimg.com/file.mp4",
+            linked_directory / "media.mp4",
+        )
 
     assert list(real_directory.iterdir()) == []
 
@@ -786,17 +992,14 @@ async def test_downloader_logs_generic_cleanup_failure_for_later_recovery(
 
     destination = tmp_path / "media.mp4"
     with caplog.at_level(logging.WARNING, logger="app.services.media_download"):
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(handler)
-        ) as client:
-            await MediaDownloader(
-                client=client,
-                max_bytes=16,
-                resolver=resolver_returning(PUBLIC_IPV4),
-            ).download(
-                "https://video.twimg.com/file.mp4?token=secret",
-                destination,
-            )
+        await MediaDownloader(
+            inner_transport=httpx.MockTransport(handler),
+            max_bytes=16,
+            resolver=resolver_returning(PUBLIC_IPV4),
+        ).download(
+            "https://video.twimg.com/file.mp4?token=secret",
+            destination,
+        )
 
     messages = [record.getMessage() for record in caplog.records]
     assert messages == ["media download temporary directory cleanup failed"]
