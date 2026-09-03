@@ -395,7 +395,7 @@ async def test_httpx_media_log_filter_leaves_non_media_urls_unchanged(caplog):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("logger_name", "return_value"),
+    ("logger_name", "media_return_value", "non_media_return_value"),
     [
         (
             "httpcore.http11",
@@ -408,6 +408,12 @@ async def test_httpx_media_log_filter_leaves_non_media_urls_unchanged(caplog):
                     (b"X-Debug", b"keep?token=visible"),
                 ],
             ),
+            (
+                b"HTTP/1.1",
+                302,
+                b"Found",
+                [(b"Location", b"/other.mp4?token=http11-non-media")],
+            ),
         ),
         (
             "httpcore.http2",
@@ -418,27 +424,162 @@ async def test_httpx_media_log_filter_leaves_non_media_urls_unchanged(caplog):
                     (b"x-debug", b"keep?token=visible"),
                 ],
             ),
+            (
+                302,
+                [(b"location", b"/other.mp4?token=http2-non-media")],
+            ),
         ),
     ],
 )
-async def test_httpcore_media_logs_redact_location_queries(
+async def test_httpcore_media_filter_is_isolated_between_concurrent_tasks(
+    tmp_path: Path,
     caplog,
     logger_name: str,
-    return_value: tuple,
+    media_return_value: tuple,
+    non_media_return_value: tuple,
 ):
-    media_client = media_download_module.build_media_http_client()
-    await media_client.aclose()
+    media_request_started = asyncio.Event()
+    non_media_log_written = asyncio.Event()
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        media_request_started.set()
+        await non_media_log_written.wait()
+        logging.getLogger(logger_name).debug(
+            "receive_response_headers.complete "
+            f"return_value={media_return_value!r}"
+        )
+        return streaming_response(b"media")
+
+    async def log_non_media_response() -> None:
+        await media_request_started.wait()
+        logging.getLogger(logger_name).debug(
+            "receive_response_headers.complete "
+            f"return_value={non_media_return_value!r}"
+        )
+        non_media_log_written.set()
 
     with caplog.at_level(logging.DEBUG, logger=logger_name):
-        logging.getLogger(logger_name).debug(
-            f"receive_response_headers.complete return_value={return_value!r}"
+        await asyncio.gather(
+            MediaDownloader(
+                inner_transport=httpx.MockTransport(handler),
+                max_bytes=16,
+                resolver=resolver_returning(PUBLIC_IPV4),
+            ).download(
+                "https://video.twimg.com/file.mp4",
+                tmp_path / "media.mp4",
+            ),
+            log_non_media_response(),
         )
 
     messages = [record.getMessage() for record in caplog.records]
     assert messages
     assert all("http11-secret" not in message for message in messages)
     assert all("http2-secret" not in message for message in messages)
+    assert any("http11-non-media" in message for message in messages) or any(
+        "http2-non-media" in message for message in messages
+    )
     assert any("keep?token=visible" in message for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_httpcore_media_context_is_restored_after_request_error(
+    tmp_path: Path,
+    caplog,
+):
+    logger_name = "httpcore.http11"
+    media_return_value = (
+        b"HTTP/1.1",
+        302,
+        b"Found",
+        [(b"Location", b"/media.mp4?token=media-secret")],
+    )
+    later_return_value = (
+        b"HTTP/1.1",
+        302,
+        b"Found",
+        [(b"Location", b"/later.mp4?token=after-error")],
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        logging.getLogger(logger_name).debug(
+            "receive_response_headers.complete "
+            f"return_value={media_return_value!r}"
+        )
+        raise httpx.ConnectError("connection failed", request=request)
+
+    with caplog.at_level(logging.DEBUG, logger=logger_name):
+        with pytest.raises(MediaDownloadError, match="request failed"):
+            await MediaDownloader(
+                inner_transport=httpx.MockTransport(handler),
+                max_bytes=16,
+                resolver=resolver_returning(PUBLIC_IPV4),
+            ).download(
+                "https://video.twimg.com/file.mp4",
+                tmp_path / "media.mp4",
+            )
+        logging.getLogger(logger_name).debug(
+            "receive_response_headers.complete "
+            f"return_value={later_return_value!r}"
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert all("media-secret" not in message for message in messages)
+    assert any("after-error" in message for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_httpcore_media_context_is_restored_after_request_cancellation(
+    tmp_path: Path,
+    caplog,
+):
+    logger_name = "httpcore.http11"
+    request_cancelled = False
+    media_return_value = (
+        b"HTTP/1.1",
+        302,
+        b"Found",
+        [(b"Location", b"/media.mp4?token=media-secret")],
+    )
+    later_return_value = (
+        b"HTTP/1.1",
+        302,
+        b"Found",
+        [(b"Location", b"/later.mp4?token=after-cancel")],
+    )
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal request_cancelled
+        logging.getLogger(logger_name).debug(
+            "receive_response_headers.complete "
+            f"return_value={media_return_value!r}"
+        )
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            request_cancelled = True
+            raise
+        raise AssertionError("unreachable")
+
+    with caplog.at_level(logging.DEBUG, logger=logger_name):
+        with pytest.raises(MediaDownloadTimeout):
+            await MediaDownloader(
+                inner_transport=httpx.MockTransport(handler),
+                max_bytes=16,
+                timeout_seconds=0.01,
+                resolver=resolver_returning(PUBLIC_IPV4),
+            ).download(
+                "https://video.twimg.com/file.mp4",
+                tmp_path / "media.mp4",
+            )
+        logging.getLogger(logger_name).debug(
+            "receive_response_headers.complete "
+            f"return_value={later_return_value!r}"
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert request_cancelled is True
+    assert all("media-secret" not in message for message in messages)
+    assert any("after-cancel" in message for message in messages)
 
 
 @pytest.mark.asyncio

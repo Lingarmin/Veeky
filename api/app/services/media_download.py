@@ -8,6 +8,7 @@ import os
 import secrets
 import time
 from collections.abc import Callable
+from contextvars import ContextVar
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
@@ -26,6 +27,10 @@ _HTTPCORE_RESPONSE_HEADER_INDEXES = {
     "httpcore.http11": 3,
     "httpcore.http2": 1,
 }
+_MEDIA_REQUEST_LOG_CONTEXT: ContextVar[bool] = ContextVar(
+    "media_request_log_context",
+    default=False,
+)
 
 
 class _HTTPXMediaUrlFilter(logging.Filter):
@@ -55,6 +60,8 @@ class _HTTPCoreMediaLocationFilter(logging.Filter):
     _media_url_filter = True
 
     def filter(self, record: logging.LogRecord) -> bool:
+        if not _MEDIA_REQUEST_LOG_CONTEXT.get():
+            return True
         header_index = _HTTPCORE_RESPONSE_HEADER_INDEXES.get(record.name)
         if (
             header_index is None
@@ -362,41 +369,45 @@ class MediaDownloader:
                             PINNED_IP_EXTENSION: pinned_address.compressed
                         },
                     )
+                    context_token = _MEDIA_REQUEST_LOG_CONTEXT.set(True)
                     try:
-                        response = await client.send(
-                            request,
-                            stream=True,
-                            follow_redirects=False,
-                        )
-                    except (httpx.ConnectError, httpx.ConnectTimeout):
-                        if address_index == len(addresses) - 1:
-                            raise
-                        continue
+                        try:
+                            response = await client.send(
+                                request,
+                                stream=True,
+                                follow_redirects=False,
+                            )
+                        except (httpx.ConnectError, httpx.ConnectTimeout):
+                            if address_index == len(addresses) - 1:
+                                raise
+                            continue
 
-                    try:
-                        self._remaining_seconds(deadline)
-                        if response.status_code in self._REDIRECT_STATUSES:
-                            if redirects >= self._max_redirects:
-                                raise MediaDownloadError(
-                                    "media redirect limit exceeded"
-                                )
-                            location = response.headers.get("Location")
-                            if not location:
-                                raise MediaDownloadError(
-                                    "media redirect had no location"
-                                )
-                            current_url = urljoin(str(response.url), location)
-                            redirects += 1
-                            redirected = True
-                            break
+                        try:
+                            self._remaining_seconds(deadline)
+                            if response.status_code in self._REDIRECT_STATUSES:
+                                if redirects >= self._max_redirects:
+                                    raise MediaDownloadError(
+                                        "media redirect limit exceeded"
+                                    )
+                                location = response.headers.get("Location")
+                                if not location:
+                                    raise MediaDownloadError(
+                                        "media redirect had no location"
+                                    )
+                                current_url = urljoin(str(response.url), location)
+                                redirects += 1
+                                redirected = True
+                                break
 
-                        response.raise_for_status()
-                        self._validate_content_encoding(response)
-                        self._validate_content_length(response)
-                        await self._write_bounded(response, job_fd, deadline)
-                        return
+                            response.raise_for_status()
+                            self._validate_content_encoding(response)
+                            self._validate_content_length(response)
+                            await self._write_bounded(response, job_fd, deadline)
+                            return
+                        finally:
+                            await response.aclose()
                     finally:
-                        await response.aclose()
+                        _MEDIA_REQUEST_LOG_CONTEXT.reset(context_token)
                 if redirected:
                     continue
         except httpx.TimeoutException:
