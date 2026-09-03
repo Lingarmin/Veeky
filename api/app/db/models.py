@@ -6,6 +6,7 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -50,6 +51,9 @@ class Installation(Base):
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     jobs: Mapped[list[AnalysisJob]] = relationship(back_populates="installation")
+    media_upload_sessions: Mapped[list[MediaUploadSession]] = relationship(
+        back_populates="installation", cascade="all, delete-orphan"
+    )
 
 
 class Video(Base):
@@ -93,6 +97,9 @@ class Video(Base):
     )
     content_jobs: Mapped[list[AnalysisJob]] = relationship(
         back_populates="content", foreign_keys="AnalysisJob.content_id"
+    )
+    media_upload_sessions: Mapped[list[MediaUploadSession]] = relationship(
+        back_populates="content", foreign_keys="MediaUploadSession.content_id"
     )
 
 
@@ -281,3 +288,68 @@ class AnalysisResult(Base):
     generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     job: Mapped[AnalysisJob] = relationship(back_populates="result")
+
+
+class MediaUploadSession(Base):
+    __tablename__ = "media_upload_sessions"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('created', 'uploading', 'complete', 'consumed', "
+            "'expired', 'failed')",
+            name="ck_media_upload_session_status",
+        ),
+        CheckConstraint(
+            "media_kind IN ('mp4', 'hls')",
+            name="ck_media_upload_session_kind",
+        ),
+        CheckConstraint(
+            "expected_bytes > 0", name="ck_media_upload_session_expected_bytes"
+        ),
+        CheckConstraint(
+            "received_bytes >= 0 AND received_bytes <= expected_bytes",
+            name="ck_media_upload_session_received_bytes",
+        ),
+        CheckConstraint(
+            "part_count > 0", name="ck_media_upload_session_part_count"
+        ),
+        CheckConstraint(
+            "part_size_bytes > 0", name="ck_media_upload_session_part_size_bytes"
+        ),
+        Index(
+            "ix_media_upload_sessions_owner_status",
+            "installation_id",
+            "status",
+        ),
+        Index("ix_media_upload_sessions_expires_at", "expires_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_string)
+    installation_id: Mapped[str] = mapped_column(
+        ForeignKey("installations.id", ondelete="CASCADE"), nullable=False
+    )
+    content_id: Mapped[str] = mapped_column(
+        ForeignKey("videos.content_id", ondelete="CASCADE"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(20), default="created")
+    expected_bytes: Mapped[int] = mapped_column(BigInteger)
+    received_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    media_kind: Mapped[str] = mapped_column(String(10))
+    part_count: Mapped[int] = mapped_column(Integer)
+    part_size_bytes: Mapped[int] = mapped_column(Integer)
+    uploaded_parts: Mapped[dict[str, dict[str, int | str]]] = mapped_column(
+        JSON, default=dict
+    )
+    hls_manifest: Mapped[dict[str, list[int]] | None] = mapped_column(
+        JSON, nullable=True
+    )
+    directory_key: Mapped[str] = mapped_column(String(36), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    installation: Mapped[Installation] = relationship(
+        back_populates="media_upload_sessions"
+    )
+    content: Mapped[Video] = relationship(
+        back_populates="media_upload_sessions", foreign_keys=[content_id]
+    )
