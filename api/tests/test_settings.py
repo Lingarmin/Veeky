@@ -18,6 +18,55 @@ def test_security_and_quota_settings_have_safe_defaults():
     assert settings.llm_credential_encryption_key is None
 
 
+def test_media_settings_have_bounded_defaults():
+    settings = Settings(_env_file=None)
+
+    assert settings.max_media_bytes == 4 * 1024 * 1024 * 1024
+    assert settings.max_temp_bytes_per_job == 6 * 1024 * 1024 * 1024
+    assert settings.media_download_timeout_seconds == 1800
+    assert settings.media_upload_session_ttl_seconds == 7200
+    assert settings.media_chunk_bytes == 8 * 1024 * 1024
+    assert settings.asr_job_timeout_seconds == 21600
+    assert settings.media_temp_root == "/var/lib/veeky/media"
+
+
+def test_media_settings_allow_environment_overrides(monkeypatch):
+    monkeypatch.setenv("MAX_MEDIA_BYTES", "1024")
+    monkeypatch.setenv("MAX_TEMP_BYTES_PER_JOB", "2048")
+    monkeypatch.setenv("MEDIA_DOWNLOAD_TIMEOUT_SECONDS", "30")
+    monkeypatch.setenv("MEDIA_UPLOAD_SESSION_TTL_SECONDS", "60")
+    monkeypatch.setenv("MEDIA_CHUNK_BYTES", "256")
+    monkeypatch.setenv("ASR_JOB_TIMEOUT_SECONDS", "120")
+    monkeypatch.setenv("MEDIA_TEMP_ROOT", "/tmp/veeky-test-media")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.max_media_bytes == 1024
+    assert settings.max_temp_bytes_per_job == 2048
+    assert settings.media_download_timeout_seconds == 30
+    assert settings.media_upload_session_ttl_seconds == 60
+    assert settings.media_chunk_bytes == 256
+    assert settings.asr_job_timeout_seconds == 120
+    assert settings.media_temp_root == "/tmp/veeky-test-media"
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "max_media_bytes",
+        "max_temp_bytes_per_job",
+        "media_download_timeout_seconds",
+        "media_upload_session_ttl_seconds",
+        "media_chunk_bytes",
+        "asr_job_timeout_seconds",
+    ],
+)
+@pytest.mark.parametrize("invalid_value", [0, -1])
+def test_media_settings_reject_non_positive_limits(field, invalid_value):
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, **{field: invalid_value})
+
+
 def test_production_settings_require_a_32_byte_base64_encryption_key():
     key = base64.b64encode(b"a" * 32).decode("ascii")
 

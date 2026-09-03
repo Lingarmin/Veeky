@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     read_rate_limit_per_minute: PositiveInt = 120
     max_active_jobs_per_installation: PositiveInt = 1
     max_video_duration_seconds: PositiveInt = 14400
+    max_media_bytes: PositiveInt = 4 * 1024 * 1024 * 1024
+    max_temp_bytes_per_job: PositiveInt = 6 * 1024 * 1024 * 1024
+    media_download_timeout_seconds: PositiveInt = 1800
+    media_upload_session_ttl_seconds: PositiveInt = 7200
+    media_chunk_bytes: PositiveInt = 8 * 1024 * 1024
+    asr_job_timeout_seconds: PositiveInt = 21600
+    media_temp_root: str = "/var/lib/veeky/media"
     llm_credential_encryption_key: SecretStr | None = None
 
     @model_validator(mode="after")
