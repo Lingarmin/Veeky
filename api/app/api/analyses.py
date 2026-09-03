@@ -4,10 +4,11 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 import hashlib
 from typing import Any, Literal
+from urllib.parse import urlsplit
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -59,6 +60,9 @@ from app.security.quotas import (
 router = APIRouter(prefix="/v1")
 JobDispatcher = Callable[[str], object]
 INTERRUPTIBLE_JOB_STATUSES = {"fetching_transcript", "translating", "analyzing"}
+MAX_DATABASE_INTEGER = 2_147_483_647
+MAX_JAVASCRIPT_INTEGER = 9_007_199_254_740_991
+MAX_X_SOURCE_CONTENT_ID = (1 << 64) - 1
 
 
 class WorkerUnavailableError(RuntimeError):
@@ -117,12 +121,36 @@ class ApiModel(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
 
 
+class MediaCandidateRequest(ApiModel):
+    url: str = Field(min_length=1, max_length=2000)
+    kind: Literal["mp4", "hls", "segment"]
+    captured_at: int = Field(
+        strict=True, ge=0, le=MAX_JAVASCRIPT_INTEGER
+    )
+
+    @field_validator("url")
+    @classmethod
+    def require_https_url(cls, value: str) -> str:
+        try:
+            parsed = urlsplit(value)
+            hostname = parsed.hostname
+        except ValueError as error:
+            raise ValueError("media candidate URL is invalid") from error
+        if parsed.scheme != "https" or not hostname:
+            raise ValueError("media candidate URL must use HTTPS")
+        return value
+
+
 class InspectRequest(ApiModel):
     url: str
     preferred_languages: list[str] = Field(default_factory=list)
-    active_media_index: int | None = Field(default=None, ge=1)
+    active_media_index: int | None = Field(
+        default=None, ge=1, le=MAX_DATABASE_INTEGER
+    )
     client_duration_ms: int | None = Field(default=None, ge=0)
-    media_candidates: list[dict[str, Any]] = Field(default_factory=list, max_length=50)
+    media_candidates: list[MediaCandidateRequest] = Field(
+        default_factory=list, max_length=50
+    )
 
 
 class TrackResponse(ApiModel):
@@ -159,8 +187,8 @@ class LlmConfigRequest(ApiModel):
 
 class ContentRefRequest(ApiModel):
     platform: Literal["youtube", "x"]
-    source_content_id: str
-    media_index: int = Field(default=1, ge=1)
+    source_content_id: str = Field(min_length=1, max_length=100)
+    media_index: int = Field(default=1, ge=1, le=MAX_DATABASE_INTEGER)
 
     def to_domain(self) -> ContentRef:
         return ContentRef(
@@ -181,6 +209,16 @@ class AnalysisCreateRequest(ApiModel):
     media_url: str | None = None
     media_session_id: str | None = None
     force: bool = False
+
+    @field_validator("content_id")
+    @classmethod
+    def normalize_content_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            return str(uuid.UUID(value))
+        except (ValueError, AttributeError) as error:
+            raise ValueError("contentId must be a valid UUID") from error
 
     @model_validator(mode="after")
     def require_one_content_locator(self) -> AnalysisCreateRequest:
@@ -374,25 +412,23 @@ async def inspect_video(
         ) from error
     except SourceRegistryConfigurationError as error:
         raise _source_adapter_unavailable() from error
+    _validate_content_ref(ref)
     adapter = _source_adapter(source_registry, ref.platform)
     inspection = await _inspect_source(adapter, ref, request.preferred_languages)
-    duration_ms = (
+    inspected_duration_ms = (
         request.client_duration_ms
         if ref.platform == "x" and request.client_duration_ms is not None
         else inspection.duration_ms
     )
-    video = await _find_video_by_ref(session, ref)
-    if video is None:
-        video = _new_video(
-            ref,
-            title=_default_video_title(ref),
-            duration_ms=duration_ms,
-            source_url=request.url,
-        )
-        session.add(video)
-    else:
-        video.duration_ms = duration_ms
-        video.source_url = request.url
+    video, created = await _get_or_create_video(
+        session,
+        ref,
+        title=_default_video_title(ref),
+        duration_ms=inspected_duration_ms,
+    )
+    if not created and ref.platform == "youtube":
+        video.duration_ms = inspected_duration_ms
+    video.source_url = _source_url(ref)
     await session.commit()
     await session.refresh(video)
 
@@ -408,7 +444,7 @@ async def inspect_video(
         content_id=video.content_id,
         content_ref=ContentRefResponse.model_validate(ref, from_attributes=True),
         video_id=_legacy_video_id(video),
-        duration_ms=duration_ms,
+        duration_ms=video.duration_ms,
         source_status=inspection.source_status,
         transcript_source=inspection.transcript_source,
         available_languages=[] if ref.platform == "x" else tracks,
@@ -450,13 +486,12 @@ async def create_analysis(
     ):
         raise _api_error(422, "source_language_unavailable", "所选字幕语言不可读取")
     duration_ms = source_inspection.duration_ms or (video.duration_ms if video else 0)
-    video_is_new = video is None
     if video is None:
-        video = _new_video(
+        video, _ = await _get_or_create_video(
+            session,
             ref,
             title=request.title or _default_video_title(ref),
             duration_ms=duration_ms,
-            source_url=_source_url(ref),
         )
     else:
         if request.title:
@@ -466,7 +501,7 @@ async def create_analysis(
     version = transcript_version(inspection.segments)
     cache_key = analysis_cache_key(
         installation_id,
-        ref.stable_key,
+        _cache_content_key(ref),
         source_language,
         request.target_language,
         version,
@@ -537,9 +572,6 @@ async def create_analysis(
     )
     if (active_jobs or 0) >= settings.max_active_jobs_per_installation:
         raise _analysis_concurrency_error()
-
-    if video_is_new:
-        session.add(video)
 
     if existing is None:
         job_id = str(uuid.uuid4())
@@ -861,6 +893,35 @@ async def _find_video_by_ref(
     )
 
 
+async def _get_or_create_video(
+    session: AsyncSession,
+    ref: ContentRef,
+    *,
+    title: str,
+    duration_ms: int,
+) -> tuple[Video, bool]:
+    existing = await _find_video_by_ref(session, ref)
+    if existing is not None:
+        return existing, False
+
+    candidate = _new_video(
+        ref,
+        title=title,
+        duration_ms=duration_ms,
+        source_url=_source_url(ref),
+    )
+    try:
+        async with session.begin_nested():
+            session.add(candidate)
+            await session.flush()
+    except IntegrityError:
+        winner = await _find_video_by_ref(session, ref)
+        if winner is None:
+            raise
+        return winner, False
+    return candidate, True
+
+
 def _new_video(
     ref: ContentRef,
     *,
@@ -891,6 +952,10 @@ def _source_url(ref: ContentRef) -> str:
     return (
         f"https://x.com/i/status/{ref.source_content_id}/video/{ref.media_index}"
     )
+
+
+def _cache_content_key(ref: ContentRef) -> str:
+    return ref.source_content_id if ref.platform == "youtube" else ref.stable_key
 
 
 def _video_content_ref(video: Video) -> ContentRef:
@@ -963,9 +1028,17 @@ def _validate_video_id(video_id: str) -> None:
 
 
 def _validate_content_ref(ref: ContentRef) -> None:
+    if not 1 <= ref.media_index <= MAX_DATABASE_INTEGER:
+        raise _api_error(422, "invalid_content_ref", "视频内容引用无效")
     if ref.platform == "youtube":
         _validate_video_id(ref.source_content_id)
-    elif not ref.source_content_id.isdigit():
+    elif (
+        not ref.source_content_id.isascii()
+        or not ref.source_content_id.isdigit()
+        or len(ref.source_content_id) > 20
+        or int(ref.source_content_id) == 0
+        or int(ref.source_content_id) > MAX_X_SOURCE_CONTENT_ID
+    ):
         raise _api_error(422, "invalid_content_ref", "视频内容引用无效")
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -166,8 +167,14 @@ OTHER_AUTH_HEADERS = {
 
 @pytest.fixture
 async def api_context(tmp_path):
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'api.sqlite'}")
+    database_url = os.environ.get(
+        "ANALYSES_TEST_DATABASE_URL",
+        f"sqlite+aiosqlite:///{tmp_path / 'api.sqlite'}",
+    )
+    engine = create_async_engine(database_url)
     async with engine.begin() as connection:
+        if "ANALYSES_TEST_DATABASE_URL" in os.environ:
+            await connection.run_sync(Base.metadata.drop_all)
         await connection.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -205,6 +212,9 @@ async def api_context(tmp_path):
         assert registered.status_code == 201
         yield client, app, factory, dispatched
 
+    if "ANALYSES_TEST_DATABASE_URL" in os.environ:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.drop_all)
     await engine.dispose()
 
 
@@ -325,6 +335,163 @@ async def test_inspect_limits_media_candidates_to_fifty(api_context):
     )
 
     assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        {"url": "http://video.twimg.com/file.mp4", "kind": "mp4", "capturedAt": 1},
+        {"url": "https://video.twimg.com/file.mp4", "kind": "other", "capturedAt": 1},
+        {"url": "https://video.twimg.com/file.mp4", "kind": "mp4", "capturedAt": -1},
+        {"url": "https://video.twimg.com/file.mp4", "kind": "mp4", "capturedAt": True},
+        {
+            "url": f"https://video.twimg.com/{'a' * 2000}",
+            "kind": "mp4",
+            "capturedAt": 1,
+        },
+    ],
+)
+async def test_inspect_rejects_invalid_media_candidates(api_context, candidate):
+    client, app, _, _ = api_context
+    app.dependency_overrides[get_source_registry] = lambda: SourceRegistry(
+        [FakeXAdapter()]
+    )
+
+    response = await client.post(
+        "/v1/videos/inspect",
+        json={
+            "url": "https://x.com/viktoroddy/status/2075545587093807111/video/1",
+            "mediaCandidates": [candidate],
+        },
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_x_provisional_duration_cannot_overwrite_existing_content(api_context):
+    client, app, factory, _ = api_context
+    app.dependency_overrides[get_source_registry] = lambda: SourceRegistry(
+        [FakeXAdapter()]
+    )
+    registered = await client.post(
+        "/v1/installations/register",
+        json={
+            "installationId": OTHER_INSTALLATION_ID,
+            "installationToken": OTHER_INSTALLATION_TOKEN,
+        },
+    )
+    assert registered.status_code == 201
+    request = {
+        "url": "https://x.com/viktoroddy/status/2075545587093807111/video/1",
+        "clientDurationMs": 1_283_000,
+    }
+
+    first = await client.post("/v1/videos/inspect", json=request)
+    second = await client.post(
+        "/v1/videos/inspect",
+        json={**request, "clientDurationMs": 42},
+        headers=OTHER_AUTH_HEADERS,
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["contentId"] == first.json()["contentId"]
+    assert second.json()["durationMs"] == 1_283_000
+    async with factory() as session:
+        video = await session.scalar(
+            select(Video).where(Video.content_id == first.json()["contentId"])
+        )
+        assert video.duration_ms == 1_283_000
+
+
+@pytest.mark.asyncio
+async def test_inspect_stores_only_canonical_source_url(api_context):
+    client, app, factory, _ = api_context
+    app.dependency_overrides[get_source_registry] = lambda: SourceRegistry(
+        [FakeXAdapter()]
+    )
+    media_url = "https://video.twimg.com/amplify_video/private-marker.mp4"
+
+    response = await client.post(
+        "/v1/videos/inspect",
+        json={
+            "url": (
+                "https://x.com/viktoroddy/status/2075545587093807111/video/1"
+                "?private_marker=discard"
+            ),
+            "mediaCandidates": [
+                {"url": media_url, "kind": "mp4", "capturedAt": 1}
+            ],
+        },
+    )
+    repeated = await client.post(
+        "/v1/videos/inspect",
+        json={
+            "url": (
+                "https://x.com/another/status/2075545587093807111/video/1"
+                "?private_marker=still-discard"
+            ),
+            "mediaCandidates": [
+                {"url": media_url, "kind": "mp4", "capturedAt": 2}
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert repeated.status_code == 200
+    assert repeated.json()["contentId"] == response.json()["contentId"]
+    async with factory() as session:
+        video = await session.scalar(
+            select(Video).where(Video.content_id == response.json()["contentId"])
+        )
+        assert video.source_url == (
+            "https://x.com/i/status/2075545587093807111/video/1"
+        )
+        assert "private_marker" not in video.source_url
+        assert media_url not in video.source_url
+
+
+@pytest.mark.asyncio
+async def test_concurrent_inspects_share_one_content_row(api_context):
+    client, app, factory, _ = api_context
+    app.dependency_overrides[get_source_registry] = lambda: SourceRegistry(
+        [FakeXAdapter()]
+    )
+    registered = await client.post(
+        "/v1/installations/register",
+        json={
+            "installationId": OTHER_INSTALLATION_ID,
+            "installationToken": OTHER_INSTALLATION_TOKEN,
+        },
+    )
+    assert registered.status_code == 201
+    payload = {
+        "url": "https://x.com/viktoroddy/status/2075545587093807111/video/1",
+        "clientDurationMs": 1_283_000,
+    }
+
+    first, second = await asyncio.gather(
+        client.post("/v1/videos/inspect", json=payload),
+        client.post(
+            "/v1/videos/inspect", json=payload, headers=OTHER_AUTH_HEADERS
+        ),
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["contentId"] == second.json()["contentId"]
+    async with factory() as session:
+        videos = (
+            await session.scalars(
+                select(Video).where(
+                    Video.platform == "x",
+                    Video.source_content_id == "2075545587093807111",
+                )
+            )
+        ).all()
+        assert len(videos) == 1
 
 
 @pytest.mark.asyncio
@@ -606,6 +773,98 @@ async def test_create_requires_exactly_one_content_locator(api_context, locator)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "locator",
+    [
+        {"contentId": ""},
+        {"contentId": "not-a-uuid"},
+        {
+            "contentRef": {
+                "platform": "x",
+                "sourceContentId": "",
+                "mediaIndex": 1,
+            }
+        },
+        {
+            "contentRef": {
+                "platform": "x",
+                "sourceContentId": "0",
+                "mediaIndex": 1,
+            }
+        },
+        {
+            "contentRef": {
+                "platform": "x",
+                "sourceContentId": "٢٠٧٥٥٤٥٥٨٧٠٩٣٨٠٧١١١",
+                "mediaIndex": 1,
+            }
+        },
+        {
+            "contentRef": {
+                "platform": "x",
+                "sourceContentId": "1" * 21,
+                "mediaIndex": 1,
+            }
+        },
+        {
+            "contentRef": {
+                "platform": "x",
+                "sourceContentId": "9" * 20,
+                "mediaIndex": 1,
+            }
+        },
+        {
+            "contentRef": {
+                "platform": "x",
+                "sourceContentId": "2075545587093807111",
+                "mediaIndex": 2_147_483_648,
+            }
+        },
+        {
+            "contentRef": {
+                "platform": "youtube",
+                "sourceContentId": "too-short",
+                "mediaIndex": 1,
+            }
+        },
+    ],
+)
+async def test_create_rejects_invalid_content_locators(api_context, locator):
+    client, app, _, dispatched = api_context
+    app.dependency_overrides[get_source_registry] = lambda: SourceRegistry(
+        [FakeXAdapter()]
+    )
+
+    response = await client.post(
+        "/v1/analyses",
+        json={**locator, "sourceLanguage": "auto", "llmConfig": LLM_CONFIG},
+    )
+
+    assert response.status_code == 422
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_inspect_rejects_media_index_above_database_integer_limit(api_context):
+    client, app, _, _ = api_context
+    app.dependency_overrides[get_source_registry] = lambda: SourceRegistry(
+        [FakeXAdapter()]
+    )
+
+    response = await client.post(
+        "/v1/videos/inspect",
+        json={
+            "url": (
+                "https://x.com/viktoroddy/status/2075545587093807111/video/"
+                "2147483648"
+            )
+        },
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_llm_test_rejects_invalid_url_without_network_call(api_context):
     client, _, _, _ = api_context
     response = await client.post(
@@ -644,6 +903,34 @@ async def test_create_reuses_active_and_completed_jobs(api_context):
     completed = await client.post("/v1/analyses", json=payload)
     assert completed.status_code == 200
     assert completed.json()["cacheHit"] is True
+
+
+@pytest.mark.asyncio
+async def test_legacy_youtube_cache_key_reuses_completed_job(api_context):
+    client, _, factory, dispatched = api_context
+    payload = {
+        "videoId": "aircAruvnKk",
+        "sourceLanguage": "en",
+        "targetLanguage": "zh-Hans",
+        "llmConfig": LLM_CONFIG,
+    }
+    first = await client.post("/v1/analyses", json=payload)
+    job_id = first.json()["jobId"]
+    async with factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        job.cache_key = job.cache_key.replace(
+            "youtube:aircAruvnKk:1", "aircAruvnKk"
+        )
+        job.status = "completed"
+        job.completed_at = datetime.now(timezone.utc)
+        await session.commit()
+
+    cached = await client.post("/v1/analyses", json=payload)
+
+    assert cached.status_code == 200
+    assert cached.json()["jobId"] == job_id
+    assert cached.json()["cacheHit"] is True
+    assert dispatched == [job_id]
 
 
 @pytest.mark.asyncio
@@ -742,6 +1029,56 @@ async def test_active_job_limit_is_independent_per_installation(api_context):
     assert other.status_code == 202
     assert first.json()["jobId"] != other.json()["jobId"]
     assert len(dispatched) == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_x_creates_share_one_content_row_across_installations(
+    api_context,
+):
+    client, app, factory, dispatched = api_context
+    app.dependency_overrides[get_source_registry] = lambda: SourceRegistry(
+        [FakeXAdapter()]
+    )
+    registered = await client.post(
+        "/v1/installations/register",
+        json={
+            "installationId": OTHER_INSTALLATION_ID,
+            "installationToken": OTHER_INSTALLATION_TOKEN,
+        },
+    )
+    assert registered.status_code == 201
+    payload = {
+        "contentRef": {
+            "platform": "x",
+            "sourceContentId": "2075545587093807111",
+            "mediaIndex": 1,
+        },
+        "sourceLanguage": "auto",
+        "llmConfig": LLM_CONFIG,
+    }
+
+    first, second = await asyncio.gather(
+        client.post("/v1/analyses", json=payload),
+        client.post("/v1/analyses", json=payload, headers=OTHER_AUTH_HEADERS),
+    )
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+    assert first.json()["contentId"] == second.json()["contentId"]
+    assert first.json()["jobId"] != second.json()["jobId"]
+    assert len(dispatched) == 2
+    async with factory() as session:
+        videos = (
+            await session.scalars(
+                select(Video).where(
+                    Video.platform == "x",
+                    Video.source_content_id == "2075545587093807111",
+                )
+            )
+        ).all()
+        jobs = (await session.scalars(select(AnalysisJob))).all()
+        assert len(videos) == 1
+        assert {job.content_id for job in jobs} == {videos[0].content_id}
 
 
 @pytest.mark.asyncio
