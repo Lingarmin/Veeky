@@ -48,6 +48,7 @@ from app.services.llm import (
     normalize_chat_completions_url,
     normalize_provider_config,
 )
+from app.services.media_upload import expire_complete_upload_if_unreferenced
 from app.security.installations import require_installation
 from app.security.credentials import JobCredentialCipher
 from app.security.quotas import (
@@ -588,24 +589,18 @@ async def create_analysis(
             try:
                 dispatcher(existing.id)
             except WorkerUnavailableError as error:
-                existing.status = "failed"
-                existing.failure_code = "worker_unavailable"
-                existing.failure_detail = str(error)
-                existing.completed_at = datetime.now(timezone.utc)
-                _clear_llm_credential(existing)
-                await session.commit()
+                await _fail_dispatch(
+                    session, settings, existing, "worker_unavailable", str(error)
+                )
                 raise _api_error(
                     503,
                     "worker_unavailable",
                     "后台任务服务未启动，请运行 docker compose up -d 后重试",
                 ) from error
             except Exception as error:
-                existing.status = "failed"
-                existing.failure_code = "dispatch_failed"
-                existing.failure_detail = str(error)
-                existing.completed_at = datetime.now(timezone.utc)
-                _clear_llm_credential(existing)
-                await session.commit()
+                await _fail_dispatch(
+                    session, settings, existing, "dispatch_failed", str(error)
+                )
                 raise _api_error(
                     503, "dispatch_failed", "后台任务暂时无法启动，请重试"
                 ) from error
@@ -721,24 +716,16 @@ async def create_analysis(
     try:
         dispatcher(job.id)
     except WorkerUnavailableError as error:
-        job.status = "failed"
-        job.failure_code = "worker_unavailable"
-        job.failure_detail = str(error)
-        job.completed_at = datetime.now(timezone.utc)
-        _clear_llm_credential(job)
-        await session.commit()
+        await _fail_dispatch(
+            session, settings, job, "worker_unavailable", str(error)
+        )
         raise _api_error(
             503,
             "worker_unavailable",
             "后台任务服务未启动，请运行 docker compose up -d 后重试",
         ) from error
     except Exception as error:
-        job.status = "failed"
-        job.failure_code = "dispatch_failed"
-        job.failure_detail = str(error)
-        job.completed_at = datetime.now(timezone.utc)
-        _clear_llm_credential(job)
-        await session.commit()
+        await _fail_dispatch(session, settings, job, "dispatch_failed", str(error))
         raise _api_error(
             503, "dispatch_failed", "后台任务暂时无法启动，请重试"
         ) from error
@@ -1164,6 +1151,34 @@ def _clear_llm_credential(job: AnalysisJob) -> None:
     job.llm_credential_ciphertext = None
     job.llm_credential_expires_at = None
     job.media_url_ciphertext = None
+
+
+async def _fail_dispatch(
+    session: AsyncSession,
+    settings: Settings,
+    job: AnalysisJob,
+    failure_code: str,
+    failure_detail: str,
+) -> None:
+    job.status = "failed"
+    job.failure_code = failure_code
+    job.failure_detail = failure_detail
+    job.completed_at = datetime.now(timezone.utc)
+    _clear_llm_credential(job)
+    media_session_id = job.media_session_id
+    installation_id = job.installation_id
+    content_id = job.content_id
+    job_id = job.id
+    await session.commit()
+    if media_session_id:
+        await expire_complete_upload_if_unreferenced(
+            session,
+            settings,
+            session_id=media_session_id,
+            installation_id=installation_id,
+            content_id=content_id,
+            excluding_job_id=job_id,
+        )
 
 
 def _validate_direct_media_url(url: str) -> None:

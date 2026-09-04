@@ -6,6 +6,7 @@ import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -26,12 +27,14 @@ from app.api.analyses import (
     get_video_metadata_service,
     _llm_snapshot,
 )
-from app.core.settings import Settings
+import app.services.media_upload as media_upload_service
+from app.core.settings import Settings, get_settings
 from app.db.models import (
     AnalysisResult,
     AnalysisJob,
     Base,
     Installation,
+    MediaUploadSession,
     TranscriptSegment as StoredTranscriptSegment,
     TranscriptTrack,
     Translation,
@@ -216,7 +219,12 @@ async def api_context(tmp_path):
         await connection.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
 
-    app = create_app(Settings(llm_credential_encryption_key=VALID_TEST_KEY))
+    app = create_app(
+        Settings(
+            llm_credential_encryption_key=VALID_TEST_KEY,
+            media_temp_root=str(tmp_path / "media"),
+        )
+    )
     dispatched = []
 
     async def session_dependency() -> AsyncIterator[AsyncSession]:
@@ -2039,3 +2047,234 @@ async def test_create_reports_when_the_background_worker_is_unavailable(api_cont
         assert job.failure_code == "worker_unavailable"
         assert job.llm_credential_ciphertext is None
         assert job.llm_credential_expires_at is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("dispatch_error", "failure_code"),
+    [
+        (WorkerUnavailableError("Worker is unavailable"), "worker_unavailable"),
+        (ConnectionError("redis unavailable"), "dispatch_failed"),
+    ],
+)
+async def test_x_create_dispatch_failure_expires_its_completed_upload(
+    api_context, dispatch_error, failure_code
+):
+    client, app, factory, _ = api_context
+    app.dependency_overrides[get_source_registry] = lambda: SourceRegistry(
+        [FakeXAdapter()]
+    )
+
+    inspected = await client.post(
+        "/v1/videos/inspect",
+        json={
+            "url": "https://x.com/example/status/2075545587093807111",
+            "activeMediaIndex": 1,
+        },
+    )
+    assert inspected.status_code == 200
+    content_id = inspected.json()["contentId"]
+    settings = app.dependency_overrides[get_settings]()
+    directory_key = "88888888-8888-4888-8888-888888888888"
+    upload_dir = Path(settings.media_temp_root) / directory_key
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "media.mp4").write_bytes(b"media")
+    (upload_dir / ".media.mp4.assembling").write_bytes(b"temporary")
+    (upload_dir / "part-00000000.bin").write_bytes(b"part")
+    async with factory() as session:
+        session.add(
+            MediaUploadSession(
+                id="dispatch-upload",
+                installation_id=INSTALLATION_ID,
+                content_id=content_id,
+                status="complete",
+                expected_bytes=5,
+                received_bytes=5,
+                media_kind="mp4",
+                part_count=1,
+                part_size_bytes=5,
+                directory_key=directory_key,
+                expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            )
+        )
+        await session.commit()
+
+    def fail_dispatch(_job_id):
+        raise dispatch_error
+
+    app.dependency_overrides[get_job_dispatcher] = lambda: fail_dispatch
+    response = await client.post(
+        "/v1/analyses",
+        json={
+            "contentId": content_id,
+            "sourceLanguage": "auto",
+            "targetLanguage": "zh-Hans",
+            "mediaSessionId": "dispatch-upload",
+            "llmConfig": LLM_CONFIG,
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == failure_code
+    async with factory() as session:
+        job = await session.scalar(
+            select(AnalysisJob).where(AnalysisJob.content_id == content_id)
+        )
+        upload = await session.get(MediaUploadSession, "dispatch-upload")
+        assert job.status == "failed"
+        assert job.failure_code == failure_code
+        assert job.llm_credential_ciphertext is None
+        assert job.llm_credential_expires_at is None
+        assert upload.status == "expired"
+        assert upload.received_bytes == 0
+    assert not upload_dir.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("dispatch_error", "failure_code"),
+    [
+        (WorkerUnavailableError("Worker is unavailable"), "worker_unavailable"),
+        (ConnectionError("redis unavailable"), "dispatch_failed"),
+    ],
+)
+async def test_existing_job_dispatch_failure_expires_its_completed_upload(
+    api_context, dispatch_error, failure_code
+):
+    client, app, factory, _ = api_context
+    payload = {
+        "videoId": "aircAruvnKk",
+        "sourceLanguage": "en",
+        "targetLanguage": "zh-Hans",
+        "llmConfig": LLM_CONFIG,
+    }
+    created = await client.post("/v1/analyses", json=payload)
+    job_id = created.json()["jobId"]
+    settings = app.dependency_overrides[get_settings]()
+    directory_key = "99999999-9999-4999-8999-999999999999"
+    upload_dir = Path(settings.media_temp_root) / directory_key
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "media.mp4").write_bytes(b"media")
+    (upload_dir / ".temporary").write_bytes(b"temporary")
+    async with factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        upload = MediaUploadSession(
+            id="existing-dispatch-upload",
+            installation_id=job.installation_id,
+            content_id=job.content_id,
+            status="complete",
+            expected_bytes=5,
+            received_bytes=5,
+            media_kind="mp4",
+            part_count=1,
+            part_size_bytes=5,
+            directory_key=directory_key,
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        job.status = "analyzing"
+        job.media_session_id = upload.id
+        session.add(upload)
+        await session.commit()
+
+    def fail_dispatch(_job_id):
+        raise dispatch_error
+
+    app.dependency_overrides[get_job_dispatcher] = lambda: fail_dispatch
+    response = await client.post("/v1/analyses", json=payload)
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == failure_code
+    async with factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        upload = await session.get(MediaUploadSession, "existing-dispatch-upload")
+        assert job.status == "failed"
+        assert job.failure_code == failure_code
+        assert job.llm_credential_ciphertext is None
+        assert job.llm_credential_expires_at is None
+        assert upload.status == "expired"
+        assert upload.received_bytes == 0
+    assert not upload_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cleanup_storage_failure_preserves_error_and_retries_later(
+    api_context, monkeypatch
+):
+    client, app, factory, _ = api_context
+    app.dependency_overrides[get_source_registry] = lambda: SourceRegistry(
+        [FakeXAdapter()]
+    )
+    inspected = await client.post(
+        "/v1/videos/inspect",
+        json={
+            "url": "https://x.com/example/status/2075545587093807111",
+            "activeMediaIndex": 1,
+        },
+    )
+    content_id = inspected.json()["contentId"]
+    settings = app.dependency_overrides[get_settings]()
+    directory_key = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    upload_dir = Path(settings.media_temp_root) / directory_key
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "media.mp4").write_bytes(b"media")
+    async with factory() as session:
+        session.add(
+            MediaUploadSession(
+                id="retry-cleanup-upload",
+                installation_id=INSTALLATION_ID,
+                content_id=content_id,
+                status="complete",
+                expected_bytes=5,
+                received_bytes=5,
+                media_kind="mp4",
+                part_count=1,
+                part_size_bytes=5,
+                directory_key=directory_key,
+                expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            )
+        )
+        await session.commit()
+
+    def fail_dispatch(_job_id):
+        raise ConnectionError("redis unavailable")
+
+    def fail_cleanup(*_args):
+        raise OSError("storage offline")
+
+    app.dependency_overrides[get_job_dispatcher] = lambda: fail_dispatch
+    with monkeypatch.context() as cleanup_patch:
+        cleanup_patch.setattr(
+            media_upload_service, "_remove_session_directory_sync", fail_cleanup
+        )
+        try:
+            response = await client.post(
+                "/v1/analyses",
+                json={
+                    "contentId": content_id,
+                    "sourceLanguage": "auto",
+                    "targetLanguage": "zh-Hans",
+                    "mediaSessionId": "retry-cleanup-upload",
+                    "llmConfig": LLM_CONFIG,
+                },
+            )
+        except media_upload_service.MediaUploadError:
+            pytest.fail("cleanup failure replaced the dispatch failure response")
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "dispatch_failed"
+    async with factory() as session:
+        job = await session.scalar(
+            select(AnalysisJob).where(AnalysisJob.content_id == content_id)
+        )
+        upload = await session.get(MediaUploadSession, "retry-cleanup-upload")
+        assert job.status == "failed"
+        assert job.llm_credential_ciphertext is None
+        assert upload.status == "complete"
+        expires_at = upload.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        assert expires_at <= datetime.now(timezone.utc)
+        assert upload_dir.is_dir()
+        assert await media_upload_service.cleanup_expired_uploads(session, settings) == 1
+
+    assert not upload_dir.exists()

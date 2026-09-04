@@ -457,6 +457,48 @@ async def expire_complete_upload_if_unreferenced(
     excluding_job_id: str,
 ) -> bool:
     await _restart_write_transaction(database)
+    upload = await _lock_unreferenced_complete_upload(
+        database,
+        session_id=session_id,
+        installation_id=installation_id,
+        content_id=content_id,
+        excluding_job_id=excluding_job_id,
+    )
+    if upload is None:
+        await database.rollback()
+        return False
+    try:
+        await _expire_locked(database, settings, upload)
+    except MediaUploadError as error:
+        if error.code != "storage_unavailable":
+            raise
+        await _restart_write_transaction(database)
+        upload = await _lock_unreferenced_complete_upload(
+            database,
+            session_id=session_id,
+            installation_id=installation_id,
+            content_id=content_id,
+            excluding_job_id=excluding_job_id,
+        )
+        if upload is None:
+            await database.rollback()
+            return False
+        retry_at = utc_now()
+        upload.updated_at = retry_at
+        upload.expires_at = retry_at
+        await database.commit()
+        return False
+    return True
+
+
+async def _lock_unreferenced_complete_upload(
+    database: AsyncSession,
+    *,
+    session_id: str,
+    installation_id: str,
+    content_id: str,
+    excluding_job_id: str,
+) -> MediaUploadSession | None:
     upload = await database.scalar(
         select(MediaUploadSession)
         .options(selectinload(MediaUploadSession.parts))
@@ -469,8 +511,7 @@ async def expire_complete_upload_if_unreferenced(
         .with_for_update()
     )
     if upload is None:
-        await database.rollback()
-        return False
+        return None
     other_job_id = await database.scalar(
         select(AnalysisJob.id).where(
             AnalysisJob.id != excluding_job_id,
@@ -478,10 +519,8 @@ async def expire_complete_upload_if_unreferenced(
         )
     )
     if other_job_id is not None:
-        await database.rollback()
-        return False
-    await _expire_locked(database, settings, upload)
-    return True
+        return None
+    return upload
 
 
 async def cleanup_expired_uploads(
