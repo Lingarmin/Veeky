@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import yaml
 
 import app.services.asr as asr_module
 from app.core.settings import Settings
@@ -113,6 +114,19 @@ class FakeWhisperFactory:
             }
         )
         return self.model
+
+
+class CountingText(str):
+    comparisons = 0
+
+    def strip(self) -> CountingText:
+        return self
+
+    def __eq__(self, other: object) -> bool:
+        type(self).comparisons += 1
+        return super().__eq__(other)
+
+    __hash__ = str.__hash__
 
 
 def raw_segment(start: Any, end: Any, text: Any) -> SimpleNamespace:
@@ -335,6 +349,20 @@ def test_normalization_keeps_adjacent_identical_text():
     )
 
     assert [segment.text for segment in segments] == ["repeat", "repeat"]
+
+
+def test_normalization_does_not_compare_each_segment_with_the_full_history():
+    CountingText.comparisons = 0
+    segment_count = 2_000
+    raw_segments = [
+        raw_segment(index, index + 0.5, CountingText(f"segment-{index}"))
+        for index in range(segment_count)
+    ]
+
+    segments = normalize_whisper_segments(raw_segments)
+
+    assert len(segments) == segment_count
+    assert CountingText.comparisons < segment_count * 4
 
 
 def test_transcriber_rejects_an_empty_normalized_transcript(tmp_path: Path):
@@ -580,7 +608,28 @@ def test_container_smoke_does_not_require_existing_service_containers():
 
     assert "docker compose images" not in script
     assert "docker compose run --rm --no-deps" in script
+    assert "mktemp -d" in script
+    assert "COMPOSE_PROJECT_NAME" in script
+    assert "VEEKY_ENV_FILE" in script
+    assert "missing.env" in script
+    assert script.count("-c '\nset -eu") == 2
+    assert "import faster_whisper" in script
+    assert "import ctranslate2" in script
     assert 'version("faster-whisper") == "1.2.1"' in script
     assert 'version("ctranslate2") == "4.8.2"' in script
     assert "touch /models/whisper/.asr-smoke" in script
     assert "touch /var/lib/veeky/media/.asr-smoke" in script
+
+
+def test_compose_requires_production_env_and_mounts_the_model_volume_parent():
+    compose = yaml.safe_load(
+        (Path(__file__).parents[2] / "docker-compose.yml").read_text()
+    )
+    services = compose["services"]
+
+    expected_env_file = ["${VEEKY_ENV_FILE:-./api/.env}"]
+    assert services["api"]["env_file"] == expected_env_file
+    assert services["worker"]["env_file"] == expected_env_file
+    assert services["scheduler"]["env_file"] == expected_env_file
+    assert "whisper_models:/models:ro" in services["api"]["volumes"]
+    assert "whisper_models:/models" in services["worker"]["volumes"]

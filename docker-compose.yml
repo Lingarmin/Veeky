@@ -3,9 +3,8 @@ services:
     build:
       context: ./api
     env_file:
-      - path: ./api/.env
-        required: false
-    # Includes LLM_CREDENTIAL_ENCRYPTION_KEY and quota settings from api/.env.
+      - ${VEEKY_ENV_FILE:-./api/.env}
+    # Includes LLM_CREDENTIAL_ENCRYPTION_KEY and quota settings from the configured env file.
     environment:
       RUNNING_IN_DOCKER: "true"
       DATABASE_URL: postgresql+asyncpg://youtube_preview:${POSTGRES_PASSWORD:-youtube_preview}@postgresql:5432/youtube_preview
@@ -30,7 +29,7 @@ services:
       retries: 6
       start_period: 15s
     volumes:
-      - whisper_models:/models/whisper:ro
+      - whisper_models:/models:ro
       - media_temp:/var/lib/veeky/media
     restart: unless-stopped
 
@@ -38,9 +37,8 @@ services:
     build:
       context: ./api
     env_file:
-      - path: ./api/.env
-        required: false
-    # Includes LLM_CREDENTIAL_ENCRYPTION_KEY and quota settings from api/.env.
+      - ${VEEKY_ENV_FILE:-./api/.env}
+    # Includes LLM_CREDENTIAL_ENCRYPTION_KEY and quota settings from the configured env file.
     environment:
       RUNNING_IN_DOCKER: "true"
       DATABASE_URL: postgresql+asyncpg://youtube_preview:${POSTGRES_PASSWORD:-youtube_preview}@postgresql:5432/youtube_preview
@@ -62,7 +60,7 @@ services:
       retries: 4
       start_period: 25s
     volumes:
-      - whisper_models:/models/whisper
+      - whisper_models:/models
       - media_temp:/var/lib/veeky/media
     restart: unless-stopped
 
@@ -70,8 +68,7 @@ services:
     build:
       context: ./api
     env_file:
-      - path: ./api/.env
-        required: false
+      - ${VEEKY_ENV_FILE:-./api/.env}
     environment:
       RUNNING_IN_DOCKER: "true"
       DATABASE_URL: postgresql+asyncpg://youtube_preview:${POSTGRES_PASSWORD:-youtube_preview}@postgresql:5432/youtube_preview

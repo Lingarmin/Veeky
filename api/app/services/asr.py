@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import threading
+from bisect import bisect_left
 from collections.abc import Callable, Iterable
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -59,7 +60,7 @@ def normalize_whisper_segments(
     raw_segments: Iterable[Any],
 ) -> list[TranscriptSegment]:
     result: list[TranscriptSegment] = []
-    emitted_raw_ranges: list[tuple[str, int, int]] = []
+    emitted_raw_ranges_by_text: dict[str, list[tuple[int, int]]] = {}
     previous_end_ms = 0
 
     for raw_segment in raw_segments:
@@ -80,12 +81,23 @@ def normalize_whisper_segments(
         raw_end_ms = max(0, raw_end_ms)
         if raw_end_ms <= raw_start_ms:
             continue
-        if any(
-            text == emitted_text
-            and raw_start_ms < emitted_end_ms
-            and emitted_start_ms < raw_end_ms
-            for emitted_text, emitted_start_ms, emitted_end_ms in emitted_raw_ranges
-        ):
+        matching_ranges = emitted_raw_ranges_by_text.get(text)
+        insertion_index = (
+            bisect_left(matching_ranges, (raw_start_ms, raw_end_ms))
+            if matching_ranges
+            else 0
+        )
+        overlaps_previous = (
+            matching_ranges is not None
+            and insertion_index > 0
+            and matching_ranges[insertion_index - 1][1] > raw_start_ms
+        )
+        overlaps_next = (
+            matching_ranges is not None
+            and insertion_index < len(matching_ranges)
+            and matching_ranges[insertion_index][0] < raw_end_ms
+        )
+        if overlaps_previous or overlaps_next:
             continue
 
         start_ms = max(previous_end_ms, raw_start_ms)
@@ -100,7 +112,10 @@ def normalize_whisper_segments(
                 text=text,
             )
         )
-        emitted_raw_ranges.append((text, raw_start_ms, raw_end_ms))
+        if matching_ranges is None:
+            emitted_raw_ranges_by_text[text] = [(raw_start_ms, raw_end_ms)]
+        else:
+            matching_ranges.insert(insertion_index, (raw_start_ms, raw_end_ms))
         previous_end_ms = raw_end_ms
 
     return result
