@@ -161,15 +161,10 @@ class FasterWhisperTranscriber:
                 return self._model
             try:
                 self._model = self._factory(
-                    model_size_or_path=ASR_MODEL_REPO,
+                    model_size_or_path=self.model_size,
                     device=self.device,
                     compute_type=self.compute_type,
                     download_root=self.model_dir,
-                    revision=ASR_MODEL_REVISION,
-                    local_files_only=False,
-                    device_index=0,
-                    cpu_threads=0,
-                    num_workers=1,
                 )
             except Exception:
                 logger.error("ASR model initialization failed")
@@ -252,10 +247,28 @@ def _normalize_language(language: Any) -> str:
     return canonical
 
 
-def _create_whisper_model(**kwargs: Any) -> Any:
+def _create_whisper_model(
+    *,
+    model_size_or_path: str,
+    device: str,
+    compute_type: str,
+    download_root: str,
+) -> Any:
     from faster_whisper import WhisperModel
 
-    return WhisperModel(**kwargs)
+    if model_size_or_path != "small":
+        raise ValueError("only the small ASR model is supported")
+    return WhisperModel(
+        model_size_or_path=ASR_MODEL_REPO,
+        device=device,
+        compute_type=compute_type,
+        download_root=download_root,
+        revision=ASR_MODEL_REVISION,
+        local_files_only=False,
+        device_index=0,
+        cpu_threads=0,
+        num_workers=1,
+    )
 
 
 _default_transcriber: FasterWhisperTranscriber | None = None

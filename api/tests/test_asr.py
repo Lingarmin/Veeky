@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import threading
 import time
 import tomllib
@@ -95,8 +96,22 @@ class FakeWhisperFactory:
         self.model = model
         self.calls: list[dict[str, Any]] = []
 
-    def __call__(self, **kwargs: Any) -> FakeWhisperModel:
-        self.calls.append(kwargs)
+    def __call__(
+        self,
+        *,
+        model_size_or_path: str,
+        device: str,
+        compute_type: str,
+        download_root: str,
+    ) -> FakeWhisperModel:
+        self.calls.append(
+            {
+                "model_size_or_path": model_size_or_path,
+                "device": device,
+                "compute_type": compute_type,
+                "download_root": download_root,
+            }
+        )
         return self.model
 
 
@@ -114,15 +129,10 @@ def test_transcriber_uses_cpu_small_int8_and_returns_language(tmp_path: Path):
 
     assert factory.calls == [
         {
-            "model_size_or_path": "Systran/faster-whisper-small",
+            "model_size_or_path": "small",
             "device": "cpu",
             "compute_type": "int8",
             "download_root": "/models/whisper",
-            "revision": EXPECTED_MODEL_REVISION,
-            "local_files_only": False,
-            "device_index": 0,
-            "cpu_threads": 0,
-            "num_workers": 1,
         }
     ]
     assert model.calls == [
@@ -167,6 +177,43 @@ def test_asr_version_is_deterministic_and_contains_runtime_parameters():
 def test_model_revision_matches_the_verified_hugging_face_metadata():
     assert asr_module.ASR_MODEL_REPO == "Systran/faster-whisper-small"
     assert asr_module.ASR_MODEL_REVISION == EXPECTED_MODEL_REVISION
+
+
+def test_default_factory_pins_the_model_repository_and_runtime_options(monkeypatch):
+    model = object()
+    calls: list[dict[str, Any]] = []
+
+    def whisper_model(**kwargs: Any) -> object:
+        calls.append(kwargs)
+        return model
+
+    monkeypatch.setitem(
+        sys.modules,
+        "faster_whisper",
+        SimpleNamespace(WhisperModel=whisper_model),
+    )
+
+    result = asr_module._create_whisper_model(
+        model_size_or_path="small",
+        device="cpu",
+        compute_type="int8",
+        download_root="/models/whisper",
+    )
+
+    assert result is model
+    assert calls == [
+        {
+            "model_size_or_path": "Systran/faster-whisper-small",
+            "device": "cpu",
+            "compute_type": "int8",
+            "download_root": "/models/whisper",
+            "revision": EXPECTED_MODEL_REVISION,
+            "local_files_only": False,
+            "device_index": 0,
+            "cpu_threads": 0,
+            "num_workers": 1,
+        }
+    ]
 
 
 def test_transcriber_rejects_a_model_size_that_does_not_match_the_pinned_repo():
