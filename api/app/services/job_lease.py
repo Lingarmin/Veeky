@@ -179,11 +179,19 @@ async def timeout_job_delivery(
     job_id: str,
     lease_token: str | None,
 ) -> tuple[str | None, datetime | None]:
-    ownership_condition = (
+    await session.scalar(
+        select(AnalysisJob.id)
+        .where(AnalysisJob.id == job_id)
+        .with_for_update()
+    )
+    now, _ = await _lease_timestamps(session, 1)
+    ownership_conditions = [
         AnalysisJob.lease_token == lease_token
         if lease_token is not None
         else AnalysisJob.lease_token.is_(None)
-    )
+    ]
+    if lease_token is not None:
+        ownership_conditions.append(AnalysisJob.lease_expires_at > now)
     status_condition = (
         AnalysisJob.status.in_(ACTIVE_JOB_STATUSES)
         if lease_token is not None
@@ -195,13 +203,13 @@ async def timeout_job_delivery(
             .where(
                 AnalysisJob.id == job_id,
                 status_condition,
-                ownership_condition,
+                *ownership_conditions,
             )
             .values(
                 status="failed",
                 failure_code="analysis_timeout",
                 failure_detail=None,
-                completed_at=datetime.now(timezone.utc),
+                completed_at=now,
                 lease_token=None,
                 lease_expires_at=None,
                 llm_credential_ciphertext=None,

@@ -32,7 +32,11 @@ from app.main import create_app
 from app.security.installations import hash_installation_token
 from app.security.quotas import get_quota_limiter
 from app.services import media_upload
-from app.services.job_lease import claim_job_lease, update_owned_job
+from app.services.job_lease import (
+    claim_job_lease,
+    timeout_job_delivery,
+    update_owned_job,
+)
 from app.services.media_upload import (
     MediaUploadError,
     cleanup_expired_uploads,
@@ -1785,6 +1789,132 @@ async def test_postgres_job_lease_claim_and_expiry_takeover_are_atomic(
             lease_seconds=60,
             values={"status": "analyzing"},
         )
+
+
+@pytest.mark.asyncio
+async def test_postgres_expired_soft_timeout_cannot_finish_before_takeover(
+    postgres_media_context,
+):
+    factory, _ = postgres_media_context
+    job_id = "pg-timeout-before"
+    expired_token = "expired-timeout-token"
+    async with factory() as session:
+        session.add(
+            AnalysisJob(
+                id=job_id,
+                installation_id=INSTALLATION_ID,
+                video_id="x:2075545587093807111:1",
+                content_id=CONTENT_ID,
+                source_language="auto",
+                target_language="zh-Hans",
+                transcript_version=f"pending:{job_id}",
+                cache_key=f"pending:{job_id}",
+                status="analyzing",
+                lease_token=expired_token,
+                lease_expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+                llm_credential_ciphertext="encrypted-secret",
+                media_url_ciphertext="encrypted-media-url",
+            )
+        )
+        await session.commit()
+
+    async with factory() as session:
+        media_session_id, retry_at = await timeout_job_delivery(
+            session,
+            job_id,
+            expired_token,
+        )
+
+    assert media_session_id is None
+    assert retry_at is not None
+    async with factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        assert job.status == "analyzing"
+        assert job.failure_code is None
+        assert job.lease_token == expired_token
+        assert job.llm_credential_ciphertext == "encrypted-secret"
+        assert job.media_url_ciphertext == "encrypted-media-url"
+
+    async with factory() as session:
+        replacement = await claim_job_lease(
+            session,
+            job_id,
+            resume=True,
+            lease_seconds=60,
+        )
+    assert replacement.token is not None
+    assert replacement.token != expired_token
+
+
+@pytest.mark.asyncio
+async def test_postgres_expired_soft_timeout_loses_concurrent_takeover_race(
+    postgres_media_context,
+):
+    factory, _ = postgres_media_context
+    job_id = "pg-timeout-race"
+    expired_token = "concurrent-expired-timeout-token"
+    async with factory() as session:
+        session.add(
+            AnalysisJob(
+                id=job_id,
+                installation_id=INSTALLATION_ID,
+                video_id="x:2075545587093807111:1",
+                content_id=CONTENT_ID,
+                source_language="auto",
+                target_language="zh-Hans",
+                transcript_version=f"pending:{job_id}",
+                cache_key=f"pending:{job_id}",
+                status="analyzing",
+                lease_token=expired_token,
+                lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=0.5),
+                llm_credential_ciphertext="encrypted-secret",
+                media_url_ciphertext="encrypted-media-url",
+            )
+        )
+        await session.commit()
+
+    async with factory() as locking_session:
+        locked_job = await locking_session.scalar(
+            select(AnalysisJob).where(AnalysisJob.id == job_id).with_for_update()
+        )
+        assert locked_job.lease_token == expired_token
+
+        async def recover_expired_delivery():
+            async with factory() as session:
+                return await timeout_job_delivery(session, job_id, expired_token)
+
+        async def claim_replacement():
+            async with factory() as session:
+                return await claim_job_lease(
+                    session,
+                    job_id,
+                    resume=True,
+                    lease_seconds=60,
+                )
+
+        recovery_task = asyncio.create_task(recover_expired_delivery())
+        await asyncio.sleep(0.05)
+        assert not recovery_task.done()
+        await asyncio.sleep(0.5)
+        takeover_task = asyncio.create_task(claim_replacement())
+        await asyncio.sleep(0.05)
+        assert not takeover_task.done()
+        await locking_session.commit()
+
+    recovery_result, replacement = await asyncio.gather(
+        recovery_task,
+        takeover_task,
+    )
+    assert recovery_result[0] is None
+    assert replacement.token is not None
+    assert replacement.token != expired_token
+    async with factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        assert job.status == "analyzing"
+        assert job.failure_code is None
+        assert job.lease_token == replacement.token
+        assert job.llm_credential_ciphertext == "encrypted-secret"
+        assert job.media_url_ciphertext == "encrypted-media-url"
 
 
 async def _complete_postgres_upload(factory, settings, session_id):
