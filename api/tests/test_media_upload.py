@@ -1151,6 +1151,74 @@ async def test_cleanup_removes_only_old_uuid_staging_files(media_context):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("disappears_at", ["stat", "unlink"])
+async def test_cleanup_continues_when_a_staging_entry_disappears(
+    media_context, monkeypatch, disappears_at
+):
+    _, _, factory, media_root = media_context
+    settings = media_settings(media_root)
+    staging = media_root / ".staging"
+    staging.mkdir(parents=True)
+    disappearing = staging / f"{uuid.uuid4()}.tmp"
+    remaining = staging / f"{uuid.uuid4()}.tmp"
+    disappearing.write_bytes(b"gone")
+    remaining.write_bytes(b"remove me too")
+    old_timestamp = time.time() - settings.media_upload_session_ttl_seconds - 1
+    os.utime(disappearing, (old_timestamp, old_timestamp))
+    os.utime(remaining, (old_timestamp, old_timestamp))
+
+    original_scandir = os.scandir
+    original_unlink = os.unlink
+
+    class EntryProxy:
+        def __init__(self, entry):
+            self.entry = entry
+            self.name = entry.name
+
+        def is_file(self, *, follow_symlinks=True):
+            return self.entry.is_file(follow_symlinks=follow_symlinks)
+
+        def stat(self, *, follow_symlinks=True):
+            if disappears_at == "stat" and self.name == disappearing.name:
+                original_unlink(disappearing)
+                raise FileNotFoundError(self.name)
+            return self.entry.stat(follow_symlinks=follow_symlinks)
+
+    class ScandirEntries:
+        def __init__(self, entries):
+            self.entries = entries
+
+        def __enter__(self):
+            return iter(self.entries)
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+    def ordered_scandir(descriptor):
+        with original_scandir(descriptor) as entries:
+            proxies = [EntryProxy(entry) for entry in entries]
+        proxies.sort(key=lambda entry: entry.name != disappearing.name)
+        return ScandirEntries(proxies)
+
+    monkeypatch.setattr(media_upload.os, "scandir", ordered_scandir)
+
+    if disappears_at == "unlink":
+        def disappearing_unlink(path, *args, **kwargs):
+            original_unlink(path, *args, **kwargs)
+            if path == disappearing.name:
+                raise FileNotFoundError(path)
+
+        monkeypatch.setattr(media_upload.os, "unlink", disappearing_unlink)
+
+    async with factory() as session:
+        cleaned = await cleanup_expired_uploads(session, settings)
+
+    assert cleaned == 0
+    assert not disappearing.exists()
+    assert not remaining.exists()
+
+
+@pytest.mark.asyncio
 async def test_delete_is_idempotent_and_does_not_touch_other_session(media_context):
     client, _, factory, media_root = media_context
     first_id = (await create_session(client)).json()["sessionId"]

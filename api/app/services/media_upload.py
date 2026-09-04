@@ -771,13 +771,19 @@ def _cleanup_stale_staging_files_sync(
                     continue
                 if str(parsed) != stem:
                     continue
-                metadata = entry.stat(follow_symlinks=False)
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
                 if (
                     not stat.S_ISREG(metadata.st_mode)
                     or metadata.st_mtime > cutoff_timestamp
                 ):
                     continue
-                os.unlink(name, dir_fd=descriptor)
+                try:
+                    os.unlink(name, dir_fd=descriptor)
+                except FileNotFoundError:
+                    continue
                 removed = True
         if removed:
             os.fsync(descriptor)
