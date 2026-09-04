@@ -7,6 +7,20 @@ export default defineConfig({
   plugins: [
     react(),
     {
+      name: "assert-content-script-is-self-contained",
+      generateBundle(_options, bundle) {
+        const contentChunk = Object.values(bundle).find(
+          (entry) => entry.type === "chunk" && entry.name === "content",
+        );
+        if (!contentChunk || contentChunk.type !== "chunk") {
+          throw new Error("Content script build entry is missing");
+        }
+        if (contentChunk.imports.length > 0 || contentChunk.dynamicImports.length > 0) {
+          throw new Error("Content script must not import external chunks");
+        }
+      },
+    },
+    {
       name: "copy-extension-manifest",
       closeBundle() {
         copyFileSync(resolve(__dirname, "manifest.json"), resolve(__dirname, "dist/manifest.json"));
