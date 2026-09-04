@@ -9,6 +9,7 @@ import { contentKey, parseContentRef } from "./shared/content";
 
 const STORAGE_KEY = "analyzedTabs";
 const MEDIA_STORAGE_KEY = "xMediaCapture";
+const LAST_DETECTED_STORAGE_KEY = "xLastDetectedContent";
 const MEDIA_CLEANUP_ALARM = "xMediaCandidateCleanup";
 const CAPTURE_WINDOW_MS = 15_000;
 const CANDIDATE_TTL_MS = 10 * 60_000;
@@ -23,8 +24,15 @@ interface CaptureTabState {
 
 type MediaCaptureState = Record<string, CaptureTabState>;
 
+interface LastDetectedContent {
+  contentRef: ContentRef;
+  canonicalStatusId: string;
+}
+
+type LastDetectedContentState = Record<string, LastDetectedContent>;
+
 interface BackgroundState {
-  activeContentByTab: Map<number, ContentRef>;
+  lastDetectedContentByTab: Map<number, ContentRef>;
   runCaptureTask: <T>(task: () => Promise<T>) => Promise<T>;
 }
 
@@ -39,7 +47,7 @@ export function parseVideoId(url?: string): string | null {
 }
 
 export function installBackgroundHandlers(chromeApi: ChromeApi): void {
-  const activeContentByTab = new Map<number, ContentRef>();
+  const lastDetectedContentByTab = new Map<number, ContentRef>();
   let captureQueue: Promise<void> = Promise.resolve();
   const runCaptureTask = <T>(task: () => Promise<T>): Promise<T> => {
     const result = captureQueue.then(task);
@@ -47,49 +55,75 @@ export function installBackgroundHandlers(chromeApi: ChromeApi): void {
     return result;
   };
   const state: BackgroundState = {
-    activeContentByTab,
+    lastDetectedContentByTab,
     runCaptureTask,
   };
   void chromeApi.sidePanel
-    .setPanelBehavior({ openPanelOnActionClick: false })
+    .setPanelBehavior({ openPanelOnActionClick: true })
     .catch(reportBackgroundError);
-  void configureActiveTab(chromeApi).catch(reportBackgroundError);
-  void runCaptureTask(() => scheduleMediaCleanup(chromeApi)).catch(reportBackgroundError);
+  void runCaptureTask(async () => {
+    await initializeMediaCapture(chromeApi);
+    await configureActiveTab(chromeApi, lastDetectedContentByTab);
+  }).catch(reportBackgroundError);
 
   chromeApi.action.onClicked.addListener((tab) => {
     const tabId = tab.id;
-    if (
-      tabId === undefined
-      || (!parseContentRef(tab.url) && !activeContentMatchesUrl(activeContentByTab.get(tabId), tab.url))
-    ) return;
-    void chromeApi.sidePanel
-      .setOptions({ tabId, path: "sidepanel.html", enabled: true })
+    if (tabId === undefined) return;
+    const explicitRef = parseContentRef(tab.url);
+    const rememberedRef = lastDetectedContentByTab.get(tabId);
+    if (explicitRef || activeContentMatchesUrl(rememberedRef, tab.url)) {
+      openPanelForTab(chromeApi, tabId);
+      return;
+    }
+    void runCaptureTask(() => resolveLastDetectedContent(chromeApi, tabId, tab.url))
+      .then((restoredRef) => {
+        if (!restoredRef) return;
+        lastDetectedContentByTab.set(tabId, restoredRef);
+        return chromeApi.sidePanel.setOptions({ tabId, path: "sidepanel.html", enabled: true });
+      })
       .catch(reportBackgroundError);
-    void chromeApi.sidePanel.open({ tabId }).catch(reportBackgroundError);
   });
 
   chromeApi.tabs.onActivated.addListener(({ tabId }) => {
-    void updatePanelForActivatedTab(chromeApi, tabId).catch(reportBackgroundError);
+    void runCaptureTask(() => updatePanelForActivatedTab(
+      chromeApi,
+      tabId,
+      lastDetectedContentByTab,
+    ))
+      .catch(reportBackgroundError);
   });
 
   chromeApi.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (!changeInfo.url) return;
-    activeContentByTab.delete(tabId);
-    const cleared = runCaptureTask(() => closeCaptureForTab(chromeApi, tabId));
-    if (parseContentRef(tab.url)) {
-      void updatePanelForTab(chromeApi, tabId, tab.url).catch(reportBackgroundError);
-      void cleared.catch(reportBackgroundError);
+    const explicitRef = parseContentRef(tab.url);
+    const rememberedRef = lastDetectedContentByTab.get(tabId);
+    const rememberedRefStillMatches = activeContentMatchesUrl(rememberedRef, tab.url);
+    if (!rememberedRefStillMatches) lastDetectedContentByTab.delete(tabId);
+    void chromeApi.sidePanel.setOptions(
+      explicitRef || rememberedRefStillMatches
+        ? { tabId, path: "sidepanel.html", enabled: true }
+        : { tabId, enabled: false },
+    ).catch(reportBackgroundError);
+    const cleared = runCaptureTask(async () => {
+      await closeCaptureForTab(chromeApi, tabId, tab.url);
+      const restoredRef = await resolveLastDetectedContent(chromeApi, tabId, tab.url);
+      if (restoredRef) lastDetectedContentByTab.set(tabId, restoredRef);
+      return restoredRef;
+    });
+    if (!explicitRef && !rememberedRefStillMatches) {
+      void cleared.then((restoredRef) => {
+        if (restoredRef) {
+          return chromeApi.sidePanel.setOptions({ tabId, path: "sidepanel.html", enabled: true });
+        }
+      }).catch(reportBackgroundError);
     } else {
-      void cleared
-        .then(() => updatePanelForTab(chromeApi, tabId, tab.url))
-        .catch(reportBackgroundError);
+      void cleared.catch(reportBackgroundError);
     }
   });
 
   chromeApi.tabs.onRemoved.addListener((tabId) => {
-    activeContentByTab.delete(tabId);
-    void runCaptureTask(() => clearMediaForTab(chromeApi, tabId))
-      .then(() => removeTabState(chromeApi, tabId))
+    lastDetectedContentByTab.delete(tabId);
+    return runCaptureTask(() => removeAllTabState(chromeApi, tabId))
       .catch(reportBackgroundError);
   });
 
@@ -119,15 +153,17 @@ function reportBackgroundError(_error: unknown): void {
   console.warn("Veeky background event failed");
 }
 
-async function updatePanelForActivatedTab(chromeApi: ChromeApi, tabId: number): Promise<void> {
+async function updatePanelForActivatedTab(
+  chromeApi: ChromeApi,
+  tabId: number,
+  lastDetectedContentByTab: Map<number, ContentRef>,
+): Promise<void> {
   const tab = await chromeApi.tabs.get(tabId);
-  await updatePanelForTab(chromeApi, tabId, tab.url);
-}
-
-async function removeTabState(chromeApi: ChromeApi, tabId: number): Promise<void> {
-  const analyzedTabs = await loadAnalyzedTabs(chromeApi);
-  delete analyzedTabs[String(tabId)];
-  await chromeApi.storage.session.set({ [STORAGE_KEY]: analyzedTabs });
+  const rememberedRef = await updatePanelForTab(chromeApi, tabId, tab.url);
+  if (rememberedRef) lastDetectedContentByTab.set(tabId, rememberedRef);
+  else if (!activeContentMatchesUrl(lastDetectedContentByTab.get(tabId), tab.url)) {
+    lastDetectedContentByTab.delete(tabId);
+  }
 }
 
 async function handleMessage(
@@ -156,8 +192,16 @@ async function handleMessage(
         },
         candidates: pruneCandidateMap(prior?.candidates ?? {}, Date.now()),
       };
-      state.activeContentByTab.set(tabId, message.contentRef);
-      await chromeApi.storage.session.set({ [MEDIA_STORAGE_KEY]: mediaState });
+      const lastDetectedState = await loadLastDetectedContentState(chromeApi);
+      lastDetectedState[tabKey] = {
+        contentRef: message.contentRef,
+        canonicalStatusId: message.contentRef.sourceContentId,
+      };
+      state.lastDetectedContentByTab.set(tabId, message.contentRef);
+      await chromeApi.storage.session.set({
+        [MEDIA_STORAGE_KEY]: mediaState,
+        [LAST_DETECTED_STORAGE_KEY]: lastDetectedState,
+      });
       await scheduleMediaCleanupForState(chromeApi, mediaState);
       await chromeApi.sidePanel.setOptions({ tabId, path: "sidepanel.html", enabled: true });
       return { ok: true };
@@ -175,10 +219,9 @@ async function handleMessage(
       if (tabState?.active && sameContentRef(tabState.active.contentRef, message.contentRef)) {
         tabState.active = null;
         tabState.candidates = pruneCandidateMap(tabState.candidates, Date.now());
-        state.activeContentByTab.delete(tabId);
         await chromeApi.storage.session.set({ [MEDIA_STORAGE_KEY]: mediaState });
         await scheduleMediaCleanupForState(chromeApi, mediaState);
-        await updatePanelForTab(chromeApi, tabId, sender.tab?.url ?? sender.url);
+        await updatePanelForTab(chromeApi, tabId, sender.url ?? sender.tab?.url);
       }
       return { ok: true };
     });
@@ -223,7 +266,7 @@ async function handleMessage(
     };
     await chromeApi.storage.session.set({ [STORAGE_KEY]: analyzedTabs });
     const tab = await chromeApi.tabs.get(message.tabId);
-    await updatePanelForTab(chromeApi, message.tabId, tab.url);
+    await state.runCaptureTask(() => updatePanelForTab(chromeApi, message.tabId, tab.url));
     return { ok: true };
   }
 
@@ -248,22 +291,23 @@ async function handleMessage(
   const tabs = await chromeApi.tabs.query({ active: true, currentWindow: true });
   const tab = tabs[0];
   if (tab?.id === undefined) throw new Error("No active browser tab");
+  const tabId = tab.id;
   const analyzedTabs = await loadAnalyzedTabs(chromeApi);
   const explicitRef = parseContentRef(tab.url);
-  let contentRef = explicitRef;
-  if (!contentRef) {
-    const mediaState = await loadMediaCaptureState(chromeApi);
-    const activeRef = mediaState[String(tab.id)]?.active?.contentRef;
-    if (activeContentMatchesUrl(activeRef, tab.url)) contentRef = activeRef ?? null;
-  }
+  const rememberedRef = await state.runCaptureTask(
+    () => resolveLastDetectedContent(chromeApi, tabId, tab.url),
+  );
+  if (rememberedRef) state.lastDetectedContentByTab.set(tabId, rememberedRef);
+  else state.lastDetectedContentByTab.delete(tabId);
+  const contentRef = explicitRef ?? rememberedRef;
   const context: ActiveTabContext = {
-    tabId: tab.id,
+    tabId,
     url: tab.url ?? "",
     title: tab.title ?? "YouTube video",
     contentRef,
     videoId: contentRef?.platform === "youtube" ? contentRef.sourceContentId : null,
     analysis: contentRef
-      ? analyzedTabs[String(tab.id)]?.[contentKey(contentRef)] ?? null
+      ? analyzedTabs[String(tabId)]?.[contentKey(contentRef)] ?? null
       : null,
   };
   return context;
@@ -442,18 +486,66 @@ async function loadMediaCaptureState(chromeApi: ChromeApi): Promise<MediaCapture
   return (value[MEDIA_STORAGE_KEY] as MediaCaptureState | undefined) ?? {};
 }
 
-async function clearMediaForTab(chromeApi: ChromeApi, tabId: number): Promise<void> {
-  const state = await loadMediaCaptureState(chromeApi);
-  if (!state[String(tabId)]) return;
-  delete state[String(tabId)];
-  await chromeApi.storage.session.set({ [MEDIA_STORAGE_KEY]: state });
-  await scheduleMediaCleanupForState(chromeApi, state);
+async function loadLastDetectedContentState(chromeApi: ChromeApi): Promise<LastDetectedContentState> {
+  const value = await chromeApi.storage.session.get(LAST_DETECTED_STORAGE_KEY);
+  return (value[LAST_DETECTED_STORAGE_KEY] as LastDetectedContentState | undefined) ?? {};
 }
 
-async function closeCaptureForTab(chromeApi: ChromeApi, tabId: number): Promise<void> {
+async function resolveLastDetectedContent(
+  chromeApi: ChromeApi,
+  tabId: number,
+  url?: string,
+): Promise<ContentRef | null> {
+  const state = await loadLastDetectedContentState(chromeApi);
+  const tabKey = String(tabId);
+  const stored = state[tabKey];
+  if (
+    stored
+    && isValidXContentRef(stored.contentRef)
+    && stored.canonicalStatusId === stored.contentRef.sourceContentId
+    && xUrlMatchesRef(url, stored.contentRef)
+  ) {
+    return stored.contentRef;
+  }
+  if (stored) {
+    delete state[tabKey];
+    await chromeApi.storage.session.set({ [LAST_DETECTED_STORAGE_KEY]: state });
+  }
+  return null;
+}
+
+async function removeAllTabState(chromeApi: ChromeApi, tabId: number): Promise<void> {
+  const value = await chromeApi.storage.session.get([
+    STORAGE_KEY,
+    MEDIA_STORAGE_KEY,
+    LAST_DETECTED_STORAGE_KEY,
+  ]);
+  const tabKey = String(tabId);
+  const analyzedTabs = (value[STORAGE_KEY] as AnalyzedTabs | undefined) ?? {};
+  const mediaState = (value[MEDIA_STORAGE_KEY] as MediaCaptureState | undefined) ?? {};
+  const lastDetectedState = (
+    value[LAST_DETECTED_STORAGE_KEY] as LastDetectedContentState | undefined
+  ) ?? {};
+  delete analyzedTabs[tabKey];
+  delete mediaState[tabKey];
+  delete lastDetectedState[tabKey];
+  await chromeApi.storage.session.set({
+    [MEDIA_STORAGE_KEY]: mediaState,
+    [LAST_DETECTED_STORAGE_KEY]: lastDetectedState,
+  });
+  await chromeApi.storage.session.set({ [STORAGE_KEY]: analyzedTabs });
+  await scheduleMediaCleanupForState(chromeApi, mediaState);
+}
+
+async function closeCaptureForTab(
+  chromeApi: ChromeApi,
+  tabId: number,
+  currentUrl?: string,
+): Promise<void> {
   const state = await loadMediaCaptureState(chromeApi);
   const tabState = state[String(tabId)];
   if (!tabState?.active) return;
+  if (xUrlMatchesRef(currentUrl, tabState.active.contentRef)) return;
   tabState.active = null;
   tabState.candidates = pruneCandidateMap(tabState.candidates, Date.now());
   if (Object.keys(tabState.candidates).length === 0) delete state[String(tabId)];
@@ -472,8 +564,15 @@ async function cleanupExpiredMedia(chromeApi: ChromeApi): Promise<void> {
   await scheduleMediaCleanupForState(chromeApi, state);
 }
 
-async function scheduleMediaCleanup(chromeApi: ChromeApi): Promise<void> {
+async function initializeMediaCapture(chromeApi: ChromeApi): Promise<void> {
   const state = await loadMediaCaptureState(chromeApi);
+  const now = Date.now();
+  for (const [tabKey, tabState] of Object.entries(state)) {
+    tabState.active = null;
+    tabState.candidates = pruneCandidateMap(tabState.candidates, now);
+    if (Object.keys(tabState.candidates).length === 0) delete state[tabKey];
+  }
+  await chromeApi.storage.session.set({ [MEDIA_STORAGE_KEY]: state });
   await scheduleMediaCleanupForState(chromeApi, state);
 }
 
@@ -500,23 +599,33 @@ async function updatePanelForTab(
   chromeApi: ChromeApi,
   tabId: number,
   url?: string,
-): Promise<void> {
-  let isSupportedVideo = parseContentRef(url) !== null;
-  if (!isSupportedVideo) {
-    const state = await loadMediaCaptureState(chromeApi);
-    isSupportedVideo = activeContentMatchesUrl(state[String(tabId)]?.active?.contentRef, url);
-  }
+): Promise<ContentRef | null> {
+  const explicitRef = parseContentRef(url);
+  const rememberedRef = await resolveLastDetectedContent(chromeApi, tabId, url);
+  const isSupportedVideo = explicitRef !== null || rememberedRef !== null;
   await chromeApi.sidePanel.setOptions(
     isSupportedVideo
       ? { tabId, path: "sidepanel.html", enabled: true }
       : { tabId, enabled: false },
   );
+  return rememberedRef;
 }
 
-async function configureActiveTab(chromeApi: ChromeApi): Promise<void> {
+function openPanelForTab(chromeApi: ChromeApi, tabId: number): void {
+  void chromeApi.sidePanel
+    .setOptions({ tabId, path: "sidepanel.html", enabled: true })
+    .catch(reportBackgroundError);
+  void chromeApi.sidePanel.open({ tabId }).catch(reportBackgroundError);
+}
+
+async function configureActiveTab(
+  chromeApi: ChromeApi,
+  lastDetectedContentByTab: Map<number, ContentRef>,
+): Promise<void> {
   const [tab] = await chromeApi.tabs.query({ active: true, currentWindow: true });
   if (tab?.id !== undefined) {
-    await updatePanelForTab(chromeApi, tab.id, tab.url);
+    const rememberedRef = await updatePanelForTab(chromeApi, tab.id, tab.url);
+    if (rememberedRef) lastDetectedContentByTab.set(tab.id, rememberedRef);
   }
 }
 
