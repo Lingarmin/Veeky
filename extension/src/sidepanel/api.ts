@@ -64,6 +64,47 @@ export interface AnalysisApi {
   getResult(jobId: string): Promise<AnalysisResult>;
 }
 
+export interface MediaSession {
+  sessionId: string;
+  contentId: string;
+  kind: "mp4" | "hls";
+  status: string;
+  expectedBytes: number;
+  receivedBytes: number;
+  partSizeBytes: number;
+  partCount: number;
+  uploadedParts: number[];
+}
+
+export interface MediaArtifact {
+  sessionId: string;
+  contentId: string;
+  kind: "mp4" | "hls";
+  status: "complete";
+  totalBytes: number;
+  partCount: number;
+}
+
+export interface MediaSessionCompleteInput {
+  kind: "mp4" | "hls";
+  partCount: number;
+  totalBytes: number;
+  manifest?: { parts: number[] };
+}
+
+export interface MediaUploadApi {
+  inspect(input: string | InspectInput): Promise<VideoInspection>;
+  createMediaSession(input: {
+    contentId: string;
+    kind: "mp4" | "hls";
+    expectedBytes: number;
+    partCount: number;
+  }): Promise<MediaSession>;
+  getMediaSession(sessionId: string): Promise<MediaSession>;
+  uploadPart(sessionId: string, partNumber: number, bytes: Uint8Array, sha256: string): Promise<void>;
+  completeMediaSession(sessionId: string, input: MediaSessionCompleteInput): Promise<MediaArtifact>;
+}
+
 export class ApiError extends Error {
   constructor(
     public readonly code: string,
@@ -80,7 +121,7 @@ export class ApiError extends Error {
 export function createApi(
   baseUrl = "http://127.0.0.1:8000",
   identityStore: InstallationIdentityStore = browserInstallationIdentityStore,
-): AnalysisApi {
+): AnalysisApi & MediaUploadApi {
   return {
     testLlm: (config) => request(`${baseUrl}/v1/llm/test`, identityStore, {
       method: "POST",
@@ -105,6 +146,32 @@ export function createApi(
     },
     getStatus: (jobId) => request(`${baseUrl}/v1/analyses/${jobId}`, identityStore),
     getResult: (jobId) => request(`${baseUrl}/v1/analyses/${jobId}/result`, identityStore),
+    createMediaSession: (input) => request(`${baseUrl}/v1/media-sessions`, identityStore, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+    getMediaSession: (sessionId) => request(`${baseUrl}/v1/media-sessions/${sessionId}`, identityStore),
+    uploadPart: (sessionId, partNumber, bytes, sha256) => {
+      const body = new Uint8Array(bytes.byteLength);
+      body.set(bytes);
+      return request(
+        `${baseUrl}/v1/media-sessions/${sessionId}/parts/${partNumber}`,
+        identityStore,
+        {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "X-Content-SHA256": sha256,
+          },
+          body: body.buffer,
+        },
+      );
+    },
+    completeMediaSession: (sessionId, { kind: _kind, ...input }) => request(
+      `${baseUrl}/v1/media-sessions/${sessionId}/complete`,
+      identityStore,
+      { method: "POST", body: JSON.stringify(input) },
+    ),
   };
 }
 

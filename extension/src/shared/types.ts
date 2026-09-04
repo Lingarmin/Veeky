@@ -40,6 +40,38 @@ export interface MediaCandidate {
   capturedAt: number;
 }
 
+export interface StartMediaUploadMessage {
+  type: "START_MEDIA_UPLOAD";
+  jobId: string;
+  contentRef: ContentRef;
+  candidate: MediaCandidate;
+}
+
+export interface MediaUploadProgressMessage {
+  type: "MEDIA_UPLOAD_PROGRESS";
+  jobId: string;
+  uploadedBytes: number;
+  totalBytes: number | null;
+}
+
+export interface MediaUploadCompleteMessage {
+  type: "MEDIA_UPLOAD_COMPLETE";
+  jobId: string;
+  mediaSessionId: string;
+}
+
+export interface MediaUploadFailedMessage {
+  type: "MEDIA_UPLOAD_FAILED";
+  jobId: string;
+  code: string;
+}
+
+export type MediaUploadMessage =
+  | StartMediaUploadMessage
+  | MediaUploadProgressMessage
+  | MediaUploadCompleteMessage
+  | MediaUploadFailedMessage;
+
 export interface LlmConfig {
   provider: "kimi" | "deepseek";
   apiUrl: string;
@@ -54,7 +86,8 @@ export type ExtensionMessage =
   | { type: "SEEK_VIDEO"; tabId: number; videoId: string; startMs: number }
   | { type: "X_PLAYER_ACTIVE"; contentRef: ContentRef; durationMs: number }
   | { type: "X_PLAYER_INACTIVE"; contentRef: ContentRef }
-  | { type: "GET_MEDIA_CANDIDATES"; tabId: number; contentRef: ContentRef };
+  | { type: "GET_MEDIA_CANDIDATES"; tabId: number; contentRef: ContentRef }
+  | MediaUploadMessage;
 
 export interface CaptionTrack {
   languageCode: string;

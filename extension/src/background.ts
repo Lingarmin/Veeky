@@ -56,12 +56,14 @@ interface BackgroundState {
   routeEpochByTab: Map<number, XRouteEpoch>;
   rescheduleRecentRequestCleanup: () => void;
   runCaptureTask: <T>(task: () => Promise<T>) => Promise<T>;
+  offscreenCreation: Promise<void> | null;
 }
 
 type ChromeApi = Pick<
   typeof chrome,
   | "action"
   | "alarms"
+  | "offscreen"
   | "runtime"
   | "sidePanel"
   | "scripting"
@@ -121,6 +123,7 @@ export function installBackgroundHandlers(chromeApi: ChromeApi): void {
     routeEpochByTab,
     rescheduleRecentRequestCleanup,
     runCaptureTask,
+    offscreenCreation: null,
   };
   void chromeApi.sidePanel
     .setPanelBehavior({ openPanelOnActionClick: false })
@@ -245,6 +248,24 @@ async function handleMessage(
   sender: chrome.runtime.MessageSender,
   state: BackgroundState,
 ): Promise<unknown> {
+  if (message.type === "START_MEDIA_UPLOAD") {
+    if (!isValidXContentRef(message.contentRef)) return { ok: false };
+    const candidate = mediaCandidateFromRequest(message.candidate.url, message.candidate.capturedAt);
+    if (!candidate || candidate.kind !== message.candidate.kind) return { ok: false };
+    const alreadyOpen = await chromeApi.offscreen.hasDocument();
+    await ensureOffscreenDocument(chromeApi, state);
+    if (!alreadyOpen) await chromeApi.runtime.sendMessage(message);
+    return { ok: true };
+  }
+
+  if (
+    message.type === "MEDIA_UPLOAD_PROGRESS"
+    || message.type === "MEDIA_UPLOAD_COMPLETE"
+    || message.type === "MEDIA_UPLOAD_FAILED"
+  ) {
+    return undefined;
+  }
+
   if (message.type === "X_PLAYER_ACTIVE") {
     const tabId = sender.tab?.id;
     if (tabId === undefined || !isValidXContentRef(message.contentRef) || !senderMatchesRef(sender, message.contentRef)) {
@@ -411,6 +432,23 @@ async function handleMessage(
       : null,
   };
   return context;
+}
+
+async function ensureOffscreenDocument(
+  chromeApi: ChromeApi,
+  state: BackgroundState,
+): Promise<void> {
+  if (await chromeApi.offscreen.hasDocument()) return;
+  if (!state.offscreenCreation) {
+    state.offscreenCreation = chromeApi.offscreen.createDocument({
+      url: "offscreen.html",
+      reasons: ["BLOBS" as chrome.offscreen.Reason],
+      justification: "Fetch and upload the X video selected by the user for transcription",
+    }).finally(() => {
+      state.offscreenCreation = null;
+    });
+  }
+  await state.offscreenCreation;
 }
 
 async function captureMediaCandidate(

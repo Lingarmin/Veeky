@@ -25,6 +25,7 @@ function createChrome(initialStored: Record<string, unknown> = {}) {
   const historyStateUpdated = new FakeEvent();
   const navigationCommitted = new FakeEvent();
   let stored: Record<string, unknown> = structuredClone(initialStored);
+  let hasOffscreenDocument = false;
 
   return {
     action: { onClicked: actionClicked },
@@ -39,7 +40,14 @@ function createChrome(initialStored: Record<string, unknown> = {}) {
     scripting: {
       executeScript: vi.fn(async () => undefined),
     },
-    runtime: { onMessage: message },
+    runtime: {
+      onMessage: message,
+      sendMessage: vi.fn(async () => undefined),
+    },
+    offscreen: {
+      hasDocument: vi.fn(async () => hasOffscreenDocument),
+      createDocument: vi.fn(async () => { hasOffscreenDocument = true; }),
+    },
     alarms: {
       onAlarm: alarm,
       create: vi.fn(),
@@ -124,6 +132,53 @@ describe("background tab isolation", () => {
 
     expect(chrome.events.historyStateUpdated.listeners).toHaveLength(1);
     expect(chrome.events.navigationCommitted.listeners).toHaveLength(1);
+  });
+
+  it("creates one offscreen document before forwarding media uploads", async () => {
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    const upload = {
+      type: "START_MEDIA_UPLOAD" as const,
+      jobId: "job-1",
+      contentRef: {
+        platform: "x" as const,
+        sourceContentId: "2075545587093807111",
+        mediaIndex: 1,
+      },
+      candidate: {
+        url: "https://video.twimg.com/amplify_video/123/file.mp4",
+        kind: "mp4" as const,
+        capturedAt: Date.now(),
+      },
+    };
+
+    await dispatchMessage(chrome, upload);
+    await dispatchMessage(chrome, { ...upload, jobId: "job-2" });
+
+    expect(chrome.offscreen.createDocument).toHaveBeenCalledOnce();
+    expect(chrome.offscreen.createDocument).toHaveBeenCalledWith({
+      url: "offscreen.html",
+      reasons: ["BLOBS"],
+      justification: "Fetch and upload the X video selected by the user for transcription",
+    });
+    expect(chrome.runtime.sendMessage).toHaveBeenCalledOnce();
+    expect(chrome.runtime.sendMessage).toHaveBeenCalledWith(upload);
+  });
+
+  it("leaves offscreen upload notifications for the side panel", async () => {
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    await flushMicrotasks();
+    chrome.tabs.query.mockClear();
+
+    await dispatchMessage(chrome, {
+      type: "MEDIA_UPLOAD_PROGRESS",
+      jobId: "job-1",
+      uploadedBytes: 8 * 1024 * 1024,
+      totalBytes: 18 * 1024 * 1024,
+    });
+
+    expect(chrome.tabs.query).not.toHaveBeenCalled();
   });
 
   it("declares the Veeky brand and toolbar icons", () => {
