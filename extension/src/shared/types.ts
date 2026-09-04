@@ -34,6 +34,12 @@ export interface ActiveTabContext {
   analysis: AnalyzedTab | null;
 }
 
+export interface MediaCandidate {
+  url: string;
+  kind: "mp4" | "hls" | "segment";
+  capturedAt: number;
+}
+
 export interface LlmConfig {
   provider: "kimi" | "deepseek";
   apiUrl: string;
@@ -45,7 +51,10 @@ export type ExtensionMessage =
   | { type: "GET_ACTIVE_TAB_CONTEXT" }
   | { type: "REGISTER_ANALYSIS"; tabId: number; videoId: string; jobId: string }
   | { type: "REGISTER_ANALYSIS"; tabId: number; contentRef: ContentRef; jobId: string }
-  | { type: "SEEK_VIDEO"; tabId: number; videoId: string; startMs: number };
+  | { type: "SEEK_VIDEO"; tabId: number; videoId: string; startMs: number }
+  | { type: "X_PLAYER_ACTIVE"; contentRef: ContentRef; durationMs: number }
+  | { type: "X_PLAYER_INACTIVE"; contentRef: ContentRef }
+  | { type: "GET_MEDIA_CANDIDATES"; tabId: number; contentRef: ContentRef };
 
 export interface CaptionTrack {
   languageCode: string;

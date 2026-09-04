@@ -5,7 +5,11 @@ import { installBackgroundHandlers, parseVideoId } from "../src/background";
 
 class FakeEvent {
   listeners: Array<(...args: any[]) => any> = [];
-  addListener = (listener: (...args: any[]) => any) => this.listeners.push(listener);
+  registrations: any[][] = [];
+  addListener = (...args: any[]) => {
+    this.listeners.push(args[0]);
+    this.registrations.push(args);
+  };
 }
 
 function createChrome() {
@@ -14,6 +18,7 @@ function createChrome() {
   const tabUpdated = new FakeEvent();
   const tabRemoved = new FakeEvent();
   const message = new FakeEvent();
+  const beforeRequest = new FakeEvent();
   let stored: Record<string, unknown> = {};
 
   return {
@@ -30,6 +35,7 @@ function createChrome() {
       executeScript: vi.fn(async () => undefined),
     },
     runtime: { onMessage: message },
+    webRequest: { onBeforeRequest: beforeRequest },
     sidePanel: {
       setOptions: vi.fn(async () => undefined),
       open: vi.fn(async () => undefined),
@@ -41,13 +47,13 @@ function createChrome() {
         set: vi.fn(async (value: Record<string, unknown>) => { stored = { ...stored, ...value }; }),
       },
     },
-    events: { actionClicked, tabActivated, tabUpdated, tabRemoved, message },
+    events: { actionClicked, tabActivated, tabUpdated, tabRemoved, message, beforeRequest },
   };
 }
 
-function dispatchMessage(chrome: ReturnType<typeof createChrome>, message: object) {
+function dispatchMessage(chrome: ReturnType<typeof createChrome>, message: object, sender: object = {}) {
   return new Promise((resolve) => {
-    chrome.events.message.listeners[0](message, {}, resolve);
+    chrome.events.message.listeners[0](message, sender, resolve);
   });
 }
 
@@ -312,5 +318,291 @@ describe("background tab isolation", () => {
       contentRef: mediaOne,
       analysis: expect.objectContaining({ contentRef: mediaOne, jobId: "job-1" }),
     }));
+  });
+});
+
+describe("X media candidate capture", () => {
+  const contentRef = {
+    platform: "x" as const,
+    sourceContentId: "2075545587093807111",
+    mediaIndex: 1,
+  };
+  const statusUrl = "https://x.com/owner/status/2075545587093807111/video/1";
+
+  function contentSender(tabId = 7, url = statusUrl) {
+    return { tab: { id: tabId, url }, url };
+  }
+
+  async function capture(
+    chrome: ReturnType<typeof createChrome>,
+    url: string,
+    options: { tabId?: number; type?: string; timeStamp?: number } = {},
+  ) {
+    return chrome.events.beforeRequest.listeners[0]({
+      tabId: options.tabId ?? 7,
+      url,
+      type: options.type ?? "media",
+      timeStamp: options.timeStamp ?? Date.now(),
+    });
+  }
+
+  it("registers the narrowest practical video request listener", () => {
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+
+    expect(chrome.events.beforeRequest.registrations[0].slice(1)).toEqual([{
+      urls: ["https://video.twimg.com/*"],
+      types: ["media", "xmlhttprequest"],
+    }]);
+  });
+
+  it("captures classified candidates only during the active 15-second window", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-05T00:00:00Z"));
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    await dispatchMessage(chrome, {
+      type: "X_PLAYER_ACTIVE",
+      contentRef,
+      durationMs: 30_000,
+    }, contentSender());
+
+    const urls = [
+      "https://video.twimg.com/amplify_video/123/vid/avc1/file.mp4?tag=14",
+      "https://video.twimg.com/amplify_video/123/pl/master.m3u8?token=opaque",
+      "https://video.twimg.com/amplify_video/123/chunk/1.ts?token=opaque",
+    ];
+    await capture(chrome, urls[0]);
+    await capture(chrome, urls[1], { type: "xmlhttprequest" });
+    await capture(chrome, urls[2], { timeStamp: Date.now() + 1 });
+
+    const response = await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES",
+      tabId: 7,
+      contentRef,
+    }, contentSender());
+    expect(response).toEqual({ candidates: [
+      { url: urls[0], kind: "mp4", capturedAt: Date.now() },
+      { url: urls[1], kind: "hls", capturedAt: Date.now() },
+      { url: urls[2], kind: "segment", capturedAt: Date.now() + 1 },
+    ] });
+
+    vi.advanceTimersByTime(15_001);
+    await capture(chrome, "https://video.twimg.com/amplify_video/123/vid/avc1/late.mp4");
+    const afterWindow = await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES",
+      tabId: 7,
+      contentRef,
+    }, contentSender());
+    expect(afterWindow).toEqual(response);
+    vi.useRealTimers();
+  });
+
+  it("does not lose the first request racing the active-player signal", async () => {
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    const active = dispatchMessage(chrome, {
+      type: "X_PLAYER_ACTIVE", contentRef, durationMs: 0,
+    }, contentSender());
+    await capture(chrome, "https://video.twimg.com/path/first.mp4");
+    await active;
+
+    expect(await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 7, contentRef,
+    }, contentSender())).toEqual({ candidates: [expect.objectContaining({
+      url: "https://video.twimg.com/path/first.mp4",
+      kind: "mp4",
+    })] });
+  });
+
+  it("uses request time when queued capture work runs after the window closes", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-05T00:00:00Z"));
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    await dispatchMessage(chrome, {
+      type: "X_PLAYER_ACTIVE", contentRef, durationMs: 0,
+    }, contentSender());
+
+    void capture(chrome, "https://video.twimg.com/path/in-window.mp4", {
+      timeStamp: Date.now() + 14_000,
+    });
+    vi.advanceTimersByTime(16_000);
+
+    expect(await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 7, contentRef,
+    }, contentSender())).toEqual({ candidates: [expect.objectContaining({
+      url: "https://video.twimg.com/path/in-window.mp4",
+    })] });
+    vi.useRealTimers();
+  });
+
+  it("does not extend the capture window for a same-player metadata update", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-05T00:00:00Z"));
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    await dispatchMessage(chrome, {
+      type: "X_PLAYER_ACTIVE", contentRef, durationMs: 0,
+    }, contentSender());
+    vi.advanceTimersByTime(10_000);
+    await dispatchMessage(chrome, {
+      type: "X_PLAYER_ACTIVE", contentRef, durationMs: 30_000,
+    }, contentSender());
+    vi.advanceTimersByTime(10_000);
+    await capture(chrome, "https://video.twimg.com/path/too-late.mp4");
+
+    expect(await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 7, contentRef,
+    }, contentSender())).toEqual({ candidates: [] });
+    vi.useRealTimers();
+  });
+
+  it.each([
+    ["http://video.twimg.com/path/file.mp4", "media"],
+    ["https://video.twimg.com:444/path/file.mp4", "media"],
+    ["https://user@video.twimg.com/path/file.mp4", "media"],
+    ["https://video.twimg.com/path/file.mp4#fragment", "media"],
+    ["https://video.twimg.com.evil.example/path/file.mp4", "media"],
+    ["https://pbs.twimg.com/path/file.mp4", "media"],
+    ["https://video.twimg.com/path/image.jpg", "media"],
+    ["https://video.twimg.com/path/file.mp4", "image"],
+  ])("rejects unsafe or unrelated request %s (%s)", async (url, type) => {
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    await dispatchMessage(chrome, { type: "X_PLAYER_ACTIVE", contentRef, durationMs: 0 }, contentSender());
+    await capture(chrome, url, { type });
+
+    expect(await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 7, contentRef,
+    }, contentSender())).toEqual({ candidates: [] });
+  });
+
+  it("does not trust a player signal or query for another status or tab", async () => {
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    await dispatchMessage(chrome, {
+      type: "X_PLAYER_ACTIVE",
+      contentRef,
+      durationMs: 0,
+    }, contentSender(7, "https://x.com/owner/status/2075545587093807222/video/1"));
+    await capture(chrome, "https://video.twimg.com/path/file.mp4");
+    expect(await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 8, contentRef,
+    }, contentSender())).toEqual({ candidates: [] });
+  });
+
+  it("accepts a current SPA frame URL while the tab URL still reports the prior status", async () => {
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    const priorUrl = "https://x.com/owner/status/2075545587093807222/video/1";
+    await dispatchMessage(chrome, {
+      type: "X_PLAYER_ACTIVE", contentRef, durationMs: 0,
+    }, { url: statusUrl, tab: { id: 7, url: priorUrl } });
+    await capture(chrome, "https://video.twimg.com/path/current.mp4");
+
+    expect(await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 7, contentRef,
+    }, contentSender())).toEqual({ candidates: [expect.objectContaining({
+      url: "https://video.twimg.com/path/current.mp4",
+    })] });
+  });
+
+  it("makes a bare status usable after a real active-player signal", async () => {
+    const bareUrl = "https://x.com/owner/status/2075545587093807111";
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    await dispatchMessage(chrome, {
+      type: "X_PLAYER_ACTIVE", contentRef, durationMs: 0,
+    }, contentSender(7, bareUrl));
+
+    chrome.tabs.query.mockResolvedValueOnce([{ id: 7, url: bareUrl, title: "X status" }]);
+    expect(await dispatchMessage(chrome, { type: "GET_ACTIVE_TAB_CONTEXT" })).toEqual(
+      expect.objectContaining({ contentRef, videoId: null }),
+    );
+    expect(chrome.sidePanel.setOptions).toHaveBeenLastCalledWith({
+      tabId: 7, path: "sidepanel.html", enabled: true,
+    });
+  });
+
+  it("restores a signaled bare status when its tab becomes active again", async () => {
+    const bareUrl = "https://x.com/owner/status/2075545587093807111";
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    await dispatchMessage(chrome, {
+      type: "X_PLAYER_ACTIVE", contentRef, durationMs: 0,
+    }, contentSender(7, bareUrl));
+    chrome.tabs.get.mockResolvedValueOnce({ id: 7, url: bareUrl });
+
+    chrome.events.tabActivated.listeners[0]({ tabId: 7 });
+    await flushMicrotasks();
+
+    expect(chrome.sidePanel.setOptions).toHaveBeenLastCalledWith({
+      tabId: 7, path: "sidepanel.html", enabled: true,
+    });
+  });
+
+  it("deduplicates, caps candidates at 50, and isolates tab/content keys", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-05T00:00:00Z"));
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    await dispatchMessage(chrome, { type: "X_PLAYER_ACTIVE", contentRef, durationMs: 0 }, contentSender());
+    const duplicate = "https://video.twimg.com/path/file-0.mp4";
+    await capture(chrome, duplicate);
+    await capture(chrome, duplicate, { timeStamp: Date.now() + 2 });
+    for (let index = 1; index <= 55; index += 1) {
+      await capture(chrome, `https://video.twimg.com/path/file-${index}.mp4`, {
+        timeStamp: Date.now() + index,
+      });
+    }
+
+    const response = await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 7, contentRef,
+    }, contentSender()) as { candidates: Array<{ url: string }> };
+    expect(response.candidates).toHaveLength(50);
+    expect(new Set(response.candidates.map(({ url }) => url)).size).toBe(50);
+
+    expect(await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 8, contentRef,
+    }, contentSender(8))).toEqual({ candidates: [] });
+    vi.useRealTimers();
+  });
+
+  it("clears inactive content and expires candidates after 10 minutes", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-05T00:00:00Z"));
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    await dispatchMessage(chrome, { type: "X_PLAYER_ACTIVE", contentRef, durationMs: 0 }, contentSender());
+    await capture(chrome, "https://video.twimg.com/path/file.mp4");
+    await dispatchMessage(chrome, { type: "X_PLAYER_INACTIVE", contentRef }, contentSender());
+    expect(await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 7, contentRef,
+    }, contentSender())).toEqual({ candidates: [] });
+
+    await dispatchMessage(chrome, { type: "X_PLAYER_ACTIVE", contentRef, durationMs: 0 }, contentSender());
+    await capture(chrome, "https://video.twimg.com/path/next.mp4");
+    vi.advanceTimersByTime(10 * 60_000 + 1);
+    expect(await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 7, contentRef,
+    }, contentSender())).toEqual({ candidates: [] });
+    vi.useRealTimers();
+  });
+
+  it("accepts inactive cleanup after an X SPA route has already changed", async () => {
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    await dispatchMessage(chrome, { type: "X_PLAYER_ACTIVE", contentRef, durationMs: 0 }, contentSender());
+    await capture(chrome, "https://video.twimg.com/path/file.mp4");
+    const nextUrl = "https://x.com/owner/status/2075545587093807222/video/1";
+
+    await dispatchMessage(chrome, {
+      type: "X_PLAYER_INACTIVE", contentRef,
+    }, contentSender(7, nextUrl));
+
+    expect(await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 7, contentRef,
+    }, contentSender())).toEqual({ candidates: [] });
   });
 });
