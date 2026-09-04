@@ -20,7 +20,8 @@ export interface ContentContext {
 
 export interface AnalyzedTab {
   tabId: number;
-  videoId: string;
+  contentRef?: ContentRef;
+  videoId?: string;
   jobId: string;
 }
 
@@ -28,6 +29,7 @@ export interface ActiveTabContext {
   tabId: number;
   url: string;
   title: string;
+  contentRef?: ContentRef | null;
   videoId: string | null;
   analysis: AnalyzedTab | null;
 }
@@ -42,6 +44,7 @@ export interface LlmConfig {
 export type ExtensionMessage =
   | { type: "GET_ACTIVE_TAB_CONTEXT" }
   | { type: "REGISTER_ANALYSIS"; tabId: number; videoId: string; jobId: string }
+  | { type: "REGISTER_ANALYSIS"; tabId: number; contentRef: ContentRef; jobId: string }
   | { type: "SEEK_VIDEO"; tabId: number; videoId: string; startMs: number };
 
 export interface CaptionTrack {

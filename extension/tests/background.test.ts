@@ -67,6 +67,19 @@ describe("background tab isolation", () => {
     expect(manifest.side_panel?.default_path).toBe("sidepanel.html");
   });
 
+  it("declares X content-script and media-capture access", () => {
+    expect(manifest.permissions).toEqual(expect.arrayContaining(["webRequest", "offscreen"]));
+    expect(manifest.host_permissions).toEqual(expect.arrayContaining([
+      "https://x.com/*",
+      "https://video.twimg.com/*",
+    ]));
+    expect(manifest.content_scripts).toEqual([{
+      matches: ["https://x.com/*"],
+      js: ["content.js"],
+      run_at: "document_idle",
+    }]);
+  });
+
   it("declares the Veeky brand and toolbar icons", () => {
     expect(manifest.name).toBe("Veeky - AI Agent：YouTube Video Translate & Summarize");
     expect(manifest.action.default_title).toBe("打开 Veeky");
@@ -85,6 +98,36 @@ describe("background tab isolation", () => {
     await flushMicrotasks();
 
     expect(chrome.sidePanel.setOptions).toHaveBeenCalledWith({ tabId: 7, path: "sidepanel.html", enabled: true });
+  });
+
+  it("enables and opens the panel for an explicit X video route", async () => {
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    await flushMicrotasks();
+
+    const url = "https://x.com/viktoroddy/status/2075545587093807111/video/1";
+    await chrome.events.tabUpdated.listeners[0](7, { url }, { id: 7, url });
+    expect(chrome.sidePanel.setOptions).toHaveBeenLastCalledWith({
+      tabId: 7,
+      path: "sidepanel.html",
+      enabled: true,
+    });
+
+    chrome.events.actionClicked.listeners[0]({ id: 7, url });
+    expect(chrome.sidePanel.open).toHaveBeenCalledWith({ tabId: 7 });
+  });
+
+  it("keeps the panel disabled on X pages without an explicit video route", async () => {
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    await flushMicrotasks();
+
+    const url = "https://x.com/viktoroddy/status/2075545587093807111";
+    await chrome.events.tabUpdated.listeners[0](7, { url }, { id: 7, url });
+    expect(chrome.sidePanel.setOptions).toHaveBeenLastCalledWith({ tabId: 7, enabled: false });
+
+    chrome.events.actionClicked.listeners[0]({ id: 7, url });
+    expect(chrome.sidePanel.open).not.toHaveBeenCalled();
   });
 
   it("opens the panel before asynchronous tab configuration completes", () => {
@@ -176,5 +219,40 @@ describe("background tab isolation", () => {
 
     await chrome.events.tabRemoved.listeners[0](7);
     expect(chrome.storage.session.set).toHaveBeenLastCalledWith({ analyzedTabs: {} });
+  });
+
+  it("does not reuse analysis state for another media item in the same tab", async () => {
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    await dispatchMessage(
+      chrome,
+      {
+        type: "REGISTER_ANALYSIS",
+        tabId: 7,
+        contentRef: {
+          platform: "x",
+          sourceContentId: "2075545587093807111",
+          mediaIndex: 1,
+        },
+        jobId: "job-1",
+      },
+    );
+
+    chrome.tabs.query.mockResolvedValueOnce([{
+      id: 7,
+      url: "https://x.com/viktoroddy/status/2075545587093807111/video/2",
+      title: "X video",
+    }]);
+    const context = await dispatchMessage(chrome, { type: "GET_ACTIVE_TAB_CONTEXT" });
+
+    expect(context).toEqual(expect.objectContaining({
+      contentRef: {
+        platform: "x",
+        sourceContentId: "2075545587093807111",
+        mediaIndex: 2,
+      },
+      videoId: null,
+      analysis: null,
+    }));
   });
 });
