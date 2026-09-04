@@ -9,6 +9,7 @@ import { contentKey, parseContentRef } from "./shared/content";
 
 const STORAGE_KEY = "analyzedTabs";
 const MEDIA_STORAGE_KEY = "xMediaCapture";
+const MEDIA_CLEANUP_ALARM = "xMediaCandidateCleanup";
 const CAPTURE_WINDOW_MS = 15_000;
 const CANDIDATE_TTL_MS = 10 * 60_000;
 const MAX_CANDIDATES = 50;
@@ -29,7 +30,7 @@ interface BackgroundState {
 
 type ChromeApi = Pick<
   typeof chrome,
-  "action" | "runtime" | "sidePanel" | "scripting" | "storage" | "tabs" | "webRequest"
+  "action" | "alarms" | "runtime" | "sidePanel" | "scripting" | "storage" | "tabs" | "webRequest"
 >;
 
 export function parseVideoId(url?: string): string | null {
@@ -53,6 +54,7 @@ export function installBackgroundHandlers(chromeApi: ChromeApi): void {
     .setPanelBehavior({ openPanelOnActionClick: false })
     .catch(reportBackgroundError);
   void configureActiveTab(chromeApi).catch(reportBackgroundError);
+  void runCaptureTask(() => scheduleMediaCleanup(chromeApi)).catch(reportBackgroundError);
 
   chromeApi.action.onClicked.addListener((tab) => {
     const tabId = tab.id;
@@ -73,7 +75,7 @@ export function installBackgroundHandlers(chromeApi: ChromeApi): void {
   chromeApi.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (!changeInfo.url) return;
     activeContentByTab.delete(tabId);
-    const cleared = runCaptureTask(() => clearMediaForTab(chromeApi, tabId));
+    const cleared = runCaptureTask(() => closeCaptureForTab(chromeApi, tabId));
     if (parseContentRef(tab.url)) {
       void updatePanelForTab(chromeApi, tabId, tab.url).catch(reportBackgroundError);
       void cleared.catch(reportBackgroundError);
@@ -97,6 +99,11 @@ export function installBackgroundHandlers(chromeApi: ChromeApi): void {
     },
     { urls: ["https://video.twimg.com/*"], types: ["media", "xmlhttprequest"] },
   );
+
+  chromeApi.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name !== MEDIA_CLEANUP_ALARM) return;
+    void runCaptureTask(() => cleanupExpiredMedia(chromeApi)).catch(reportBackgroundError);
+  });
 
   chromeApi.runtime.onMessage.addListener(
     (message: ExtensionMessage, sender, sendResponse) => {
@@ -138,7 +145,6 @@ async function handleMessage(
     return state.runCaptureTask(async () => {
       const mediaState = await loadMediaCaptureState(chromeApi);
       const tabKey = String(tabId);
-      const key = contentKey(message.contentRef);
       const prior = mediaState[tabKey];
       const samePlayer = Boolean(
         prior?.active && sameContentRef(prior.active.contentRef, message.contentRef),
@@ -148,12 +154,11 @@ async function handleMessage(
           contentRef: message.contentRef,
           expiresAt: samePlayer ? prior.active!.expiresAt : signalAt + CAPTURE_WINDOW_MS,
         },
-        candidates: samePlayer
-          ? { [key]: pruneCandidates(prior.candidates[key] ?? [], Date.now()) }
-          : {},
+        candidates: pruneCandidateMap(prior?.candidates ?? {}, Date.now()),
       };
       state.activeContentByTab.set(tabId, message.contentRef);
       await chromeApi.storage.session.set({ [MEDIA_STORAGE_KEY]: mediaState });
+      await scheduleMediaCleanupForState(chromeApi, mediaState);
       await chromeApi.sidePanel.setOptions({ tabId, path: "sidepanel.html", enabled: true });
       return { ok: true };
     });
@@ -166,11 +171,13 @@ async function handleMessage(
     }
     return state.runCaptureTask(async () => {
       const mediaState = await loadMediaCaptureState(chromeApi);
-      const active = mediaState[String(tabId)]?.active;
-      if (active && sameContentRef(active.contentRef, message.contentRef)) {
-        delete mediaState[String(tabId)];
+      const tabState = mediaState[String(tabId)];
+      if (tabState?.active && sameContentRef(tabState.active.contentRef, message.contentRef)) {
+        tabState.active = null;
+        tabState.candidates = pruneCandidateMap(tabState.candidates, Date.now());
         state.activeContentByTab.delete(tabId);
         await chromeApi.storage.session.set({ [MEDIA_STORAGE_KEY]: mediaState });
+        await scheduleMediaCleanupForState(chromeApi, mediaState);
         await updatePanelForTab(chromeApi, tabId, sender.tab?.url ?? sender.url);
       }
       return { ok: true };
@@ -185,15 +192,17 @@ async function handleMessage(
       const now = Date.now();
       const tabState = mediaState[String(message.tabId)];
       const key = contentKey(message.contentRef);
-      if (!tabState?.active || !sameContentRef(tabState.active.contentRef, message.contentRef)) {
-        return { candidates: [] };
-      }
+      if (!tabState) return { candidates: [] };
       const candidates = pruneCandidates(tabState.candidates[key] ?? [], now);
 
       if (candidates.length !== (tabState.candidates[key]?.length ?? 0)) {
         if (candidates.length) tabState.candidates[key] = candidates;
         else delete tabState.candidates[key];
+        if (!tabState.active && Object.keys(tabState.candidates).length === 0) {
+          delete mediaState[String(message.tabId)];
+        }
         await chromeApi.storage.session.set({ [MEDIA_STORAGE_KEY]: mediaState });
+        await scheduleMediaCleanupForState(chromeApi, mediaState);
       }
       return { candidates: sortCandidates(candidates) };
     });
@@ -280,6 +289,7 @@ async function captureMediaCandidate(
   current.push(candidate);
   tabState.candidates[key] = sortCandidates(current).slice(0, MAX_CANDIDATES);
   await chromeApi.storage.session.set({ [MEDIA_STORAGE_KEY]: state });
+  await scheduleMediaCleanupForState(chromeApi, state);
 }
 
 function mediaCandidateFromRequest(urlValue: string, capturedAt: number): MediaCandidate | null {
@@ -390,9 +400,20 @@ function sameContentRef(left: ContentRef, right: ContentRef): boolean {
 function pruneCandidates(candidates: MediaCandidate[], now: number): MediaCandidate[] {
   return candidates.filter((candidate) => (
     candidate.capturedAt <= now + CAPTURE_WINDOW_MS
-    && now - candidate.capturedAt <= CANDIDATE_TTL_MS
+    && now - candidate.capturedAt < CANDIDATE_TTL_MS
     && mediaCandidateFromRequest(candidate.url, candidate.capturedAt)?.kind === candidate.kind
   ));
+}
+
+function pruneCandidateMap(
+  candidates: Record<string, MediaCandidate[]>,
+  now: number,
+): Record<string, MediaCandidate[]> {
+  return Object.fromEntries(
+    Object.entries(candidates)
+      .map(([key, values]) => [key, pruneCandidates(values, now)] as const)
+      .filter((entry) => entry[1].length > 0),
+  );
 }
 
 function sortCandidates(candidates: MediaCandidate[]): MediaCandidate[] {
@@ -426,6 +447,53 @@ async function clearMediaForTab(chromeApi: ChromeApi, tabId: number): Promise<vo
   if (!state[String(tabId)]) return;
   delete state[String(tabId)];
   await chromeApi.storage.session.set({ [MEDIA_STORAGE_KEY]: state });
+  await scheduleMediaCleanupForState(chromeApi, state);
+}
+
+async function closeCaptureForTab(chromeApi: ChromeApi, tabId: number): Promise<void> {
+  const state = await loadMediaCaptureState(chromeApi);
+  const tabState = state[String(tabId)];
+  if (!tabState?.active) return;
+  tabState.active = null;
+  tabState.candidates = pruneCandidateMap(tabState.candidates, Date.now());
+  if (Object.keys(tabState.candidates).length === 0) delete state[String(tabId)];
+  await chromeApi.storage.session.set({ [MEDIA_STORAGE_KEY]: state });
+  await scheduleMediaCleanupForState(chromeApi, state);
+}
+
+async function cleanupExpiredMedia(chromeApi: ChromeApi): Promise<void> {
+  const state = await loadMediaCaptureState(chromeApi);
+  const now = Date.now();
+  for (const [tabKey, tabState] of Object.entries(state)) {
+    tabState.candidates = pruneCandidateMap(tabState.candidates, now);
+    if (!tabState.active && Object.keys(tabState.candidates).length === 0) delete state[tabKey];
+  }
+  await chromeApi.storage.session.set({ [MEDIA_STORAGE_KEY]: state });
+  await scheduleMediaCleanupForState(chromeApi, state);
+}
+
+async function scheduleMediaCleanup(chromeApi: ChromeApi): Promise<void> {
+  const state = await loadMediaCaptureState(chromeApi);
+  await scheduleMediaCleanupForState(chromeApi, state);
+}
+
+async function scheduleMediaCleanupForState(
+  chromeApi: ChromeApi,
+  state: MediaCaptureState,
+): Promise<void> {
+  let nextExpiry = Number.POSITIVE_INFINITY;
+  for (const tabState of Object.values(state)) {
+    for (const candidates of Object.values(tabState.candidates)) {
+      for (const candidate of candidates) {
+        nextExpiry = Math.min(nextExpiry, candidate.capturedAt + CANDIDATE_TTL_MS);
+      }
+    }
+  }
+  if (Number.isFinite(nextExpiry)) {
+    chromeApi.alarms.create(MEDIA_CLEANUP_ALARM, { when: nextExpiry });
+  } else {
+    await chromeApi.alarms.clear(MEDIA_CLEANUP_ALARM);
+  }
 }
 
 async function updatePanelForTab(

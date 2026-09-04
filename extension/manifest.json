@@ -3,7 +3,7 @@
   "name": "Veeky - AI Agent：YouTube Video Translate & Summarize",
   "version": "0.1.0",
   "description": "读取公开视频字幕，在观看前生成翻译、摘要与时间轴。",
-  "permissions": ["sidePanel", "storage", "tabs", "scripting", "webRequest", "offscreen"],
+  "permissions": ["sidePanel", "storage", "tabs", "scripting", "webRequest", "offscreen", "alarms"],
   "host_permissions": [
     "https://*.youtube.com/*",
     "https://youtu.be/*",
