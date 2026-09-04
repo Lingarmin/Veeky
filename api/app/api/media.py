@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import ConfigDict, Field, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.analyses import ApiModel, enforce_write_quota
+from app.api.analyses import ApiModel, enforce_read_quota, enforce_write_quota
 from app.core.settings import Settings, get_settings
 from app.db.models import Installation, MediaUploadSession
 from app.db.session import get_session
@@ -30,9 +30,12 @@ from app.services.media_upload import (
 router = APIRouter(prefix="/v1/media-sessions", tags=["media"])
 _SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 MAX_COMPLETION_BODY_BYTES = 1024 * 1024
+MAX_CREATE_BODY_BYTES = 64 * 1024
 
 
 class MediaSessionCreateRequest(ApiModel):
+    model_config = ConfigDict(**ApiModel.model_config, extra="forbid")
+
     content_id: str
     kind: Literal["mp4", "hls"]
     expected_bytes: int = Field(strict=True)
@@ -85,12 +88,13 @@ class MediaArtifactResponse(ApiModel):
 
 @router.post("", response_model=MediaSessionCreateResponse, status_code=201)
 async def create_media_session(
-    request: MediaSessionCreateRequest,
+    http_request: Request,
     database: AsyncSession = Depends(get_session),
     installation: Installation = Depends(require_installation),
     settings: Settings = Depends(get_settings),
     _: None = Depends(enforce_write_quota),
 ) -> MediaSessionCreateResponse:
+    request = await _read_create_request(http_request)
     try:
         upload = await create_upload_session(
             database,
@@ -112,6 +116,7 @@ async def get_media_session(
     database: AsyncSession = Depends(get_session),
     installation: Installation = Depends(require_installation),
     settings: Settings = Depends(get_settings),
+    _: None = Depends(enforce_read_quota),
 ) -> MediaSessionResponse:
     try:
         upload = await get_owned_upload(
@@ -276,6 +281,46 @@ async def _read_completion_request(request: Request) -> MediaSessionCompleteRequ
                 },
             ) from None
         raise _invalid_completion_body() from None
+
+
+async def _read_create_request(request: Request) -> MediaSessionCreateRequest:
+    declared_length = request.headers.get("content-length")
+    if declared_length is not None:
+        try:
+            if int(declared_length) > MAX_CREATE_BODY_BYTES:
+                raise _create_body_too_large()
+        except ValueError:
+            raise _invalid_create_body() from None
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > MAX_CREATE_BODY_BYTES:
+            raise _create_body_too_large()
+        body.extend(chunk)
+    try:
+        payload = await asyncio.to_thread(json.loads, bytes(body))
+        return MediaSessionCreateRequest.model_validate(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError, ValidationError):
+        raise _invalid_create_body() from None
+
+
+def _create_body_too_large() -> HTTPException:
+    return HTTPException(
+        status_code=413,
+        detail={
+            "code": "create_body_too_large",
+            "message": "create body exceeds the size limit",
+        },
+    )
+
+
+def _invalid_create_body() -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail={
+            "code": "invalid_create_body",
+            "message": "create body is malformed or invalid",
+        },
+    )
 
 
 def _completion_body_too_large() -> HTTPException:

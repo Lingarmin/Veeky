@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -77,6 +77,7 @@ async def create_upload_session(
     part_count: int,
 ) -> MediaUploadSession:
     _validate_declaration(settings, expected_bytes, part_count)
+    await _serialize_sqlite_write(database)
     await database.scalar(
         select(Installation.id)
         .where(Installation.id == installation_id)
@@ -173,6 +174,7 @@ async def get_owned_upload(
     if upload is None:
         raise _error(404, "media_session_not_found", "media session was not found")
     if expire and _is_expired(upload):
+        await _serialize_sqlite_write(database)
         upload = await _lock_owned(database, session_id, installation_id)
         if upload is None:
             raise _error(404, "media_session_not_found", "media session was not found")
@@ -189,86 +191,106 @@ async def store_part(
     checksum: str,
     chunks: AsyncIterator[bytes],
 ) -> None:
-    _require_writable(upload)
     upload_id = upload.id
     installation_id = upload.installation_id
     if part_number < 0 or part_number >= upload.part_count:
         raise _error(422, "invalid_part_number", "part number is outside the declaration")
     expected_size = _expected_part_size(upload, part_number)
-    directory = _session_directory(settings, upload)
-    temporary = directory / f".upload-{uuid.uuid4()}.tmp"
-    final_path = _part_path(directory, part_number)
+    staging_directory = _staging_directory(settings)
+    temporary = staging_directory / f"{uuid.uuid4()}.tmp"
+    created_file = False
+    final_path: Path | None = None
 
     try:
-        size, actual_checksum = await _write_temporary_part(
-            directory, temporary, chunks, expected_size
-        )
-    except MediaUploadError:
-        raise
-    except OSError as error:
-        raise _error(503, "storage_unavailable", "media storage is unavailable") from error
-    if actual_checksum != checksum.lower():
-        await asyncio.to_thread(_unlink_if_exists_sync, temporary)
-        raise _error(422, "checksum_mismatch", "part checksum does not match")
-    try:
-        created_file = await asyncio.to_thread(
-            _publish_part_sync,
-            temporary,
-            final_path,
-            size,
-            actual_checksum,
-        )
-    except PartIntegrityError as error:
-        raise _error(409, "part_conflict", str(error)) from error
-    except OSError as error:
-        raise _error(503, "storage_unavailable", "media storage is unavailable") from error
+        try:
+            size, actual_checksum = await _write_temporary_part(
+                staging_directory, temporary, chunks, expected_size
+            )
+        except MediaUploadError:
+            raise
+        except OSError as error:
+            raise _error(
+                503, "storage_unavailable", "media storage is unavailable"
+            ) from error
+        if actual_checksum != checksum.lower():
+            raise _error(422, "checksum_mismatch", "part checksum does not match")
 
-    await database.rollback()
-    locked = await _lock_owned(database, upload_id, installation_id)
-    if locked is None:
-        if created_file:
-            await asyncio.to_thread(_unlink_and_fsync_sync, final_path)
-        raise _error(404, "media_session_not_found", "media session was not found")
-    if _is_expired(locked):
-        await _expire_locked(database, settings, locked)
-        raise _error(409, "upload_expired", "media upload session has expired")
-    if locked.status not in {"created", "uploading"}:
-        if created_file:
-            await asyncio.to_thread(_unlink_and_fsync_sync, final_path)
-        raise _invalid_state(locked.status)
+        await _restart_write_transaction(database)
+        locked = await _lock_owned(database, upload_id, installation_id)
+        if locked is None:
+            raise _error(404, "media_session_not_found", "media session was not found")
+        if _is_expired(locked):
+            await _expire_locked(database, settings, locked)
+            raise _error(409, "upload_expired", "media upload session has expired")
 
-    existing = next(
-        (part for part in locked.parts if part.part_number == part_number), None
-    )
-    if existing is not None:
-        if existing.byte_size != size or existing.sha256 != actual_checksum:
-            _transition(locked, "failed")
-            await database.commit()
+        existing = next(
+            (part for part in locked.parts if part.part_number == part_number), None
+        )
+        metadata_matches = (
+            existing is not None
+            and existing.byte_size == size
+            and existing.sha256 == actual_checksum
+        )
+        if locked.status in {"complete", "consumed"}:
+            if metadata_matches:
+                await database.commit()
+                return
+            raise _invalid_state(locked.status)
+        if locked.status not in {"created", "uploading"}:
+            raise _invalid_state(locked.status)
+        if existing is not None and not metadata_matches:
             raise _error(
                 409,
-                "part_integrity_failed",
-                "published part does not match its stored metadata",
+                "part_conflict",
+                "part number already contains different bytes",
             )
-        await database.commit()
-        return
 
-    locked.parts.append(
-        MediaUploadPart(
-            part_number=part_number,
-            byte_size=size,
-            sha256=actual_checksum,
-            created_at=utc_now(),
+        directory = _session_directory(settings, locked)
+        final_path = _part_path(directory, part_number)
+        try:
+            created_file = await asyncio.to_thread(
+                _publish_part_sync,
+                temporary,
+                final_path,
+                size,
+                actual_checksum,
+            )
+        except PartIntegrityError as error:
+            raise _error(409, "part_conflict", str(error)) from error
+
+        if existing is not None:
+            await database.commit()
+            created_file = False
+            return
+
+        locked.parts.append(
+            MediaUploadPart(
+                part_number=part_number,
+                byte_size=size,
+                sha256=actual_checksum,
+                created_at=utc_now(),
+            )
         )
-    )
-    locked.received_bytes += size
-    if locked.received_bytes > locked.expected_bytes:
-        _transition(locked, "failed")
+        locked.received_bytes += size
+        if locked.received_bytes > locked.expected_bytes:
+            _transition(locked, "failed")
+            await database.commit()
+            created_file = False
+            raise _error(409, "upload_failed", "received media exceeds its declaration")
+        if locked.status == "created":
+            _transition(locked, "uploading")
+        locked.updated_at = utc_now()
         await database.commit()
-        raise _error(409, "upload_failed", "received media exceeds its declaration")
-    if locked.status == "created":
-        _transition(locked, "uploading")
-    locked.updated_at = utc_now()
-    await database.commit()
+        created_file = False
+    except OSError as error:
+        await database.rollback()
+        raise _error(
+            503, "storage_unavailable", "media storage is unavailable"
+        ) from error
+    finally:
+        if created_file and final_path is not None:
+            await asyncio.to_thread(_unlink_and_fsync_sync, final_path)
+        await asyncio.to_thread(_unlink_if_exists_sync, temporary)
 
 
 async def complete_upload(
@@ -281,7 +303,7 @@ async def complete_upload(
 ) -> MediaArtifact:
     upload_id = upload.id
     installation_id = upload.installation_id
-    await database.rollback()
+    await _restart_write_transaction(database)
     locked = await _lock_owned(database, upload_id, installation_id)
     if locked is None:
         raise _error(404, "media_session_not_found", "media session was not found")
@@ -345,25 +367,23 @@ async def complete_upload(
                 json.dumps(canonical_manifest, separators=(",", ":")).encode("utf-8"),
             )
             locked.hls_manifest = canonical_manifest
+    # MP4 assembly releases verified parts as it advances, so failures are terminal.
     except PartIntegrityError as error:
         _transition(locked, "failed")
         locked.updated_at = utc_now()
         await database.commit()
         raise _error(409, "part_integrity_failed", str(error)) from error
     except OSError as error:
-        await database.rollback()
-        raise _error(503, "storage_unavailable", "media storage is unavailable") from error
+        _transition(locked, "failed")
+        locked.updated_at = utc_now()
+        await database.commit()
+        raise _error(
+            503, "storage_unavailable", "media storage is unavailable"
+        ) from error
 
     _transition(locked, "complete")
     locked.updated_at = utc_now()
     await database.commit()
-    if locked.media_kind == "mp4":
-        try:
-            await asyncio.to_thread(_remove_part_files_sync, directory, locked.parts)
-        except OSError as error:
-            raise _error(
-                503, "storage_unavailable", "media storage is unavailable"
-            ) from error
     return _artifact(locked, artifact_path)
 
 
@@ -374,7 +394,7 @@ async def delete_upload(
 ) -> None:
     upload_id = upload.id
     installation_id = upload.installation_id
-    await database.rollback()
+    await _restart_write_transaction(database)
     locked = await _lock_owned(database, upload_id, installation_id)
     if locked is None:
         raise _error(404, "media_session_not_found", "media session was not found")
@@ -402,6 +422,7 @@ async def cleanup_expired_uploads(
     await database.rollback()
     cleaned = 0
     for session_id in session_ids:
+        await _serialize_sqlite_write(database)
         upload = await database.scalar(
             select(MediaUploadSession)
             .options(selectinload(MediaUploadSession.parts))
@@ -505,6 +526,8 @@ def _assemble_mp4_sync(
     artifact_path = directory / "media.mp4"
     temporary = directory / f".assemble-{uuid.uuid4()}.tmp"
     total_bytes = 0
+    published = False
+    durable = False
     try:
         with temporary.open("xb") as destination:
             for part in parts:
@@ -524,14 +547,23 @@ def _assemble_mp4_sync(
                 if part_size != part.byte_size or digest.hexdigest() != part.sha256:
                     raise PartIntegrityError("a verified media part is missing or changed")
                 total_bytes += part_size
+                destination.flush()
+                os.fsync(destination.fileno())
+                source_path.unlink(missing_ok=True)
+                _fsync_directory_sync(directory)
             destination.flush()
             os.fsync(destination.fileno())
         if total_bytes != expected_bytes:
             raise PartIntegrityError("assembled media size is incorrect")
         os.replace(temporary, artifact_path)
+        published = True
         _fsync_directory_sync(directory)
+        durable = True
     finally:
         temporary.unlink(missing_ok=True)
+        if published and not durable:
+            artifact_path.unlink(missing_ok=True)
+            _fsync_directory_if_exists_sync(directory)
     return artifact_path
 
 
@@ -557,6 +589,7 @@ def _publish_part_sync(
 ) -> bool:
     created = False
     try:
+        _ensure_directory_sync(final_path.parent)
         try:
             os.link(temporary, final_path)
             created = True
@@ -566,12 +599,10 @@ def _publish_part_sync(
                 raise PartIntegrityError(
                     "part number already contains different bytes"
                 )
-        temporary.unlink(missing_ok=True)
         if created:
             _fsync_directory_sync(final_path.parent)
         return created
     except BaseException:
-        temporary.unlink(missing_ok=True)
         if created:
             final_path.unlink(missing_ok=True)
         raise
@@ -591,14 +622,9 @@ def _atomic_write_sync(path: Path, body: bytes) -> None:
 
 
 def _remove_part_files_sync(directory: Path, parts: list[MediaUploadPart]) -> None:
-    removed = False
     for part in parts:
-        path = _part_path(directory, part.part_number)
-        if path.exists():
-            path.unlink()
-            removed = True
-    if removed and directory.exists():
-        _fsync_directory_sync(directory)
+        _part_path(directory, part.part_number).unlink(missing_ok=True)
+    _fsync_directory_if_exists_sync(directory)
 
 
 def _remove_session_directory_sync(
@@ -606,8 +632,11 @@ def _remove_session_directory_sync(
 ) -> None:
     directory = _session_directory(settings, upload)
     root = directory.parent
-    if directory.exists():
+    try:
         shutil.rmtree(directory)
+    except FileNotFoundError:
+        return
+    else:
         _fsync_directory_sync(root)
 
 
@@ -619,9 +648,8 @@ def _ensure_directory_sync(directory: Path) -> None:
 
 
 def _unlink_and_fsync_sync(path: Path) -> None:
-    if path.exists():
-        path.unlink()
-        _fsync_directory_sync(path.parent)
+    path.unlink(missing_ok=True)
+    _fsync_directory_if_exists_sync(path.parent)
 
 
 def _fsync_directory_sync(directory: Path) -> None:
@@ -630,6 +658,13 @@ def _fsync_directory_sync(directory: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _fsync_directory_if_exists_sync(directory: Path) -> None:
+    try:
+        _fsync_directory_sync(directory)
+    except FileNotFoundError:
+        pass
 
 
 def _write_and_hash_sync(destination, digest, chunk: bytes) -> None:
@@ -719,6 +754,11 @@ def _session_directory(settings: Settings, upload: MediaUploadSession) -> Path:
     return directory
 
 
+def _staging_directory(settings: Settings) -> Path:
+    root = Path(settings.media_temp_root).resolve()
+    return (root / ".staging").resolve()
+
+
 def _part_path(directory: Path, part_number: int) -> Path:
     return directory / f"part-{part_number:08d}.bin"
 
@@ -753,13 +793,6 @@ def _transition(upload: MediaUploadSession, target: str) -> None:
     upload.status = target
 
 
-def _require_writable(upload: MediaUploadSession) -> None:
-    if upload.status == "expired" or _is_expired(upload):
-        raise _error(409, "upload_expired", "media upload session has expired")
-    if upload.status not in {"created", "uploading"}:
-        raise _invalid_state(upload.status)
-
-
 def _invalid_state(status: str) -> MediaUploadError:
     if status == "expired":
         return _error(409, "upload_expired", "media upload session has expired")
@@ -777,3 +810,15 @@ def _is_expired(upload: MediaUploadSession) -> bool:
 
 def _error(status_code: int, code: str, message: str) -> MediaUploadError:
     return MediaUploadError(status_code, code, message)
+
+
+async def _serialize_sqlite_write(database: AsyncSession) -> None:
+    if database.get_bind().dialect.name == "sqlite":
+        await database.rollback()
+        await database.execute(text("BEGIN IMMEDIATE"))
+
+
+async def _restart_write_transaction(database: AsyncSession) -> None:
+    await database.rollback()
+    if database.get_bind().dialect.name == "sqlite":
+        await database.execute(text("BEGIN IMMEDIATE"))

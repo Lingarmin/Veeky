@@ -128,15 +128,21 @@ def media_postgres_url() -> Iterator[str]:
             f"postgresql+asyncpg://veeky:veeky@127.0.0.1:{port}/veeky_media_test"
         )
         environment = {**os.environ, "DATABASE_URL": database_url}
-        migrated = subprocess.run(
-            [sys.executable, "-m", "alembic", "upgrade", "head"],
-            cwd=API_DIRECTORY,
-            env=environment,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert migrated.returncode == 0, migrated.stderr
+        migration_deadline = time.monotonic() + 10
+        while True:
+            migrated = subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                cwd=API_DIRECTORY,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if migrated.returncode == 0:
+                break
+            if time.monotonic() >= migration_deadline:
+                pytest.fail(migrated.stderr)
+            time.sleep(0.25)
         yield database_url
     finally:
         subprocess.run(["docker", "rm", "--force", container_id], check=False)
@@ -340,6 +346,7 @@ async def test_every_media_mutation_consumes_the_installation_write_quota(media_
     created = await create_session(client, expected_bytes=4, part_count=1)
     session_id = created.json()["sessionId"]
 
+    await client.get(f"/v1/media-sessions/{session_id}")
     await upload_part(client, session_id, 0, b"part")
     await client.post(
         f"/v1/media-sessions/{session_id}/complete",
@@ -349,10 +356,100 @@ async def test_every_media_mutation_consumes_the_installation_write_quota(media_
 
     assert limiter.calls == [
         (INSTALLATION_ID, "write", 20),
+        (INSTALLATION_ID, "read", 120),
         (INSTALLATION_ID, "write", 20),
         (INSTALLATION_ID, "write", 20),
         (INSTALLATION_ID, "write", 20),
     ]
+
+
+@pytest.mark.asyncio
+async def test_create_bounds_and_strictly_validates_body_after_auth_and_quota(
+    media_context,
+):
+    client, app, _, _ = media_context
+    limiter = TrackingQuotaLimiter()
+    app.dependency_overrides[get_quota_limiter] = lambda: limiter
+
+    unknown = await client.post(
+        "/v1/media-sessions",
+        json={
+            "contentId": CONTENT_ID,
+            "kind": "mp4",
+            "expectedBytes": 4,
+            "partCount": 1,
+            "clientPath": "/private/client/video.mp4",
+        },
+    )
+    oversized = await client.post(
+        "/v1/media-sessions",
+        json={
+            "contentId": CONTENT_ID,
+            "kind": "mp4",
+            "expectedBytes": 4,
+            "partCount": 1,
+            "padding": "x" * (64 * 1024),
+        },
+    )
+    unauthorized = await client.post(
+        "/v1/media-sessions",
+        content=b"x" * (64 * 1024 + 1),
+        headers={
+            "Authorization": "Bearer invalid",
+            "Content-Type": "application/json",
+        },
+    )
+
+    assert unknown.status_code == 422
+    assert unknown.json()["detail"]["code"] == "invalid_create_body"
+    assert "/private/client/video.mp4" not in unknown.text
+    assert oversized.status_code == 413
+    assert oversized.json()["detail"]["code"] == "create_body_too_large"
+    assert unauthorized.status_code == 401
+    assert limiter.calls == [
+        (INSTALLATION_ID, "write", 20),
+        (INSTALLATION_ID, "write", 20),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unauthenticated_create_is_rejected_without_reading_body(media_context):
+    _, app, _, _ = media_context
+    response_status = None
+
+    async def receive():
+        raise AssertionError("request body must not be read before authentication")
+
+    async def send(message):
+        nonlocal response_status
+        if message["type"] == "http.response.start":
+            response_status = message["status"]
+
+    await app(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/media-sessions",
+            "raw_path": b"/v1/media-sessions",
+            "query_string": b"",
+            "root_path": "",
+            "server": ("test", 80),
+            "client": ("127.0.0.1", 1234),
+            "headers": [
+                (b"authorization", b"Bearer invalid"),
+                (b"x-veeky-installation-id", INSTALLATION_ID.encode()),
+                (b"content-type", b"application/json"),
+                (b"content-length", str(64 * 1024 + 1).encode()),
+            ],
+        },
+        receive,
+        send,
+    )
+
+    assert response_status == 401
 
 
 def test_media_uploads_default_to_one_active_session_per_installation():
@@ -381,7 +478,7 @@ async def test_create_enforces_active_session_and_reserved_byte_caps(media_conte
 
 @pytest.mark.asyncio
 async def test_upload_rejects_bad_checksum_and_conflicting_duplicate(media_context):
-    client, _, _, _ = media_context
+    client, _, _, media_root = media_context
     session_id = (await create_session(client)).json()["sessionId"]
     part = b"0123456789abcdef"
 
@@ -393,6 +490,33 @@ async def test_upload_rejects_bad_checksum_and_conflicting_duplicate(media_conte
     conflict = await upload_part(client, session_id, 0, b"fedcba9876543210")
     assert conflict.status_code == 409
     assert conflict.json()["detail"]["code"] == "part_conflict"
+    assert list(media_root.glob(".staging/*.tmp")) == []
+
+
+@pytest.mark.asyncio
+async def test_completed_and_consumed_part_retries_use_database_metadata(media_context):
+    client, _, factory, media_root = media_context
+    session_id = (
+        await create_session(client, expected_bytes=4, part_count=1)
+    ).json()["sessionId"]
+    await upload_part(client, session_id, 0, b"part")
+    completed = await client.post(
+        f"/v1/media-sessions/{session_id}/complete",
+        json={"partCount": 1, "totalBytes": 4},
+    )
+    assert completed.status_code == 200
+
+    assert (await upload_part(client, session_id, 0, b"part")).status_code == 204
+    async with factory() as session:
+        upload = await session.get(MediaUploadSession, session_id)
+        upload.status = "consumed"
+        await session.commit()
+    assert (await upload_part(client, session_id, 0, b"part")).status_code == 204
+
+    conflict = await upload_part(client, session_id, 0, b"nope")
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "invalid_upload_state"
+    assert list(media_root.glob(".staging/*.tmp")) == []
 
 
 @pytest.mark.asyncio
@@ -543,6 +667,116 @@ async def test_complete_rejects_a_part_changed_after_it_was_verified(media_conte
     assert response.json()["detail"]["code"] == "part_integrity_failed"
     status = await client.get(f"/v1/media-sessions/{session_id}")
     assert status.json()["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_mp4_assembly_releases_parts_as_the_output_grows(
+    media_context, monkeypatch
+):
+    client, _, factory, media_root = media_context
+    session_id = (await create_session(client)).json()["sessionId"]
+    await upload_part(client, session_id, 0, b"0123456789abcdef")
+    await upload_part(client, session_id, 1, b"tail")
+    async with factory() as session:
+        upload = await session.get(MediaUploadSession, session_id)
+        directory = media_root / upload.directory_key
+
+    observed_sizes: list[int] = []
+    original_fsync = media_upload._fsync_directory_sync
+
+    def observe_directory_size(path):
+        observed_sizes.append(
+            sum(item.stat().st_size for item in path.iterdir() if item.is_file())
+        )
+        original_fsync(path)
+
+    monkeypatch.setattr(media_upload, "_fsync_directory_sync", observe_directory_size)
+
+    response = await client.post(
+        f"/v1/media-sessions/{session_id}/complete",
+        json={"partCount": 2, "totalBytes": 20},
+    )
+
+    assert response.status_code == 200
+    assert observed_sizes
+    assert max(observed_sizes) <= 20
+    assert (directory / "media.mp4").read_bytes() == b"0123456789abcdef" + b"tail"
+
+
+@pytest.mark.asyncio
+async def test_mp4_assembly_storage_failure_is_non_retryable_and_cleans_partial_output(
+    media_context, monkeypatch
+):
+    client, _, factory, media_root = media_context
+    session_id = (await create_session(client)).json()["sessionId"]
+    await upload_part(client, session_id, 0, b"0123456789abcdef")
+    await upload_part(client, session_id, 1, b"tail")
+    async with factory() as session:
+        upload = await session.get(MediaUploadSession, session_id)
+        directory = media_root / upload.directory_key
+
+    original_fsync = media_upload._fsync_directory_sync
+
+    def fail_after_first_part_is_released(path):
+        if not (path / "part-00000000.bin").exists():
+            raise OSError("injected assembly fsync failure")
+        original_fsync(path)
+
+    monkeypatch.setattr(
+        media_upload,
+        "_fsync_directory_sync",
+        fail_after_first_part_is_released,
+    )
+
+    response = await client.post(
+        f"/v1/media-sessions/{session_id}/complete",
+        json={"partCount": 2, "totalBytes": 20},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "storage_unavailable"
+    async with factory() as session:
+        upload = await session.get(MediaUploadSession, session_id)
+        assert upload.status == "failed"
+    assert not (directory / "media.mp4").exists()
+    assert list(directory.glob(".assemble-*.tmp")) == []
+
+
+@pytest.mark.asyncio
+async def test_mp4_assembly_fsync_failure_after_publish_removes_artifact(
+    media_context, monkeypatch
+):
+    client, _, factory, media_root = media_context
+    session_id = (
+        await create_session(client, expected_bytes=4, part_count=1)
+    ).json()["sessionId"]
+    await upload_part(client, session_id, 0, b"part")
+    async with factory() as session:
+        upload = await session.get(MediaUploadSession, session_id)
+        directory = media_root / upload.directory_key
+
+    original_fsync = media_upload._fsync_directory_sync
+
+    def fail_after_artifact_publish(path):
+        if (path / "media.mp4").exists():
+            raise OSError("injected artifact fsync failure")
+        original_fsync(path)
+
+    monkeypatch.setattr(
+        media_upload, "_fsync_directory_sync", fail_after_artifact_publish
+    )
+
+    response = await client.post(
+        f"/v1/media-sessions/{session_id}/complete",
+        json={"partCount": 1, "totalBytes": 4},
+    )
+
+    assert response.status_code == 503
+    async with factory() as session:
+        upload = await session.get(MediaUploadSession, session_id)
+        assert upload.status == "failed"
+    assert not (directory / "media.mp4").exists()
+    assert list(directory.glob(".assemble-*.tmp")) == []
 
 
 @pytest.mark.asyncio
@@ -795,6 +1029,109 @@ async def seed_postgres_upload(factory, settings) -> tuple[str, Path]:
 
 
 @pytest.mark.asyncio
+async def test_sqlite_concurrent_creates_obey_limit_for_fifty_rounds(media_context):
+    _, _, factory, media_root = media_context
+    settings = media_settings(media_root).model_copy(
+        update={"max_active_media_upload_sessions_per_installation": 1}
+    )
+
+    async def create_one():
+        async with factory() as session:
+            return await create_upload_session(
+                session,
+                settings,
+                INSTALLATION_ID,
+                CONTENT_ID,
+                "mp4",
+                4,
+                1,
+            )
+
+    for _ in range(50):
+        results = await asyncio.gather(
+            create_one(), create_one(), return_exceptions=True
+        )
+        created = [
+            result for result in results if isinstance(result, MediaUploadSession)
+        ]
+        errors = [result for result in results if isinstance(result, MediaUploadError)]
+        assert len(created) == 1
+        assert len(errors) == 1
+        assert errors[0].code == "media_session_limit"
+        async with factory() as session:
+            upload = await get_owned_upload(
+                session, settings, created[0].id, INSTALLATION_ID, expire=False
+            )
+            await delete_upload(session, settings, upload)
+
+
+@pytest.mark.asyncio
+async def test_sqlite_serializes_complete_delete_and_expire_for_fifty_rounds(
+    media_context, monkeypatch
+):
+    _, _, factory, media_root = media_context
+    settings = media_settings(media_root)
+    original_assemble = media_upload._assemble_mp4_sync
+    original_now = media_upload.utc_now
+
+    for round_number in range(50):
+        monkeypatch.setattr(media_upload, "utc_now", original_now)
+        session_id, directory = await seed_postgres_upload(factory, settings)
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_assemble(*args):
+            entered.set()
+            assert release.wait(5)
+            return original_assemble(*args)
+
+        monkeypatch.setattr(media_upload, "_assemble_mp4_sync", blocked_assemble)
+
+        async def complete_one():
+            async with factory() as session:
+                upload = await get_owned_upload(
+                    session, settings, session_id, INSTALLATION_ID
+                )
+                return await complete_upload(session, settings, upload, 1, 4, None)
+
+        complete_task = asyncio.create_task(complete_one())
+        assert await asyncio.to_thread(entered.wait, 5)
+
+        if round_number % 2 == 0:
+
+            async def expire_one():
+                async with factory() as session:
+                    upload = await get_owned_upload(
+                        session,
+                        settings,
+                        session_id,
+                        INSTALLATION_ID,
+                        expire=False,
+                    )
+                    await delete_upload(session, settings, upload)
+
+        else:
+            future = original_now() + timedelta(hours=2)
+            monkeypatch.setattr(media_upload, "utc_now", lambda: future)
+
+            async def expire_one():
+                async with factory() as session:
+                    return await cleanup_expired_uploads(session, settings)
+
+        expire_task = asyncio.create_task(expire_one())
+        await asyncio.sleep(0)
+        assert not expire_task.done()
+        release.set()
+        await complete_task
+        await expire_task
+
+        async with factory() as session:
+            upload = await session.get(MediaUploadSession, session_id)
+            assert upload.status == "expired"
+        assert not directory.exists()
+
+
+@pytest.mark.asyncio
 async def test_postgres_concurrent_creates_cannot_exceed_installation_limit(
     postgres_media_context,
 ):
@@ -880,14 +1217,29 @@ async def test_postgres_complete_blocks_put_without_reverting_complete_state(
     session_id, directory = await seed_postgres_upload(factory, settings)
     entered = threading.Event()
     release = threading.Event()
+    put_staged = asyncio.Event()
+    staged_path = None
     original_assemble = media_upload._assemble_mp4_sync
+    original_write_temporary_part = media_upload._write_temporary_part
 
     def blocked_assemble(*args):
         entered.set()
         assert release.wait(5)
         return original_assemble(*args)
 
+    async def track_staged_part(*args):
+        nonlocal staged_path
+        result = await original_write_temporary_part(*args)
+        staged_path = args[1]
+        put_staged.set()
+        return result
+
     monkeypatch.setattr(media_upload, "_assemble_mp4_sync", blocked_assemble)
+    monkeypatch.setattr(
+        media_upload,
+        "_write_temporary_part",
+        track_staged_part,
+    )
 
     async def complete_one():
         async with factory() as session:
@@ -913,19 +1265,21 @@ async def test_postgres_complete_blocks_put_without_reverting_complete_state(
     complete_task = asyncio.create_task(complete_one())
     assert await asyncio.to_thread(entered.wait, 5)
     put_task = asyncio.create_task(retry_part())
-    await asyncio.sleep(0.05)
+    await asyncio.wait_for(put_staged.wait(), timeout=5)
+    assert staged_path is not None
+    assert staged_path.parent == Path(settings.media_temp_root).resolve() / ".staging"
+    uuid.UUID(staged_path.stem)
     assert not put_task.done()
     release.set()
     artifact = await complete_task
-    with pytest.raises(MediaUploadError) as rejected:
-        await put_task
+    await put_task
 
-    assert rejected.value.code == "invalid_upload_state"
     async with factory() as session:
         upload = await session.get(MediaUploadSession, session_id)
         assert upload.status == "complete"
     assert artifact.path == directory / "media.mp4"
     assert artifact.path.read_bytes() == b"part"
+    assert list(Path(settings.media_temp_root).glob(".staging/*.tmp")) == []
 
 
 @pytest.mark.asyncio
