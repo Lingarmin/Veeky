@@ -3,12 +3,18 @@ import type {
   AnalyzedTab,
   ContentRef,
   ExtensionMessage,
+  MediaApiRequest,
+  MediaApiResponse,
   MediaCandidate,
+  MediaUploadMessage,
 } from "./shared/types";
+import { OFFSCREEN_MEDIA_PORT } from "./shared/types";
 import { contentKey, parseContentRef, parseXStatusRoute } from "./shared/content";
+import { createApi, type MediaUploadApi } from "./sidepanel/api";
 
 const STORAGE_KEY = "analyzedTabs";
 const MEDIA_STORAGE_KEY = "xMediaCapture";
+const MEDIA_UPLOAD_JOBS_KEY = "mediaUploadJobs";
 const LAST_DETECTED_STORAGE_KEY = "xLastDetectedContent";
 const MEDIA_CLEANUP_ALARM = "xMediaCandidateCleanup";
 const CAPTURE_WINDOW_MS = 15_000;
@@ -57,6 +63,19 @@ interface BackgroundState {
   rescheduleRecentRequestCleanup: () => void;
   runCaptureTask: <T>(task: () => Promise<T>) => Promise<T>;
   offscreenCreation: Promise<void> | null;
+  offscreenPort: chrome.runtime.Port | null;
+  offscreenPortWaiters: Array<(port: chrome.runtime.Port) => void>;
+  activeUploadJobId: string | null;
+  completedUploadJobIds: Set<string>;
+}
+
+interface BackgroundDependencies {
+  mediaApi?: MediaUploadApi;
+}
+
+interface MediaUploadJobsState {
+  activeJobId: string | null;
+  completedJobIds: string[];
 }
 
 type ChromeApi = Pick<
@@ -78,7 +97,11 @@ export function parseVideoId(url?: string): string | null {
   return ref?.platform === "youtube" ? ref.sourceContentId : null;
 }
 
-export function installBackgroundHandlers(chromeApi: ChromeApi): void {
+export function installBackgroundHandlers(
+  chromeApi: ChromeApi,
+  dependencies: BackgroundDependencies = {},
+): void {
+  const mediaApi = dependencies.mediaApi ?? createApi();
   const lastDetectedContentByTab = new Map<number, ContentRef>();
   const recentRequestsByTab = new Map<number, BufferedMediaCandidate[]>();
   const routeEpochByTab = new Map<number, XRouteEpoch>();
@@ -124,11 +147,18 @@ export function installBackgroundHandlers(chromeApi: ChromeApi): void {
     rescheduleRecentRequestCleanup,
     runCaptureTask,
     offscreenCreation: null,
+    offscreenPort: null,
+    offscreenPortWaiters: [],
+    activeUploadJobId: null,
+    completedUploadJobIds: new Set(),
   };
   void chromeApi.sidePanel
     .setPanelBehavior({ openPanelOnActionClick: false })
     .catch(reportBackgroundError);
   const initialization = runCaptureTask(async () => {
+    const uploadJobs = await loadMediaUploadJobsState(chromeApi);
+    state.activeUploadJobId = uploadJobs.activeJobId;
+    state.completedUploadJobIds = new Set(uploadJobs.completedJobIds);
     await initializeMediaCapture(chromeApi);
     await configureActiveTab(chromeApi, lastDetectedContentByTab, routeEpochByTab);
   });
@@ -215,6 +245,35 @@ export function installBackgroundHandlers(chromeApi: ChromeApi): void {
     void runCaptureTask(() => cleanupExpiredMedia(chromeApi)).catch(reportBackgroundError);
   });
 
+  chromeApi.runtime.onConnect.addListener((port) => {
+    if (port.name !== OFFSCREEN_MEDIA_PORT) return;
+    if (!isTrustedOffscreenPort(chromeApi, port)) {
+      port.disconnect();
+      return;
+    }
+    if (state.offscreenPort && state.offscreenPort !== port) {
+      port.disconnect();
+      return;
+    }
+    state.offscreenPort = port;
+    for (const resolve of state.offscreenPortWaiters.splice(0)) resolve(port);
+    port.onMessage.addListener((message: unknown) => {
+      void handleOffscreenPortMessage(chromeApi, mediaApi, port, message, state)
+        .catch(reportBackgroundError);
+    });
+    port.onDisconnect.addListener(() => {
+      if (state.offscreenPort !== port) return;
+      state.offscreenPort = null;
+      globalThis.setTimeout(() => {
+        if (state.offscreenPort !== null) return;
+        void state.runCaptureTask(async () => {
+          state.activeUploadJobId = null;
+          await saveMediaUploadJobsState(chromeApi, state);
+        }).catch(reportBackgroundError);
+      }, 1_000);
+    });
+  });
+
   chromeApi.runtime.onMessage.addListener(
     (message: ExtensionMessage, sender, sendResponse) => {
       handleMessage(chromeApi, message, sender, state).then(sendResponse).catch((error) => {
@@ -249,13 +308,59 @@ async function handleMessage(
   state: BackgroundState,
 ): Promise<unknown> {
   if (message.type === "START_MEDIA_UPLOAD") {
-    if (!isValidXContentRef(message.contentRef)) return { ok: false };
+    if (
+      !isTrustedSidePanelSender(chromeApi, sender)
+      || !Number.isInteger(message.tabId)
+      || message.tabId < 0
+      || !message.jobId
+      || !isValidXContentRef(message.contentRef)
+      || !message.candidate
+      || typeof message.candidate.url !== "string"
+      || typeof message.candidate.capturedAt !== "number"
+    ) return { ok: false };
     const candidate = mediaCandidateFromRequest(message.candidate.url, message.candidate.capturedAt);
     if (!candidate || candidate.kind !== message.candidate.kind) return { ok: false };
-    const alreadyOpen = await chromeApi.offscreen.hasDocument();
-    await ensureOffscreenDocument(chromeApi, state);
-    if (!alreadyOpen) await chromeApi.runtime.sendMessage(message);
-    return { ok: true };
+    const authorized = await state.runCaptureTask(async () => {
+      if (
+        state.activeUploadJobId !== null
+        || state.completedUploadJobIds.has(message.jobId)
+      ) return false;
+      const [analyzedTabs, mediaState] = await Promise.all([
+        loadAnalyzedTabs(chromeApi),
+        loadMediaCaptureState(chromeApi),
+      ]);
+      const key = contentKey(message.contentRef);
+      const analyzed = analyzedTabs[String(message.tabId)]?.[key];
+      if (
+        !analyzed
+        || analyzed.tabId !== message.tabId
+        || analyzed.jobId !== message.jobId
+        || !analyzed.contentRef
+        || !sameContentRef(analyzed.contentRef, message.contentRef)
+      ) return false;
+      const storedCandidates = pruneCandidates(
+        mediaState[String(message.tabId)]?.candidates[key] ?? [],
+        Date.now(),
+      );
+      if (!storedCandidates.some((stored) => sameMediaCandidate(stored, message.candidate))) return false;
+      state.activeUploadJobId = message.jobId;
+      await saveMediaUploadJobsState(chromeApi, state);
+      return true;
+    });
+    if (!authorized) return { ok: false };
+    try {
+      await ensureOffscreenDocument(chromeApi, state);
+      const port = state.offscreenPort ?? await waitForOffscreenPort(state);
+      port.postMessage(message);
+      return { ok: true };
+    } catch (_error) {
+      await state.runCaptureTask(async () => {
+        if (state.activeUploadJobId !== message.jobId) return;
+        state.activeUploadJobId = null;
+        await saveMediaUploadJobsState(chromeApi, state);
+      });
+      return { ok: false };
+    }
   }
 
   if (
@@ -449,6 +554,185 @@ async function ensureOffscreenDocument(
     });
   }
   await state.offscreenCreation;
+}
+
+function waitForOffscreenPort(state: BackgroundState): Promise<chrome.runtime.Port> {
+  if (state.offscreenPort) return Promise.resolve(state.offscreenPort);
+  return new Promise((resolve, reject) => {
+    const waiter = (port: chrome.runtime.Port) => {
+      globalThis.clearTimeout(timer);
+      resolve(port);
+    };
+    const timer = globalThis.setTimeout(() => {
+      state.offscreenPortWaiters = state.offscreenPortWaiters.filter((entry) => entry !== waiter);
+      reject(new Error("Offscreen media port did not connect"));
+    }, 5_000);
+    state.offscreenPortWaiters.push(waiter);
+  });
+}
+
+function isTrustedSidePanelSender(chromeApi: ChromeApi, sender: chrome.runtime.MessageSender): boolean {
+  return sender.id === chromeApi.runtime.id
+    && sender.url === chromeApi.runtime.getURL("sidepanel.html");
+}
+
+function isTrustedOffscreenPort(chromeApi: ChromeApi, port: chrome.runtime.Port): boolean {
+  return port.sender?.id === chromeApi.runtime.id
+    && port.sender.url === chromeApi.runtime.getURL("offscreen.html");
+}
+
+function sameMediaCandidate(left: MediaCandidate, right: MediaCandidate): boolean {
+  return left.url === right.url
+    && left.kind === right.kind
+    && left.capturedAt === right.capturedAt;
+}
+
+async function handleOffscreenPortMessage(
+  chromeApi: ChromeApi,
+  mediaApi: MediaUploadApi,
+  port: chrome.runtime.Port,
+  message: unknown,
+  state: BackgroundState,
+): Promise<void> {
+  if (isMediaApiRequest(message)) {
+    try {
+      const result = await invokeMediaApi(mediaApi, message);
+      port.postMessage({
+        type: "MEDIA_API_RESPONSE",
+        requestId: message.requestId,
+        ok: true,
+        result,
+      } satisfies MediaApiResponse);
+    } catch (error) {
+      port.postMessage({
+        type: "MEDIA_API_RESPONSE",
+        requestId: message.requestId,
+        ok: false,
+        error: {
+          code: errorCodeFromApi(error),
+          message: error instanceof Error ? error.message : "Media API request failed",
+        },
+      } satisfies MediaApiResponse);
+    }
+    return;
+  }
+  if (!isMediaUploadNotification(message)) return;
+  const accepted = await state.runCaptureTask(async () => {
+    if (message.jobId !== state.activeUploadJobId) return false;
+    if (message.type === "MEDIA_UPLOAD_COMPLETE") {
+      state.completedUploadJobIds.add(message.jobId);
+      state.activeUploadJobId = null;
+      await saveMediaUploadJobsState(chromeApi, state);
+    } else if (message.type === "MEDIA_UPLOAD_FAILED") {
+      state.activeUploadJobId = null;
+      await saveMediaUploadJobsState(chromeApi, state);
+    }
+    return true;
+  });
+  if (!accepted) return;
+  await chromeApi.runtime.sendMessage(message).catch(reportBackgroundError);
+}
+
+function isMediaApiRequest(message: unknown): message is MediaApiRequest {
+  if (typeof message !== "object" || message === null) return false;
+  const request = message as Partial<MediaApiRequest>;
+  return request.type === "MEDIA_API_REQUEST"
+    && typeof request.requestId === "string"
+    && request.requestId.length > 0
+    && Array.isArray(request.args)
+    && [
+      "inspect",
+      "createMediaSession",
+      "getMediaSession",
+      "uploadPart",
+      "completeMediaSession",
+      "cancelMediaSession",
+    ].includes(request.operation ?? "");
+}
+
+function isMediaUploadNotification(
+  message: unknown,
+): message is Exclude<MediaUploadMessage, { type: "START_MEDIA_UPLOAD" }> {
+  if (typeof message !== "object" || message === null) return false;
+  const notification = message as Partial<MediaUploadMessage>;
+  return typeof notification.jobId === "string" && (
+    notification.type === "MEDIA_UPLOAD_PROGRESS"
+    || notification.type === "MEDIA_UPLOAD_COMPLETE"
+    || notification.type === "MEDIA_UPLOAD_FAILED"
+  );
+}
+
+async function invokeMediaApi(api: MediaUploadApi, request: MediaApiRequest): Promise<unknown> {
+  const args = request.args;
+  switch (request.operation) {
+    case "inspect":
+      if (args.length !== 1 || (typeof args[0] !== "string" && !isRecord(args[0]))) break;
+      return api.inspect(args[0] as Parameters<MediaUploadApi["inspect"]>[0]);
+    case "createMediaSession":
+      if (args.length !== 1 || !isCreateMediaSessionInput(args[0])) break;
+      return api.createMediaSession(args[0]);
+    case "getMediaSession":
+      if (args.length !== 1 || typeof args[0] !== "string") break;
+      return api.getMediaSession(args[0]);
+    case "uploadPart":
+      if (
+        args.length !== 4
+        || typeof args[0] !== "string"
+        || !Number.isInteger(args[1])
+        || !(args[2] instanceof Uint8Array)
+        || typeof args[3] !== "string"
+      ) break;
+      return api.uploadPart(args[0], args[1] as number, args[2], args[3]);
+    case "completeMediaSession":
+      if (args.length !== 2 || typeof args[0] !== "string" || !isMediaSessionCompleteInput(args[1])) break;
+      return api.completeMediaSession(args[0], args[1]);
+    case "cancelMediaSession":
+      if (args.length !== 1 || typeof args[0] !== "string") break;
+      return api.cancelMediaSession(args[0]);
+  }
+  throw new Error("Invalid media API request");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isCreateMediaSessionInput(
+  value: unknown,
+): value is Parameters<MediaUploadApi["createMediaSession"]>[0] {
+  if (!isRecord(value)) return false;
+  return typeof value.contentId === "string"
+    && (value.kind === "mp4" || value.kind === "hls")
+    && Number.isSafeInteger(value.expectedBytes)
+    && (value.expectedBytes as number) > 0
+    && Number.isSafeInteger(value.partCount)
+    && (value.partCount as number) > 0;
+}
+
+function isMediaSessionCompleteInput(
+  value: unknown,
+): value is Parameters<MediaUploadApi["completeMediaSession"]>[1] {
+  if (!isRecord(value)) return false;
+  if (
+    (value.kind !== "mp4" && value.kind !== "hls")
+    || !Number.isSafeInteger(value.partCount)
+    || (value.partCount as number) <= 0
+    || !Number.isSafeInteger(value.totalBytes)
+    || (value.totalBytes as number) <= 0
+  ) return false;
+  if (value.manifest === undefined) return true;
+  return isRecord(value.manifest)
+    && Array.isArray(value.manifest.parts)
+    && value.manifest.parts.every((part) => Number.isSafeInteger(part) && part >= 0);
+}
+
+function errorCodeFromApi(error: unknown): string {
+  return typeof error === "object"
+    && error !== null
+    && "code" in error
+    && typeof error.code === "string"
+    ? error.code
+    : "media_api_failed";
 }
 
 async function captureMediaCandidate(
@@ -871,6 +1155,26 @@ function seekCurrentYouTubePlayer(seconds: number): void {
 async function loadAnalyzedTabs(chromeApi: ChromeApi): Promise<AnalyzedTabs> {
   const value = await chromeApi.storage.session.get(STORAGE_KEY);
   return (value[STORAGE_KEY] as AnalyzedTabs | undefined) ?? {};
+}
+
+async function loadMediaUploadJobsState(chromeApi: ChromeApi): Promise<MediaUploadJobsState> {
+  const value = await chromeApi.storage.session.get(MEDIA_UPLOAD_JOBS_KEY);
+  const stored = value[MEDIA_UPLOAD_JOBS_KEY] as Partial<MediaUploadJobsState> | undefined;
+  return {
+    activeJobId: typeof stored?.activeJobId === "string" ? stored.activeJobId : null,
+    completedJobIds: Array.isArray(stored?.completedJobIds)
+      ? stored.completedJobIds.filter((jobId): jobId is string => typeof jobId === "string")
+      : [],
+  };
+}
+
+async function saveMediaUploadJobsState(chromeApi: ChromeApi, state: BackgroundState): Promise<void> {
+  await chromeApi.storage.session.set({
+    [MEDIA_UPLOAD_JOBS_KEY]: {
+      activeJobId: state.activeUploadJobId,
+      completedJobIds: [...state.completedUploadJobIds],
+    } satisfies MediaUploadJobsState,
+  });
 }
 
 async function loadMediaCaptureState(chromeApi: ChromeApi): Promise<MediaCaptureState> {

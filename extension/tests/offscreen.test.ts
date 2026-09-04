@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  createReconnectingMediaPort,
   installOffscreenHandlers,
   uploadMediaCandidate,
   type MediaPartSpool,
@@ -36,6 +37,24 @@ function textResponse(body: string, finalUrl?: string): Response {
   });
   if (finalUrl) Object.defineProperty(response, "url", { value: finalUrl });
   return response;
+}
+
+function createPort(name: string, sender: object) {
+  const messageListeners: Array<(message: unknown) => void> = [];
+  const disconnectListeners: Array<() => void> = [];
+  return {
+    name,
+    sender,
+    postMessage: vi.fn(),
+    disconnect: vi.fn(),
+    onMessage: {
+      addListener: vi.fn((listener: (message: unknown) => void) => messageListeners.push(listener)),
+    },
+    onDisconnect: {
+      addListener: vi.fn((listener: () => void) => disconnectListeners.push(listener)),
+    },
+    events: { message: { listeners: messageListeners }, disconnect: { listeners: disconnectListeners } },
+  };
 }
 
 function createSpool() {
@@ -97,6 +116,7 @@ function createApi(overrides: Partial<MediaUploadApi> = {}) {
       totalBytes: input.totalBytes,
       partCount: input.partCount,
     })),
+    cancelMediaSession: vi.fn(async () => undefined),
     ...overrides,
   } satisfies MediaUploadApi;
 }
@@ -115,6 +135,7 @@ describe("offscreen X media upload", () => {
 
     const sessionId = await uploadMediaCandidate({
       type: "START_MEDIA_UPLOAD",
+      tabId: 7,
       jobId: "job-1",
       contentRef,
       candidate: {
@@ -127,7 +148,7 @@ describe("offscreen X media upload", () => {
     expect(sessionId).toBe("session-1");
     expect(fetchMedia).toHaveBeenCalledWith(
       "https://video.twimg.com/amplify_video/123/vid/avc1/file.mp4?token=opaque",
-      { credentials: "include" },
+      { credentials: "include", redirect: "error" },
     );
     expect(vi.mocked(api.uploadPart).mock.calls.map((call) => call[1])).toEqual([0, 1, 2]);
     expect(vi.mocked(api.uploadPart).mock.calls.map((call) => call[2].byteLength)).toEqual([8 * MIB, 8 * MIB, 2 * MIB]);
@@ -154,6 +175,7 @@ describe("offscreen X media upload", () => {
 
     await uploadMediaCandidate({
       type: "START_MEDIA_UPLOAD",
+      tabId: 7,
       jobId: "job-no-length",
       contentRef,
       candidate: { url: "https://video.twimg.com/no-length.mp4", kind: "mp4", capturedAt: 1 },
@@ -183,6 +205,7 @@ describe("offscreen X media upload", () => {
   it("reports a stable error when browser part storage is unavailable", async () => {
     await expect(uploadMediaCandidate({
       type: "START_MEDIA_UPLOAD",
+      tabId: 7,
       jobId: "job-no-storage",
       contentRef,
       candidate: { url: "https://video.twimg.com/no-length.mp4", kind: "mp4", capturedAt: 1 },
@@ -191,6 +214,29 @@ describe("offscreen X media upload", () => {
       api: createApi(),
       reportProgress: async () => undefined,
     })).rejects.toMatchObject({ code: "media_spool_unavailable" });
+  });
+
+  it("stops spooling as soon as streamed media exceeds the size limit", async () => {
+    const spool = createSpool();
+    await expect(uploadMediaCandidate({
+      type: "START_MEDIA_UPLOAD",
+      tabId: 7,
+      jobId: "job-too-large",
+      contentRef,
+      candidate: { url: "https://video.twimg.com/too-large.mp4", kind: "mp4", capturedAt: 1 },
+    }, {
+      fetchMedia: vi.fn(async () => responseFromChunks([
+        new Uint8Array(8),
+        new Uint8Array(8),
+      ])),
+      api: createApi(),
+      reportProgress: async () => undefined,
+      createPartSpool: async () => spool,
+      limits: { maxMediaBytes: 10, maxPlaylistBytes: 2 * MIB },
+    })).rejects.toMatchObject({ code: "media_too_large" });
+
+    expect(spool.write).not.toHaveBeenCalled();
+    expect(spool.dispose).toHaveBeenCalledOnce();
   });
 
   it("queries session state before retrying a failed part", async () => {
@@ -217,6 +263,7 @@ describe("offscreen X media upload", () => {
 
     await uploadMediaCandidate({
       type: "START_MEDIA_UPLOAD",
+      tabId: 7,
       jobId: "job-retry",
       contentRef,
       candidate: { url: "https://video.twimg.com/file.mp4", kind: "mp4", capturedAt: 1 },
@@ -252,6 +299,7 @@ describe("offscreen X media upload", () => {
 
     await uploadMediaCandidate({
       type: "START_MEDIA_UPLOAD",
+      tabId: 7,
       jobId: "job-resume",
       contentRef,
       candidate: { url: "https://video.twimg.com/file.mp4", kind: "mp4", capturedAt: 1 },
@@ -267,6 +315,29 @@ describe("offscreen X media upload", () => {
     expect(api.completeMediaSession).toHaveBeenCalledOnce();
   });
 
+  it("cancels a created media session when upload fails", async () => {
+    const api = createApi({
+      uploadPart: vi.fn(async () => { throw new Error("upload failed"); }),
+      getMediaSession: vi.fn(async () => { throw new Error("status failed"); }),
+    });
+
+    await expect(uploadMediaCandidate({
+      type: "START_MEDIA_UPLOAD",
+      tabId: 7,
+      jobId: "job-cancel",
+      contentRef,
+      candidate: { url: "https://video.twimg.com/file.mp4", kind: "mp4", capturedAt: 1 },
+    }, {
+      fetchMedia: vi.fn(async () => responseFromChunks([new Uint8Array([1])], {
+        "Content-Length": "1",
+      })),
+      api,
+      reportProgress: async () => undefined,
+    })).rejects.toThrow("status failed");
+
+    expect(api.cancelMediaSession).toHaveBeenCalledWith("session-1");
+  });
+
   it("keeps X cookies and authorization data out of API metadata", async () => {
     const api = createApi();
     const candidate = {
@@ -280,7 +351,7 @@ describe("offscreen X media upload", () => {
     } as MediaCandidate;
 
     await uploadMediaCandidate({
-      type: "START_MEDIA_UPLOAD", jobId: "job-secret", contentRef, candidate,
+      type: "START_MEDIA_UPLOAD", tabId: 7, jobId: "job-secret", contentRef, candidate,
     }, {
       fetchMedia: vi.fn(async (_url, init) => {
         expect(new Headers(init?.headers).has("Cookie")).toBe(false);
@@ -336,6 +407,7 @@ describe("offscreen X media upload", () => {
 
     await uploadMediaCandidate({
       type: "START_MEDIA_UPLOAD",
+      tabId: 7,
       jobId: "job-hls",
       contentRef,
       candidate: { url: masterUrl, kind: "hls", capturedAt: 1 },
@@ -368,6 +440,7 @@ describe("offscreen X media upload", () => {
   ])("rejects an unsafe HLS playlist URL: %s", async (url) => {
     await expect(uploadMediaCandidate({
       type: "START_MEDIA_UPLOAD",
+      tabId: 7,
       jobId: "job-invalid-hls",
       contentRef,
       candidate: { url, kind: "hls", capturedAt: 1 },
@@ -382,6 +455,7 @@ describe("offscreen X media upload", () => {
   it("rejects HLS references outside video.twimg.com", async () => {
     await expect(uploadMediaCandidate({
       type: "START_MEDIA_UPLOAD",
+      tabId: 7,
       jobId: "job-invalid-reference",
       contentRef,
       candidate: { url: "https://video.twimg.com/master.m3u8", kind: "hls", capturedAt: 1 },
@@ -411,6 +485,7 @@ describe("offscreen X media upload", () => {
     const playlistUrl = "https://video.twimg.com/path/media.m3u8";
     await expect(uploadMediaCandidate({
       type: "START_MEDIA_UPLOAD",
+      tabId: 7,
       jobId: "job-invalid-tag",
       contentRef,
       candidate: { url: playlistUrl, kind: "hls", capturedAt: 1 },
@@ -426,6 +501,7 @@ describe("offscreen X media upload", () => {
   it("rejects a playlist redirect outside video.twimg.com", async () => {
     await expect(uploadMediaCandidate({
       type: "START_MEDIA_UPLOAD",
+      tabId: 7,
       jobId: "job-playlist-redirect",
       contentRef,
       candidate: {
@@ -448,6 +524,7 @@ describe("offscreen X media upload", () => {
     const segmentUrl = "https://video.twimg.com/path/segment.m4s";
     await expect(uploadMediaCandidate({
       type: "START_MEDIA_UPLOAD",
+      tabId: 7,
       jobId: "job-segment-redirect",
       contentRef,
       candidate: { url: playlistUrl, kind: "hls", capturedAt: 1 },
@@ -460,16 +537,150 @@ describe("offscreen X media upload", () => {
       createPartSpool: async () => createSpool(),
     })).rejects.toMatchObject({ code: "invalid_media_url" });
   });
+
+  it("rejects an HLS playlist larger than 2 MiB while streaming it", async () => {
+    const oversized = new Uint8Array(2 * MIB + 1);
+    oversized.fill("x".charCodeAt(0));
+    oversized.set(new TextEncoder().encode("#EXTM3U\n"));
+
+    await expect(uploadMediaCandidate({
+      type: "START_MEDIA_UPLOAD",
+      tabId: 7,
+      jobId: "job-large-playlist",
+      contentRef,
+      candidate: { url: "https://video.twimg.com/large.m3u8", kind: "hls", capturedAt: 1 },
+    }, {
+      fetchMedia: vi.fn(async () => responseFromChunks([oversized])),
+      api: createApi(),
+      reportProgress: async () => undefined,
+      createPartSpool: async () => createSpool(),
+    })).rejects.toMatchObject({ code: "hls_playlist_too_large" });
+  });
+
+  it.each([
+    ["byte ranges", "#EXT-X-BYTERANGE:100@0"],
+    ["encryption", "#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\""],
+    ["low-latency parts", "#EXT-X-PART:DURATION=0.333,URI=\"part.m4s\""],
+  ])("rejects unsupported HLS %s", async (_name, feature) => {
+    const playlistUrl = "https://video.twimg.com/path/media.m3u8";
+    await expect(uploadMediaCandidate({
+      type: "START_MEDIA_UPLOAD",
+      tabId: 7,
+      jobId: "job-unsupported-hls",
+      contentRef,
+      candidate: { url: playlistUrl, kind: "hls", capturedAt: 1 },
+    }, {
+      fetchMedia: vi.fn(async () => textResponse([
+        "#EXTM3U",
+        feature,
+        "segment.m4s",
+      ].join("\n"), playlistUrl)),
+      api: createApi(),
+      reportProgress: async () => undefined,
+      createPartSpool: async () => createSpool(),
+    })).rejects.toMatchObject({ code: "unsupported_hls_playlist" });
+  });
+
+  it.each([
+    "#EXT-X-STREAM-INF:BANDWIDTH=1000",
+    "#EXT-X-STREAM-INF:BANDWIDTH=oops,RESOLUTION=1920x1080",
+    "#EXT-X-STREAM-INF:BANDWIDTH=1000,RESOLUTION=invalid",
+  ])("rejects an unparseable HLS master variant: %s", async (variant) => {
+    await expect(uploadMediaCandidate({
+      type: "START_MEDIA_UPLOAD",
+      tabId: 7,
+      jobId: "job-invalid-variant",
+      contentRef,
+      candidate: { url: "https://video.twimg.com/master.m3u8", kind: "hls", capturedAt: 1 },
+    }, {
+      fetchMedia: vi.fn(async () => textResponse(`#EXTM3U\n${variant}\nvariant.m3u8`)),
+      api: createApi(),
+      reportProgress: async () => undefined,
+      createPartSpool: async () => createSpool(),
+    })).rejects.toMatchObject({ code: "unsupported_hls_playlist" });
+  });
+
+  it("rejects a nested HLS master and multiple init-map transitions", async () => {
+    const masterUrl = "https://video.twimg.com/master.m3u8";
+    const nestedUrl = "https://video.twimg.com/nested.m3u8";
+    const resources = new Map([
+      [masterUrl, textResponse([
+        "#EXTM3U",
+        "#EXT-X-STREAM-INF:BANDWIDTH=1000,RESOLUTION=640x360",
+        "nested.m3u8",
+      ].join("\n"))],
+      [nestedUrl, textResponse([
+        "#EXTM3U",
+        "#EXT-X-STREAM-INF:BANDWIDTH=500,RESOLUTION=320x180",
+        "media.m3u8",
+      ].join("\n"))],
+    ]);
+
+    await expect(uploadMediaCandidate({
+      type: "START_MEDIA_UPLOAD",
+      tabId: 7,
+      jobId: "job-nested-master",
+      contentRef,
+      candidate: { url: masterUrl, kind: "hls", capturedAt: 1 },
+    }, {
+      fetchMedia: vi.fn(async (url) => resources.get(String(url)) ?? new Response()),
+      api: createApi(),
+      reportProgress: async () => undefined,
+      createPartSpool: async () => createSpool(),
+    })).rejects.toMatchObject({ code: "unsupported_hls_playlist" });
+
+    await expect(uploadMediaCandidate({
+      type: "START_MEDIA_UPLOAD",
+      tabId: 7,
+      jobId: "job-multiple-maps",
+      contentRef,
+      candidate: { url: masterUrl, kind: "hls", capturedAt: 1 },
+    }, {
+      fetchMedia: vi.fn(async () => textResponse([
+        "#EXTM3U",
+        "#EXT-X-MAP:URI=\"init-1.mp4\"",
+        "segment-1.m4s",
+        "#EXT-X-MAP:URI=\"init-2.mp4\"",
+        "segment-2.m4s",
+      ].join("\n"))),
+      api: createApi(),
+      reportProgress: async () => undefined,
+      createPartSpool: async () => createSpool(),
+    })).rejects.toMatchObject({ code: "unsupported_hls_playlist" });
+  });
+});
+
+describe("offscreen port lifecycle", () => {
+  it("reconnects the logical media port after the service worker disconnects", () => {
+    const first = createPort("veeky-offscreen-media", {});
+    const second = createPort("veeky-offscreen-media", {});
+    const runtime = {
+      connect: vi.fn()
+        .mockReturnValueOnce(first)
+        .mockReturnValueOnce(second),
+    };
+    const port = createReconnectingMediaPort(runtime as never);
+    const listener = vi.fn();
+    port.onMessage.addListener(listener);
+
+    first.events.disconnect.listeners[0]();
+    second.events.message.listeners[0]({ type: "AFTER_RESTART" });
+    port.postMessage({ type: "PING" });
+
+    expect(runtime.connect).toHaveBeenCalledTimes(2);
+    expect(listener).toHaveBeenCalledWith({ type: "AFTER_RESTART" });
+    expect(second.postMessage).toHaveBeenCalledWith({ type: "PING" });
+  });
 });
 
 describe("offscreen message handling", () => {
-  function createRuntime() {
+  function createRuntimePort() {
     const listeners: Array<(message: unknown) => void> = [];
     return {
       onMessage: {
         addListener: vi.fn((listener: (message: unknown) => void) => { listeners.push(listener); }),
       },
-      sendMessage: vi.fn(async () => undefined),
+      postMessage: vi.fn(),
       dispatch(message: unknown) {
         for (const listener of listeners) listener(message);
       },
@@ -478,14 +689,15 @@ describe("offscreen message handling", () => {
 
   const startMessage = {
     type: "START_MEDIA_UPLOAD" as const,
+    tabId: 7,
     jobId: "job-handler",
     contentRef,
     candidate: { url: "https://video.twimg.com/file.mp4", kind: "mp4" as const, capturedAt: 1 },
   };
 
   it("sends MEDIA_UPLOAD_COMPLETE after a successful upload", async () => {
-    const runtime = createRuntime();
-    installOffscreenHandlers({ runtime } as never, {
+    const port = createRuntimePort();
+    installOffscreenHandlers(port as never, {
       fetchMedia: vi.fn(async () => responseFromChunks([new Uint8Array([1])], {
         "Content-Length": "1",
       })),
@@ -493,9 +705,9 @@ describe("offscreen message handling", () => {
       reportProgress: async () => undefined,
     });
 
-    runtime.dispatch(startMessage);
+    port.dispatch(startMessage);
 
-    await vi.waitFor(() => expect(runtime.sendMessage).toHaveBeenCalledWith({
+    await vi.waitFor(() => expect(port.postMessage).toHaveBeenCalledWith({
       type: "MEDIA_UPLOAD_COMPLETE",
       jobId: "job-handler",
       mediaSessionId: "session-1",
@@ -503,16 +715,16 @@ describe("offscreen message handling", () => {
   });
 
   it("sends MEDIA_UPLOAD_FAILED with the upload error code", async () => {
-    const runtime = createRuntime();
-    installOffscreenHandlers({ runtime } as never, {
+    const port = createRuntimePort();
+    installOffscreenHandlers(port as never, {
       fetchMedia: vi.fn(async () => new Response(null, { status: 403 })),
       api: createApi(),
       reportProgress: async () => undefined,
     });
 
-    runtime.dispatch(startMessage);
+    port.dispatch(startMessage);
 
-    await vi.waitFor(() => expect(runtime.sendMessage).toHaveBeenCalledWith({
+    await vi.waitFor(() => expect(port.postMessage).toHaveBeenCalledWith({
       type: "MEDIA_UPLOAD_FAILED",
       jobId: "job-handler",
       code: "media_fetch_failed",
@@ -520,26 +732,60 @@ describe("offscreen message handling", () => {
   });
 
   it("runs only one upload for concurrent START messages for the same job", async () => {
-    const runtime = createRuntime();
+    const port = createRuntimePort();
     let releaseFetch: ((response: Response) => void) | undefined;
     const fetchMedia = vi.fn(() => new Promise<Response>((resolve) => { releaseFetch = resolve; }));
     const api = createApi();
-    installOffscreenHandlers({ runtime } as never, {
+    installOffscreenHandlers(port as never, {
       fetchMedia,
       api,
       reportProgress: async () => undefined,
     });
 
-    runtime.dispatch(startMessage);
-    runtime.dispatch(startMessage);
+    port.dispatch(startMessage);
+    port.dispatch(startMessage);
     await vi.waitFor(() => expect(fetchMedia).toHaveBeenCalledOnce());
     releaseFetch?.(responseFromChunks([new Uint8Array([1])], { "Content-Length": "1" }));
-    await vi.waitFor(() => expect(runtime.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+    await vi.waitFor(() => expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({
       type: "MEDIA_UPLOAD_COMPLETE",
       jobId: "job-handler",
     })));
 
     expect(api.inspect).toHaveBeenCalledOnce();
     expect(api.createMediaSession).toHaveBeenCalledOnce();
+  });
+
+  it("allows only one global upload job at a time", async () => {
+    const port = createRuntimePort();
+    let releaseFetch: ((response: Response) => void) | undefined;
+    const fetchMedia = vi.fn(() => new Promise<Response>((resolve) => { releaseFetch = resolve; }));
+    installOffscreenHandlers(port as never, {
+      fetchMedia,
+      api: createApi(),
+      reportProgress: async () => undefined,
+    });
+
+    port.dispatch(startMessage);
+    port.dispatch({ ...startMessage, jobId: "job-handler-2" });
+    await vi.waitFor(() => expect(fetchMedia).toHaveBeenCalledOnce());
+    expect(port.postMessage).toHaveBeenCalledWith({
+      type: "MEDIA_UPLOAD_FAILED",
+      jobId: "job-handler-2",
+      code: "media_upload_in_progress",
+    });
+    releaseFetch?.(responseFromChunks([new Uint8Array([1])], { "Content-Length": "1" }));
+  });
+
+  it("cleans abandoned OPFS spools when the offscreen document starts", async () => {
+    const port = createRuntimePort();
+    const cleanupPartSpools = vi.fn(async () => undefined);
+    installOffscreenHandlers(port as never, {
+      fetchMedia: vi.fn(),
+      api: createApi(),
+      reportProgress: async () => undefined,
+      cleanupPartSpools,
+    });
+
+    await vi.waitFor(() => expect(cleanupPartSpools).toHaveBeenCalledOnce());
   });
 });

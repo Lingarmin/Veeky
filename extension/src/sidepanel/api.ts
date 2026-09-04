@@ -103,6 +103,7 @@ export interface MediaUploadApi {
   getMediaSession(sessionId: string): Promise<MediaSession>;
   uploadPart(sessionId: string, partNumber: number, bytes: Uint8Array, sha256: string): Promise<void>;
   completeMediaSession(sessionId: string, input: MediaSessionCompleteInput): Promise<MediaArtifact>;
+  cancelMediaSession(sessionId: string): Promise<void>;
 }
 
 export class ApiError extends Error {
@@ -171,6 +172,11 @@ export function createApi(
       `${baseUrl}/v1/media-sessions/${sessionId}/complete`,
       identityStore,
       { method: "POST", body: JSON.stringify(input) },
+    ),
+    cancelMediaSession: (sessionId) => request(
+      `${baseUrl}/v1/media-sessions/${sessionId}`,
+      identityStore,
+      { method: "DELETE" },
     ),
   };
 }

@@ -14,12 +14,27 @@ class FakeEvent {
   };
 }
 
+function createPort(name: string, sender: object) {
+  const message = new FakeEvent();
+  const disconnect = new FakeEvent();
+  return {
+    name,
+    sender,
+    onMessage: message,
+    onDisconnect: disconnect,
+    postMessage: vi.fn(),
+    disconnect: vi.fn(),
+    events: { message, disconnect },
+  };
+}
+
 function createChrome(initialStored: Record<string, unknown> = {}) {
   const actionClicked = new FakeEvent();
   const tabActivated = new FakeEvent();
   const tabUpdated = new FakeEvent();
   const tabRemoved = new FakeEvent();
   const message = new FakeEvent();
+  const connect = new FakeEvent();
   const beforeRequest = new FakeEvent();
   const alarm = new FakeEvent();
   const historyStateUpdated = new FakeEvent();
@@ -41,7 +56,10 @@ function createChrome(initialStored: Record<string, unknown> = {}) {
       executeScript: vi.fn(async () => undefined),
     },
     runtime: {
+      id: "extension-id",
       onMessage: message,
+      onConnect: connect,
+      getURL: vi.fn((path: string) => `chrome-extension://extension-id/${path}`),
       sendMessage: vi.fn(async () => undefined),
     },
     offscreen: {
@@ -75,6 +93,7 @@ function createChrome(initialStored: Record<string, unknown> = {}) {
       tabUpdated,
       tabRemoved,
       message,
+      connect,
       beforeRequest,
       alarm,
       historyStateUpdated,
@@ -126,6 +145,10 @@ describe("background tab isolation", () => {
     }]);
   });
 
+  it("requires Chrome 125 for offscreen.hasDocument", () => {
+    expect(manifest.minimum_chrome_version).toBe("125");
+  });
+
   it("tracks SPA and full-document navigation", () => {
     const chrome = createChrome();
     installBackgroundHandlers(chrome as never);
@@ -134,35 +157,171 @@ describe("background tab isolation", () => {
     expect(chrome.events.navigationCommitted.listeners).toHaveLength(1);
   });
 
-  it("creates one offscreen document before forwarding media uploads", async () => {
-    const chrome = createChrome();
+  it("sends an authorized captured candidate only through the private offscreen port", async () => {
+    const contentRef = {
+      platform: "x" as const,
+      sourceContentId: "2075545587093807111",
+      mediaIndex: 1,
+    };
+    const candidate = {
+      url: "https://video.twimg.com/amplify_video/123/file.mp4",
+      kind: "mp4" as const,
+      capturedAt: Date.now(),
+    };
+    const key = contentKey(contentRef);
+    const chrome = createChrome({
+      analyzedTabs: { "7": { [key]: { tabId: 7, contentRef, jobId: "job-1" } } },
+      xMediaCapture: { "7": { active: null, candidates: { [key]: [candidate] } } },
+    });
+    const port = createPort("veeky-offscreen-media", {
+      id: "extension-id",
+      url: "chrome-extension://extension-id/offscreen.html",
+    });
     installBackgroundHandlers(chrome as never);
+    chrome.events.connect.listeners[0](port);
     const upload = {
       type: "START_MEDIA_UPLOAD" as const,
+      tabId: 7,
       jobId: "job-1",
-      contentRef: {
-        platform: "x" as const,
-        sourceContentId: "2075545587093807111",
-        mediaIndex: 1,
-      },
-      candidate: {
-        url: "https://video.twimg.com/amplify_video/123/file.mp4",
-        kind: "mp4" as const,
-        capturedAt: Date.now(),
-      },
+      contentRef,
+      candidate,
     };
 
-    await dispatchMessage(chrome, upload);
-    await dispatchMessage(chrome, { ...upload, jobId: "job-2" });
+    expect(await dispatchMessage(chrome, upload, {
+      id: "extension-id",
+      url: "chrome-extension://extension-id/sidepanel.html",
+    })).toEqual({ ok: true });
 
-    expect(chrome.offscreen.createDocument).toHaveBeenCalledOnce();
-    expect(chrome.offscreen.createDocument).toHaveBeenCalledWith({
-      url: "offscreen.html",
-      reasons: ["BLOBS"],
-      justification: "Fetch and upload the X video selected by the user for transcription",
+    expect(port.postMessage).toHaveBeenCalledWith(upload);
+    expect(chrome.runtime.sendMessage).not.toHaveBeenCalledWith(upload);
+  });
+
+  it("rejects in-flight and completed upload replays", async () => {
+    const contentRef = {
+      platform: "x" as const,
+      sourceContentId: "2075545587093807111",
+      mediaIndex: 1,
+    };
+    const candidate = {
+      url: "https://video.twimg.com/amplify_video/123/file.mp4",
+      kind: "mp4" as const,
+      capturedAt: Date.now(),
+    };
+    const key = contentKey(contentRef);
+    const chrome = createChrome({
+      analyzedTabs: { "7": { [key]: { tabId: 7, contentRef, jobId: "job-1" } } },
+      xMediaCapture: { "7": { active: null, candidates: { [key]: [candidate] } } },
     });
-    expect(chrome.runtime.sendMessage).toHaveBeenCalledOnce();
-    expect(chrome.runtime.sendMessage).toHaveBeenCalledWith(upload);
+    const port = createPort("veeky-offscreen-media", {
+      id: "extension-id",
+      url: "chrome-extension://extension-id/offscreen.html",
+    });
+    installBackgroundHandlers(chrome as never);
+    chrome.events.connect.listeners[0](port);
+    const upload = {
+      type: "START_MEDIA_UPLOAD" as const,
+      tabId: 7,
+      jobId: "job-1",
+      contentRef,
+      candidate,
+    };
+    const sender = {
+      id: "extension-id",
+      url: "chrome-extension://extension-id/sidepanel.html",
+    };
+
+    expect(await dispatchMessage(chrome, upload, sender)).toEqual({ ok: true });
+    expect(await dispatchMessage(chrome, upload, sender)).toEqual({ ok: false });
+    port.events.message.listeners[0]({
+      type: "MEDIA_UPLOAD_COMPLETE",
+      jobId: "job-1",
+      mediaSessionId: "session-1",
+    });
+    await flushMicrotasks();
+    expect(await dispatchMessage(chrome, upload, sender)).toEqual({ ok: false });
+    expect(port.postMessage).toHaveBeenCalledTimes(1);
+
+    const restarted = createChrome(chrome.getStored());
+    const restartedPort = createPort("veeky-offscreen-media", {
+      id: "extension-id",
+      url: "chrome-extension://extension-id/offscreen.html",
+    });
+    installBackgroundHandlers(restarted as never);
+    restarted.events.connect.listeners[0](restartedPort);
+    expect(await dispatchMessage(restarted, upload, sender)).toEqual({ ok: false });
+    expect(restartedPort.postMessage).not.toHaveBeenCalled();
+  });
+
+  it("rejects START from an untrusted sender or for an uncaptured candidate", async () => {
+    const chrome = createChrome();
+    const port = createPort("veeky-offscreen-media", {
+      id: "extension-id",
+      url: "chrome-extension://extension-id/offscreen.html",
+    });
+    installBackgroundHandlers(chrome as never);
+    chrome.events.connect.listeners[0](port);
+    const upload = {
+      type: "START_MEDIA_UPLOAD" as const,
+      tabId: 7,
+      jobId: "job-1",
+      contentRef: { platform: "x" as const, sourceContentId: "2075545587093807111", mediaIndex: 1 },
+      candidate: { url: "https://video.twimg.com/file.mp4", kind: "mp4" as const, capturedAt: 1 },
+    };
+
+    expect(await dispatchMessage(chrome, upload, {
+      id: "extension-id",
+      url: "chrome-extension://extension-id/other.html",
+    })).toEqual({ ok: false });
+    expect(await dispatchMessage(chrome, upload, {
+      id: "extension-id",
+      url: "chrome-extension://extension-id/sidepanel.html",
+    })).toEqual({ ok: false });
+    expect(port.postMessage).not.toHaveBeenCalled();
+  });
+
+  it("rejects an offscreen port with a mismatched sender", () => {
+    const chrome = createChrome();
+    const port = createPort("veeky-offscreen-media", {
+      id: "extension-id",
+      url: "chrome-extension://extension-id/sidepanel.html",
+    });
+    installBackgroundHandlers(chrome as never);
+
+    chrome.events.connect.listeners[0](port);
+
+    expect(port.disconnect).toHaveBeenCalledOnce();
+  });
+
+  it("proxies media API requests only for the authenticated offscreen port", async () => {
+    const chrome = createChrome();
+    const getMediaSession = vi.fn(async () => ({
+      sessionId: "session-1",
+      uploadedParts: [0],
+    }));
+    const port = createPort("veeky-offscreen-media", {
+      id: "extension-id",
+      url: "chrome-extension://extension-id/offscreen.html",
+    });
+    installBackgroundHandlers(chrome as never, {
+      mediaApi: { getMediaSession } as never,
+    });
+    chrome.events.connect.listeners[0](port);
+
+    port.events.message.listeners[0]({
+      type: "MEDIA_API_REQUEST",
+      requestId: "request-1",
+      operation: "getMediaSession",
+      args: ["session-1"],
+    });
+    await flushMicrotasks();
+
+    expect(getMediaSession).toHaveBeenCalledWith("session-1");
+    expect(port.postMessage).toHaveBeenCalledWith({
+      type: "MEDIA_API_RESPONSE",
+      requestId: "request-1",
+      ok: true,
+      result: { sessionId: "session-1", uploadedParts: [0] },
+    });
   });
 
   it("leaves offscreen upload notifications for the side panel", async () => {

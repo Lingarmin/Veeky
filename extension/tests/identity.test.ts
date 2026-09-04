@@ -57,6 +57,21 @@ describe("installation identity", () => {
     expect(headers.get("X-Veeky-Installation-Id")).toBe(installationIdentity.installationId);
   });
 
+  it("cancels a media session with an authenticated DELETE", async () => {
+    const fetchMock = vi.fn(async () => new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await createApi("http://api.test", createIdentityStore()).cancelMediaSession("session-1");
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("http://api.test/v1/media-sessions/session-1");
+    expect(init.method).toBe("DELETE");
+    const headers = new Headers(init.headers);
+    expect(headers.get("Authorization")).toBe(`Bearer ${installationIdentity.installationToken}`);
+    expect(headers.get("X-Veeky-Installation-Id")).toBe(installationIdentity.installationId);
+  });
+
   it("registers once and retries once when the installation is unknown", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(jsonResponse({ detail: { code: "installation_auth_required" } }, 401))

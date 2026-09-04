@@ -42,6 +42,7 @@ export interface MediaCandidate {
 
 export interface StartMediaUploadMessage {
   type: "START_MEDIA_UPLOAD";
+  tabId: number;
   jobId: string;
   contentRef: ContentRef;
   candidate: MediaCandidate;
@@ -71,6 +72,31 @@ export type MediaUploadMessage =
   | MediaUploadProgressMessage
   | MediaUploadCompleteMessage
   | MediaUploadFailedMessage;
+
+export const OFFSCREEN_MEDIA_PORT = "veeky-offscreen-media";
+
+export type MediaApiOperation =
+  | "inspect"
+  | "createMediaSession"
+  | "getMediaSession"
+  | "uploadPart"
+  | "completeMediaSession"
+  | "cancelMediaSession";
+
+export interface MediaApiRequest {
+  type: "MEDIA_API_REQUEST";
+  requestId: string;
+  operation: MediaApiOperation;
+  args: unknown[];
+}
+
+export interface MediaApiResponse {
+  type: "MEDIA_API_RESPONSE";
+  requestId: string;
+  ok: boolean;
+  result?: unknown;
+  error?: { code: string; message: string };
+}
 
 export interface LlmConfig {
   provider: "kimi" | "deepseek";
