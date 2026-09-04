@@ -207,6 +207,91 @@ describe("X active player tracking", () => {
     teardown();
   });
 
+  it("counts only image and video tiles when deriving a bare-status media index", () => {
+    window.history.replaceState({}, "", `/owner/status/${STATUS_ID}`);
+    document.body.innerHTML = `
+      <article>
+        <img id="avatar" src="avatar.jpg" alt="Owner profile photo">
+        <a href="/owner/status/${STATUS_ID}">status</a>
+        <div data-testid="tweetPhoto"><img id="first-media" src="first.jpg"></div>
+        <div data-testid="videoPlayer"><video id="second-media"></video></div>
+      </article>
+    `;
+    const onActive = vi.fn();
+    const teardown = installXPlayerTracker({ onActive, onInactive: vi.fn() });
+    const video = document.querySelector<HTMLVideoElement>("#second-media")!;
+    setPlayerState(video, false);
+
+    video.dispatchEvent(new Event("play"));
+
+    expect(onActive).toHaveBeenCalledWith(expect.objectContaining({ mediaIndex: 2 }), 12_500);
+    teardown();
+  });
+
+  it("keeps an explicit route index when a contained media link is stale", () => {
+    window.history.replaceState({}, "", `/owner/status/${STATUS_ID}/video/2`);
+    document.body.innerHTML = `
+      <article>
+        <a href="/owner/status/${STATUS_ID}">status</a>
+        <a href="/owner/status/${STATUS_ID}/video/1"><video id="stale-link-video"></video></a>
+      </article>
+    `;
+    const onActive = vi.fn();
+    const teardown = installXPlayerTracker({ onActive, onInactive: vi.fn() });
+    const video = document.querySelector<HTMLVideoElement>("#stale-link-video")!;
+    setPlayerState(video, false);
+
+    video.dispatchEvent(new Event("play"));
+
+    expect(onActive).toHaveBeenCalledWith(expect.objectContaining({ mediaIndex: 2 }), 12_500);
+    teardown();
+  });
+
+  it("uses a contained same-status video link for a single mounted player", () => {
+    window.history.replaceState({}, "", `/owner/status/${STATUS_ID}`);
+    document.body.innerHTML = `
+      <article>
+        <a href="/owner/status/${STATUS_ID}">status</a>
+        <a href="/owner/status/${STATUS_ID}/video/2"><video id="mounted-second"></video></a>
+      </article>
+    `;
+    const onActive = vi.fn();
+    const teardown = installXPlayerTracker({ onActive, onInactive: vi.fn() });
+    const video = document.querySelector<HTMLVideoElement>("#mounted-second")!;
+    setPlayerState(video, false);
+
+    video.dispatchEvent(new Event("play"));
+
+    expect(onActive).toHaveBeenCalledWith(expect.objectContaining({ mediaIndex: 2 }), 12_500);
+    teardown();
+  });
+
+  it("does not borrow a quoted or reply media link for the current video index", () => {
+    window.history.replaceState({}, "", `/owner/status/${STATUS_ID}`);
+    document.body.innerHTML = `
+      <article>
+        <a href="/owner/status/${STATUS_ID}">status</a>
+        <video id="current-video"></video>
+        <a href="/quoted/status/2075545587093807222/video/2">
+          <video id="quoted-video"></video>
+        </a>
+      </article>
+      <article>
+        <a href="/reply/status/2075545587093807333/video/3">reply</a>
+        <video id="reply-video"></video>
+      </article>
+    `;
+    const onActive = vi.fn();
+    const teardown = installXPlayerTracker({ onActive, onInactive: vi.fn() });
+    const current = document.querySelector<HTMLVideoElement>("#current-video")!;
+    setPlayerState(current, false);
+
+    current.dispatchEvent(new Event("play"));
+
+    expect(onActive).toHaveBeenCalledWith(expect.objectContaining({ mediaIndex: 1 }), 12_500);
+    teardown();
+  });
+
   it("prefers the current status media modal and updates duration on metadata", () => {
     window.history.replaceState({}, "", `/owner/status/${STATUS_ID}/video/2`);
     renderStatus({ modal: true });
@@ -272,6 +357,106 @@ describe("X active player tracking", () => {
     replacement.dispatchEvent(new Event("play"));
     expect(onActive).toHaveBeenCalledTimes(2);
     teardown();
+  });
+
+  it("keeps the most recently played valid video selected during mutation scans", async () => {
+    window.history.replaceState({}, "", `/owner/status/${STATUS_ID}`);
+    renderStatus({ mediaCount: 2, reply: true, modal: true });
+    const onActive = vi.fn();
+    const onInactive = vi.fn();
+    const teardown = installXPlayerTracker({ onActive, onInactive });
+    const first = document.querySelector<HTMLVideoElement>("#main-1")!;
+    const second = document.querySelector<HTMLVideoElement>("#main-2")!;
+    const modal = document.querySelector<HTMLVideoElement>("#modal-video")!;
+    const reply = document.querySelector<HTMLVideoElement>("#reply-video")!;
+    setPlayerState(first, false, 10);
+    setPlayerState(second, false, 20);
+    setPlayerState(modal, true, 30);
+    setPlayerState(reply, true, 40);
+
+    first.dispatchEvent(new Event("play"));
+    second.dispatchEvent(new Event("play"));
+    document.body.append(document.createElement("span"));
+    await flushMutations();
+    expect(onActive).toHaveBeenLastCalledWith(expect.objectContaining({ mediaIndex: 2 }), 20_000);
+    const callsAfterSecond = onActive.mock.calls.length;
+
+    setPlayerState(reply, false, 40);
+    reply.dispatchEvent(new Event("play"));
+    document.body.append(document.createElement("span"));
+    await flushMutations();
+    expect(onActive).toHaveBeenCalledTimes(callsAfterSecond);
+
+    setPlayerState(modal, false, 30);
+    modal.dispatchEvent(new Event("play"));
+    document.body.append(document.createElement("span"));
+    await flushMutations();
+    expect(onActive).toHaveBeenLastCalledWith(expect.objectContaining({ mediaIndex: 2 }), 30_000);
+    teardown();
+  });
+
+  it("polls for route-only transitions and stops polling on teardown", () => {
+    vi.useFakeTimers();
+    const originalPushState = window.history.pushState;
+    window.history.replaceState({}, "", `/owner/status/${STATUS_ID}/video/1`);
+    renderStatus();
+    const onActive = vi.fn();
+    const onInactive = vi.fn();
+    const teardown = installXPlayerTracker({ onActive, onInactive });
+    const video = document.querySelector<HTMLVideoElement>("#main-1")!;
+    const statusLink = document.querySelector<HTMLAnchorElement>("#current-status a")!;
+    setPlayerState(video, false);
+    video.dispatchEvent(new Event("play"));
+
+    const nextStatusId = "2075545587093807333";
+    originalPushState.call(window.history, {}, "", `/other/status/${nextStatusId}/video/1`);
+    statusLink.href = `/other/status/${nextStatusId}`;
+    vi.advanceTimersByTime(300);
+
+    expect(onInactive).toHaveBeenCalledWith(expect.objectContaining({ sourceContentId: STATUS_ID }));
+    expect(onActive).toHaveBeenLastCalledWith(expect.objectContaining({
+      sourceContentId: nextStatusId,
+      mediaIndex: 1,
+    }), 12_500);
+
+    teardown();
+    onActive.mockClear();
+    onInactive.mockClear();
+    originalPushState.call(window.history, {}, "", `/third/status/2075545587093807444/video/1`);
+    vi.advanceTimersByTime(1_000);
+    expect(onActive).not.toHaveBeenCalled();
+    expect(onInactive).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it("rescans when status ownership updates after a polled route change", async () => {
+    vi.useFakeTimers();
+    const originalPushState = window.history.pushState;
+    window.history.replaceState({}, "", `/owner/status/${STATUS_ID}/video/1`);
+    renderStatus();
+    const onActive = vi.fn();
+    const onInactive = vi.fn();
+    const teardown = installXPlayerTracker({ onActive, onInactive });
+    const video = document.querySelector<HTMLVideoElement>("#main-1")!;
+    const statusLink = document.querySelector<HTMLAnchorElement>("#current-status a")!;
+    setPlayerState(video, false);
+    video.dispatchEvent(new Event("play"));
+
+    const nextStatusId = "2075545587093807333";
+    originalPushState.call(window.history, {}, "", `/other/status/${nextStatusId}/video/1`);
+    vi.advanceTimersByTime(300);
+    expect(onInactive).toHaveBeenCalledWith(expect.objectContaining({ sourceContentId: STATUS_ID }));
+    expect(onActive).toHaveBeenCalledTimes(1);
+
+    statusLink.setAttribute("href", `/other/status/${nextStatusId}`);
+    await vi.runOnlyPendingTimersAsync();
+
+    expect(onActive).toHaveBeenLastCalledWith(expect.objectContaining({
+      sourceContentId: nextStatusId,
+      mediaIndex: 1,
+    }), 12_500);
+    teardown();
+    vi.useRealTimers();
   });
 
   it("teardown removes player, observer, popstate, and history hooks", async () => {

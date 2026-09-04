@@ -14,6 +14,11 @@ const MEDIA_CLEANUP_ALARM = "xMediaCandidateCleanup";
 const CAPTURE_WINDOW_MS = 15_000;
 const CANDIDATE_TTL_MS = 10 * 60_000;
 const MAX_CANDIDATES = 50;
+const MAX_TOTAL_CANDIDATES = 200;
+const MAX_TOTAL_CANDIDATE_URL_BYTES = 128_000;
+const RECENT_REQUEST_MAX_AGE_MS = 1_500;
+const MAX_RECENT_REQUESTS_PER_TAB = 12;
+const MAX_RECENT_REQUEST_URL_BYTES = 32_000;
 const X_STATUS_PATH = /^\/[^/]+\/status\/([0-9]+)(?:\/video\/([1-9][0-9]*))?\/?$/;
 type AnalyzedTabs = Record<string, Record<string, AnalyzedTab>>;
 
@@ -31,8 +36,14 @@ interface LastDetectedContent {
 
 type LastDetectedContentState = Record<string, LastDetectedContent>;
 
+interface BufferedMediaCandidate extends MediaCandidate {
+  routeGeneration: number;
+}
+
 interface BackgroundState {
   lastDetectedContentByTab: Map<number, ContentRef>;
+  recentRequestsByTab: Map<number, BufferedMediaCandidate[]>;
+  routeGenerationByTab: Map<number, number>;
   runCaptureTask: <T>(task: () => Promise<T>) => Promise<T>;
 }
 
@@ -48,6 +59,8 @@ export function parseVideoId(url?: string): string | null {
 
 export function installBackgroundHandlers(chromeApi: ChromeApi): void {
   const lastDetectedContentByTab = new Map<number, ContentRef>();
+  const recentRequestsByTab = new Map<number, BufferedMediaCandidate[]>();
+  const routeGenerationByTab = new Map<number, number>();
   let captureQueue: Promise<void> = Promise.resolve();
   const runCaptureTask = <T>(task: () => Promise<T>): Promise<T> => {
     const result = captureQueue.then(task);
@@ -56,10 +69,12 @@ export function installBackgroundHandlers(chromeApi: ChromeApi): void {
   };
   const state: BackgroundState = {
     lastDetectedContentByTab,
+    recentRequestsByTab,
+    routeGenerationByTab,
     runCaptureTask,
   };
   void chromeApi.sidePanel
-    .setPanelBehavior({ openPanelOnActionClick: true })
+    .setPanelBehavior({ openPanelOnActionClick: false })
     .catch(reportBackgroundError);
   void runCaptureTask(async () => {
     await initializeMediaCapture(chromeApi);
@@ -75,13 +90,6 @@ export function installBackgroundHandlers(chromeApi: ChromeApi): void {
       openPanelForTab(chromeApi, tabId);
       return;
     }
-    void runCaptureTask(() => resolveLastDetectedContent(chromeApi, tabId, tab.url))
-      .then((restoredRef) => {
-        if (!restoredRef) return;
-        lastDetectedContentByTab.set(tabId, restoredRef);
-        return chromeApi.sidePanel.setOptions({ tabId, path: "sidepanel.html", enabled: true });
-      })
-      .catch(reportBackgroundError);
   });
 
   chromeApi.tabs.onActivated.addListener(({ tabId }) => {
@@ -95,6 +103,8 @@ export function installBackgroundHandlers(chromeApi: ChromeApi): void {
 
   chromeApi.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (!changeInfo.url) return;
+    routeGenerationByTab.set(tabId, (routeGenerationByTab.get(tabId) ?? 0) + 1);
+    recentRequestsByTab.delete(tabId);
     const explicitRef = parseContentRef(tab.url);
     const rememberedRef = lastDetectedContentByTab.get(tabId);
     const rememberedRefStillMatches = activeContentMatchesUrl(rememberedRef, tab.url);
@@ -123,13 +133,22 @@ export function installBackgroundHandlers(chromeApi: ChromeApi): void {
 
   chromeApi.tabs.onRemoved.addListener((tabId) => {
     lastDetectedContentByTab.delete(tabId);
+    recentRequestsByTab.delete(tabId);
+    routeGenerationByTab.delete(tabId);
     return runCaptureTask(() => removeAllTabState(chromeApi, tabId))
       .catch(reportBackgroundError);
   });
 
   chromeApi.webRequest.onBeforeRequest.addListener(
     (details) => {
-      void runCaptureTask(() => captureMediaCandidate(chromeApi, details)).catch(reportBackgroundError);
+      const routeGeneration = routeGenerationByTab.get(details.tabId) ?? 0;
+      void runCaptureTask(() => captureMediaCandidate(
+        chromeApi,
+        details,
+        recentRequestsByTab,
+        routeGenerationByTab,
+        routeGeneration,
+      )).catch(reportBackgroundError);
     },
     { urls: ["https://video.twimg.com/*"], types: ["media", "xmlhttprequest"] },
   );
@@ -182,16 +201,36 @@ async function handleMessage(
       const mediaState = await loadMediaCaptureState(chromeApi);
       const tabKey = String(tabId);
       const prior = mediaState[tabKey];
+      const previousRef = state.lastDetectedContentByTab.get(tabId);
+      if (previousRef && !sameContentRef(previousRef, message.contentRef)) {
+        state.routeGenerationByTab.set(
+          tabId,
+          (state.routeGenerationByTab.get(tabId) ?? 0) + 1,
+        );
+        state.recentRequestsByTab.delete(tabId);
+      }
       const samePlayer = Boolean(
         prior?.active && sameContentRef(prior.active.contentRef, message.contentRef),
       );
+      const key = contentKey(message.contentRef);
+      const buffered = claimRecentRequests(
+        state.recentRequestsByTab,
+        tabId,
+        signalAt,
+        state.routeGenerationByTab.get(tabId) ?? 0,
+      );
+      const candidates = pruneCandidateMap(prior?.candidates ?? {}, Date.now());
+      if (buffered.length) {
+        candidates[key] = mergeCandidates(candidates[key] ?? [], buffered, Date.now());
+      }
       mediaState[tabKey] = {
         active: {
           contentRef: message.contentRef,
           expiresAt: samePlayer ? prior.active!.expiresAt : signalAt + CAPTURE_WINDOW_MS,
         },
-        candidates: pruneCandidateMap(prior?.candidates ?? {}, Date.now()),
+        candidates,
       };
+      enforceAggregateCandidateLimits(mediaState);
       const lastDetectedState = await loadLastDetectedContentState(chromeApi);
       lastDetectedState[tabKey] = {
         contentRef: message.contentRef,
@@ -219,6 +258,7 @@ async function handleMessage(
       if (tabState?.active && sameContentRef(tabState.active.contentRef, message.contentRef)) {
         tabState.active = null;
         tabState.candidates = pruneCandidateMap(tabState.candidates, Date.now());
+        enforceAggregateCandidateLimits(mediaState);
         await chromeApi.storage.session.set({ [MEDIA_STORAGE_KEY]: mediaState });
         await scheduleMediaCleanupForState(chromeApi, mediaState);
         await updatePanelForTab(chromeApi, tabId, sender.url ?? sender.tab?.url);
@@ -244,6 +284,7 @@ async function handleMessage(
         if (!tabState.active && Object.keys(tabState.candidates).length === 0) {
           delete mediaState[String(message.tabId)];
         }
+        enforceAggregateCandidateLimits(mediaState);
         await chromeApi.storage.session.set({ [MEDIA_STORAGE_KEY]: mediaState });
         await scheduleMediaCleanupForState(chromeApi, mediaState);
       }
@@ -316,6 +357,9 @@ async function handleMessage(
 async function captureMediaCandidate(
   chromeApi: ChromeApi,
   details: chrome.webRequest.WebRequestBodyDetails,
+  recentRequestsByTab: Map<number, BufferedMediaCandidate[]>,
+  routeGenerationByTab: Map<number, number>,
+  routeGeneration: number,
 ): Promise<void> {
   if (details.tabId < 0 || (details.type !== "media" && details.type !== "xmlhttprequest")) return;
   const candidate = mediaCandidateFromRequest(details.url, details.timeStamp);
@@ -324,16 +368,97 @@ async function captureMediaCandidate(
   const state = await loadMediaCaptureState(chromeApi);
   const tabState = state[String(details.tabId)];
   const now = Date.now();
-  if (!tabState?.active) return;
+  if (!tabState?.active) {
+    if ((routeGenerationByTab.get(details.tabId) ?? 0) === routeGeneration) {
+      bufferRecentRequest(recentRequestsByTab, details.tabId, candidate, now, routeGeneration);
+    }
+    return;
+  }
   const windowOpenedAt = tabState.active.expiresAt - CAPTURE_WINDOW_MS;
   if (candidate.capturedAt < windowOpenedAt || candidate.capturedAt > tabState.active.expiresAt) return;
   const key = contentKey(tabState.active.contentRef);
-  const current = pruneCandidates(tabState.candidates[key] ?? [], now)
-    .filter(({ url }) => url !== candidate.url);
-  current.push(candidate);
-  tabState.candidates[key] = sortCandidates(current).slice(0, MAX_CANDIDATES);
+  tabState.candidates[key] = mergeCandidates(tabState.candidates[key] ?? [], [candidate], now);
+  enforceAggregateCandidateLimits(state);
   await chromeApi.storage.session.set({ [MEDIA_STORAGE_KEY]: state });
   await scheduleMediaCleanupForState(chromeApi, state);
+}
+
+function mergeCandidates(
+  current: MediaCandidate[],
+  additions: MediaCandidate[],
+  now: number,
+): MediaCandidate[] {
+  const byUrl = new Map(pruneCandidates(current, now).map((candidate) => [candidate.url, candidate]));
+  for (const candidate of additions) byUrl.set(candidate.url, candidate);
+  return sortCandidates([...byUrl.values()]).slice(0, MAX_CANDIDATES);
+}
+
+function bufferRecentRequest(
+  recentRequestsByTab: Map<number, BufferedMediaCandidate[]>,
+  tabId: number,
+  candidate: MediaCandidate,
+  now: number,
+  routeGeneration: number,
+): void {
+  const recent = (recentRequestsByTab.get(tabId) ?? [])
+    .filter((item) => now - item.capturedAt <= RECENT_REQUEST_MAX_AGE_MS)
+    .filter((item) => item.url !== candidate.url);
+  recent.push({ ...candidate, routeGeneration });
+  while (
+    recent.length > MAX_RECENT_REQUESTS_PER_TAB
+    || estimatedCandidateUrlBytes(recent) > MAX_RECENT_REQUEST_URL_BYTES
+  ) {
+    recent.shift();
+  }
+  if (recent.length) recentRequestsByTab.set(tabId, recent);
+  else recentRequestsByTab.delete(tabId);
+}
+
+function claimRecentRequests(
+  recentRequestsByTab: Map<number, BufferedMediaCandidate[]>,
+  tabId: number,
+  signalAt: number,
+  routeGeneration: number,
+): MediaCandidate[] {
+  const claimed = (recentRequestsByTab.get(tabId) ?? []).filter((candidate) => (
+    candidate.routeGeneration === routeGeneration
+    && candidate.capturedAt <= signalAt
+    && signalAt - candidate.capturedAt <= RECENT_REQUEST_MAX_AGE_MS
+  ));
+  recentRequestsByTab.delete(tabId);
+  return claimed.map(({ routeGeneration: _routeGeneration, ...candidate }) => candidate);
+}
+
+function estimatedCandidateUrlBytes(candidates: MediaCandidate[]): number {
+  return candidates.reduce((total, candidate) => total + candidate.url.length * 2, 0);
+}
+
+function enforceAggregateCandidateLimits(state: MediaCaptureState): void {
+  const entries = Object.entries(state).flatMap(([tabKey, tabState]) => (
+    Object.entries(tabState.candidates).flatMap(([key, candidates]) => (
+      candidates.map((candidate) => ({ tabKey, key, candidate }))
+    ))
+  )).sort((left, right) => (
+    left.candidate.capturedAt - right.candidate.capturedAt
+    || left.tabKey.localeCompare(right.tabKey)
+    || left.key.localeCompare(right.key)
+    || left.candidate.url.localeCompare(right.candidate.url)
+  ));
+  let totalBytes = entries.reduce(
+    (total, entry) => total + entry.candidate.url.length * 2,
+    0,
+  );
+  while (entries.length > MAX_TOTAL_CANDIDATES || totalBytes > MAX_TOTAL_CANDIDATE_URL_BYTES) {
+    const oldest = entries.shift();
+    if (!oldest) break;
+    const candidates = state[oldest.tabKey]?.candidates[oldest.key];
+    if (!candidates) continue;
+    const index = candidates.findIndex(({ url }) => url === oldest.candidate.url);
+    if (index < 0) continue;
+    totalBytes -= candidates[index].url.length * 2;
+    candidates.splice(index, 1);
+    if (candidates.length === 0) delete state[oldest.tabKey].candidates[oldest.key];
+  }
 }
 
 function mediaCandidateFromRequest(urlValue: string, capturedAt: number): MediaCandidate | null {
@@ -455,7 +580,10 @@ function pruneCandidateMap(
 ): Record<string, MediaCandidate[]> {
   return Object.fromEntries(
     Object.entries(candidates)
-      .map(([key, values]) => [key, pruneCandidates(values, now)] as const)
+      .map(([key, values]) => [
+        key,
+        sortCandidates(pruneCandidates(values, now)).slice(0, MAX_CANDIDATES),
+      ] as const)
       .filter((entry) => entry[1].length > 0),
   );
 }
@@ -529,6 +657,7 @@ async function removeAllTabState(chromeApi: ChromeApi, tabId: number): Promise<v
   delete analyzedTabs[tabKey];
   delete mediaState[tabKey];
   delete lastDetectedState[tabKey];
+  enforceAggregateCandidateLimits(mediaState);
   await chromeApi.storage.session.set({
     [MEDIA_STORAGE_KEY]: mediaState,
     [LAST_DETECTED_STORAGE_KEY]: lastDetectedState,
@@ -549,6 +678,7 @@ async function closeCaptureForTab(
   tabState.active = null;
   tabState.candidates = pruneCandidateMap(tabState.candidates, Date.now());
   if (Object.keys(tabState.candidates).length === 0) delete state[String(tabId)];
+  enforceAggregateCandidateLimits(state);
   await chromeApi.storage.session.set({ [MEDIA_STORAGE_KEY]: state });
   await scheduleMediaCleanupForState(chromeApi, state);
 }
@@ -557,9 +687,11 @@ async function cleanupExpiredMedia(chromeApi: ChromeApi): Promise<void> {
   const state = await loadMediaCaptureState(chromeApi);
   const now = Date.now();
   for (const [tabKey, tabState] of Object.entries(state)) {
+    if (tabState.active && tabState.active.expiresAt <= now) tabState.active = null;
     tabState.candidates = pruneCandidateMap(tabState.candidates, now);
     if (!tabState.active && Object.keys(tabState.candidates).length === 0) delete state[tabKey];
   }
+  enforceAggregateCandidateLimits(state);
   await chromeApi.storage.session.set({ [MEDIA_STORAGE_KEY]: state });
   await scheduleMediaCleanupForState(chromeApi, state);
 }
@@ -572,6 +704,7 @@ async function initializeMediaCapture(chromeApi: ChromeApi): Promise<void> {
     tabState.candidates = pruneCandidateMap(tabState.candidates, now);
     if (Object.keys(tabState.candidates).length === 0) delete state[tabKey];
   }
+  enforceAggregateCandidateLimits(state);
   await chromeApi.storage.session.set({ [MEDIA_STORAGE_KEY]: state });
   await scheduleMediaCleanupForState(chromeApi, state);
 }
@@ -582,6 +715,7 @@ async function scheduleMediaCleanupForState(
 ): Promise<void> {
   let nextExpiry = Number.POSITIVE_INFINITY;
   for (const tabState of Object.values(state)) {
+    if (tabState.active) nextExpiry = Math.min(nextExpiry, tabState.active.expiresAt);
     for (const candidates of Object.values(tabState.candidates)) {
       for (const candidate of candidates) {
         nextExpiry = Math.min(nextExpiry, candidate.capturedAt + CANDIDATE_TTL_MS);

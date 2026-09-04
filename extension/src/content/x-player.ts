@@ -1,6 +1,7 @@
 import type { ContentRef } from "../shared/types";
 
 const X_STATUS_PATH = /^\/[^/]+\/status\/([0-9]+)(?:\/video\/([1-9][0-9]*))?\/?$/;
+const ROUTE_POLL_MS = 250;
 
 export interface XPlayerTrackerOptions {
   onActive: (contentRef: ContentRef, durationMs: number) => void;
@@ -35,7 +36,10 @@ export function installXPlayerTracker(options: XPlayerTrackerOptions): () => voi
   const pageWindow = options.window ?? window;
   const pageDocument = options.document ?? document;
   const bindings = new Map<HTMLVideoElement, BoundVideo>();
+  const playOrder = new Map<HTMLVideoElement, number>();
   let selection: Selection | null = null;
+  let playSequence = 0;
+  let lastRoute = pageRoute(pageWindow);
   let stopped = false;
 
   const clearSelection = () => {
@@ -64,7 +68,11 @@ export function installXPlayerTracker(options: XPlayerTrackerOptions): () => voi
   const bind = (video: HTMLVideoElement) => {
     if (bindings.has(video)) return;
     const listeners: BoundVideo = {
-      play: () => select(video),
+      play: () => {
+        playSequence += 1;
+        playOrder.set(video, playSequence);
+        select(video);
+      },
       pause: () => {
         if (selection?.video === video) clearSelection();
       },
@@ -83,6 +91,7 @@ export function installXPlayerTracker(options: XPlayerTrackerOptions): () => voi
     video.removeEventListener("pause", listeners.pause);
     video.removeEventListener("loadedmetadata", listeners.loadedmetadata);
     bindings.delete(video);
+    playOrder.delete(video);
   };
 
   const scan = () => {
@@ -94,20 +103,40 @@ export function installXPlayerTracker(options: XPlayerTrackerOptions): () => voi
 
     const videos = Array.from(pageDocument.querySelectorAll<HTMLVideoElement>("video"));
     for (const video of videos) bind(video);
+    if (
+      selection
+      && selection.video.isConnected
+      && !selection.video.paused
+      && contentRefForVideo(selection.video, pageRoute(pageWindow))
+    ) {
+      return;
+    }
     const playing = videos
       .filter((video) => !video.paused && contentRefForVideo(video, pageRoute(pageWindow)))
-      .sort((left, right) => playerPriority(right) - playerPriority(left));
+      .sort((left, right) => (
+        (playOrder.get(right) ?? 0) - (playOrder.get(left) ?? 0)
+        || playerPriority(right) - playerPriority(left)
+      ));
     if (playing[0]) select(playing[0]);
   };
 
   const handleRouteChange = () => {
+    lastRoute = pageRoute(pageWindow);
     clearSelection();
     scan();
   };
   const observer = new MutationObserver(scan);
-  observer.observe(pageDocument.documentElement, { childList: true, subtree: true });
+  observer.observe(pageDocument.documentElement, {
+    attributes: true,
+    attributeFilter: ["href"],
+    childList: true,
+    subtree: true,
+  });
   pageWindow.addEventListener("popstate", handleRouteChange);
   const removeHistoryHook = subscribeToHistory(pageWindow, handleRouteChange);
+  const routePoll = pageWindow.setInterval(() => {
+    if (pageRoute(pageWindow) !== lastRoute) handleRouteChange();
+  }, ROUTE_POLL_MS);
   scan();
 
   return () => {
@@ -116,6 +145,7 @@ export function installXPlayerTracker(options: XPlayerTrackerOptions): () => voi
     observer.disconnect();
     pageWindow.removeEventListener("popstate", handleRouteChange);
     removeHistoryHook();
+    pageWindow.clearInterval(routePoll);
     for (const [video, listeners] of bindings) unbind(video, listeners);
     selection = null;
   };
@@ -131,28 +161,48 @@ function contentRefForVideo(video: HTMLVideoElement, pageUrl: string): ContentRe
   const scope = playerScope(video);
   if (!scope || owningStatusId(video, scope) !== route.sourceContentId) return null;
 
-  let mediaIndex = route.mediaIndex;
-  if (!mediaIndex && scope.matches("article")) {
-    const scopedVideos = Array.from(scope.querySelectorAll<HTMLVideoElement>("video"))
-      .filter((candidate) => (
-        playerScope(candidate) === scope
-        && owningStatusId(candidate, scope) === route.sourceContentId
-      ));
-    const index = scopedVideos.indexOf(video);
-    if (index >= 0) mediaIndex = index + 1;
-  } else if (!mediaIndex) {
-    mediaIndex = mediaIndexFromLinks(scope, route.sourceContentId);
+  let mediaIndex = route.mediaIndex
+    ?? mediaIndexFromContainedLink(video, scope, route.sourceContentId);
+  if (!mediaIndex) {
+    mediaIndex = mediaIndexFromTiles(video, scope, route.sourceContentId);
   }
   if (!mediaIndex || mediaIndex < 1) return null;
   return { platform: "x", sourceContentId: route.sourceContentId, mediaIndex };
 }
 
-function playerScope(video: HTMLVideoElement): Element | null {
-  return video.closest('[role="dialog"]') ?? video.closest("article");
+function mediaIndexFromTiles(
+  video: HTMLVideoElement,
+  scope: Element,
+  statusId: string,
+): number | null {
+  const recognizedTiles = Array.from(scope.querySelectorAll<HTMLElement>(
+    '[data-testid="tweetPhoto"], [data-testid="videoPlayer"]',
+  )).filter((candidate) => (
+    playerScope(candidate) === scope
+    && owningStatusId(candidate, scope) === statusId
+  ));
+  const topLevelTiles = recognizedTiles.filter((candidate) => (
+    !recognizedTiles.some((other) => other !== candidate && other.contains(candidate))
+  ));
+  const tileIndex = topLevelTiles.findIndex((candidate) => candidate.contains(video));
+  if (tileIndex >= 0) return tileIndex + 1;
+
+  if (recognizedTiles.length > 0) return null;
+  const scopedMedia = Array.from(scope.querySelectorAll<HTMLElement>("video, img"))
+    .filter((candidate) => (
+      playerScope(candidate) === scope
+      && owningStatusId(candidate, scope) === statusId
+    ));
+  const index = scopedMedia.indexOf(video);
+  return index >= 0 ? index + 1 : null;
 }
 
-function owningStatusId(video: HTMLVideoElement, scope: Element): string | null {
-  let container: Element | null = video.parentElement;
+function playerScope(element: Element): Element | null {
+  return element.closest('[role="dialog"]') ?? element.closest("article");
+}
+
+function owningStatusId(element: Element, scope: Element): string | null {
+  let container: Element | null = element;
   while (container) {
     const anchor = container.matches('a[href*="/status/"]')
       ? container as HTMLAnchorElement
@@ -166,7 +216,17 @@ function owningStatusId(video: HTMLVideoElement, scope: Element): string | null 
   return null;
 }
 
-function mediaIndexFromLinks(scope: Element, statusId: string): number | null {
+function mediaIndexFromContainedLink(
+  video: HTMLVideoElement,
+  scope: Element,
+  statusId: string,
+): number | null {
+  const containingAnchor = video.closest<HTMLAnchorElement>('a[href*="/status/"]');
+  if (containingAnchor && scope.contains(containingAnchor)) {
+    const route = parseXStatusRoute(containingAnchor.getAttribute("href") ?? containingAnchor.href);
+    if (route?.sourceContentId === statusId && route.mediaIndex) return route.mediaIndex;
+  }
+  if (!scope.matches('[role="dialog"]')) return null;
   for (const anchor of scope.querySelectorAll<HTMLAnchorElement>('a[href*="/status/"]')) {
     const route = parseXStatusRoute(anchor.getAttribute("href") ?? anchor.href);
     if (route?.sourceContentId === statusId && route.mediaIndex) return route.mediaIndex;

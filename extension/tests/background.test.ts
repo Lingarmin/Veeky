@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import manifest from "../manifest.json";
 import { installBackgroundHandlers, parseVideoId } from "../src/background";
+import { contentKey } from "../src/shared/content";
 
 class FakeEvent {
   listeners: Array<(...args: any[]) => any> = [];
@@ -422,6 +423,131 @@ describe("X media candidate capture", () => {
     })] });
   });
 
+  it("claims a recent request that arrives just before the active-player signal", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-05T00:00:00Z"));
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    await flushMicrotasks();
+    await capture(chrome, "https://video.twimg.com/path/pre-active.m3u8");
+    await capture(chrome, "https://video.twimg.com/path/pre-active.mp4");
+    vi.advanceTimersByTime(100);
+
+    await dispatchMessage(chrome, {
+      type: "X_PLAYER_ACTIVE", contentRef, durationMs: 0,
+    }, contentSender());
+
+    expect(await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 7, contentRef,
+    }, contentSender())).toEqual({ candidates: [
+      expect.objectContaining({ url: "https://video.twimg.com/path/pre-active.mp4", kind: "mp4" }),
+      expect.objectContaining({ url: "https://video.twimg.com/path/pre-active.m3u8", kind: "hls" }),
+    ] });
+    vi.useRealTimers();
+  });
+
+  it("does not claim stale or another tab's buffered requests", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-05T00:00:00Z"));
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    await flushMicrotasks();
+    await capture(chrome, "https://video.twimg.com/path/stale.mp4");
+    vi.advanceTimersByTime(2_001);
+    await capture(chrome, "https://video.twimg.com/path/other-tab.mp4", { tabId: 8 });
+
+    await dispatchMessage(chrome, {
+      type: "X_PLAYER_ACTIVE", contentRef, durationMs: 0,
+    }, contentSender());
+
+    expect(await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 7, contentRef,
+    }, contentSender())).toEqual({ candidates: [] });
+    vi.useRealTimers();
+  });
+
+  it("retains a claimed segment as segment-only evidence", async () => {
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    await flushMicrotasks();
+    await capture(chrome, "https://video.twimg.com/path/pre-active.ts");
+
+    await dispatchMessage(chrome, {
+      type: "X_PLAYER_ACTIVE", contentRef, durationMs: 0,
+    }, contentSender());
+
+    expect(await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 7, contentRef,
+    }, contentSender())).toEqual({ candidates: [expect.objectContaining({ kind: "segment" })] });
+  });
+
+  it("does not claim a recent request from the previous route", async () => {
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    await flushMicrotasks();
+    await capture(chrome, "https://video.twimg.com/path/previous-route.mp4");
+    const nextRef = { ...contentRef, sourceContentId: "2075545587093807222" };
+    const nextUrl = "https://x.com/owner/status/2075545587093807222/video/1";
+    chrome.events.tabUpdated.listeners[0](7, { url: nextUrl }, { id: 7, url: nextUrl });
+    await flushMicrotasks();
+
+    await dispatchMessage(chrome, {
+      type: "X_PLAYER_ACTIVE", contentRef: nextRef, durationMs: 0,
+    }, contentSender(7, nextUrl));
+
+    expect(await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 7, contentRef: nextRef,
+    }, contentSender(7, nextUrl))).toEqual({ candidates: [] });
+  });
+
+  it("does not claim a buffered request when the active status changes before onUpdated", async () => {
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    await dispatchMessage(chrome, {
+      type: "X_PLAYER_ACTIVE", contentRef, durationMs: 0,
+    }, contentSender());
+    await dispatchMessage(chrome, {
+      type: "X_PLAYER_INACTIVE", contentRef,
+    }, contentSender());
+    await capture(chrome, "https://video.twimg.com/path/late-previous-route.mp4");
+
+    const nextRef = { ...contentRef, sourceContentId: "2075545587093807222" };
+    const nextUrl = "https://x.com/owner/status/2075545587093807222/video/1";
+    await dispatchMessage(chrome, {
+      type: "X_PLAYER_ACTIVE", contentRef: nextRef, durationMs: 0,
+    }, contentSender(7, nextUrl));
+
+    expect(await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 7, contentRef: nextRef,
+    }, contentSender(7, nextUrl))).toEqual({ candidates: [] });
+  });
+
+  it("bounds the recent request ring by count and URL bytes", async () => {
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    await flushMicrotasks();
+    for (let index = 0; index < 20; index += 1) {
+      await capture(chrome, `https://video.twimg.com/path/recent-${index}.mp4`);
+    }
+    for (let index = 0; index < 4; index += 1) {
+      await capture(chrome, `https://video.twimg.com/path/long-${index}.mp4?token=${"x".repeat(8_000)}`);
+    }
+
+    await dispatchMessage(chrome, {
+      type: "X_PLAYER_ACTIVE", contentRef, durationMs: 0,
+    }, contentSender());
+    const response = await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 7, contentRef,
+    }, contentSender()) as { candidates: Array<{ url: string }> };
+
+    expect(response.candidates.length).toBeLessThanOrEqual(12);
+    expect(response.candidates).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ url: "https://video.twimg.com/path/recent-0.mp4" }),
+    ]));
+    expect(response.candidates.reduce((total, item) => total + item.url.length * 2, 0))
+      .toBeLessThanOrEqual(32_000);
+  });
+
   it("uses request time when queued capture work runs after the window closes", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-09-05T00:00:00Z"));
@@ -650,7 +776,7 @@ describe("X media candidate capture", () => {
     expect(restarted.sidePanel.open).toHaveBeenCalledWith({ tabId: 7 });
   });
 
-  it("delegates a cold-start bare-status click to Chrome's panel behavior", () => {
+  it("does not open a cold-start bare status after the action gesture expires", async () => {
     const bareUrl = "https://x.com/owner/status/2075545587093807111";
     const chrome = createChrome({
       xLastDetectedContent: {
@@ -661,9 +787,14 @@ describe("X media candidate capture", () => {
     installBackgroundHandlers(chrome as never);
 
     const clicked = chrome.events.actionClicked.listeners[0]({ id: 7, url: bareUrl });
+    if (clicked instanceof Promise) await clicked;
 
-    expect(chrome.sidePanel.setPanelBehavior).toHaveBeenCalledWith({ openPanelOnActionClick: true });
-    expect(clicked).toBeUndefined();
+    expect(chrome.sidePanel.setPanelBehavior).toHaveBeenCalledWith({ openPanelOnActionClick: false });
+    expect(chrome.sidePanel.open).not.toHaveBeenCalled();
+
+    await flushMicrotasks();
+    chrome.events.actionClicked.listeners[0]({ id: 7, url: bareUrl });
+    expect(chrome.sidePanel.open).toHaveBeenCalledWith({ tabId: 7 });
   });
 
   it("closes a persisted active capture window when the service worker restarts", async () => {
@@ -833,6 +964,169 @@ describe("X media candidate capture", () => {
     await flushMicrotasks();
 
     expect(chrome.getStored()).toEqual(expect.objectContaining({ xMediaCapture: {} }));
+    vi.useRealTimers();
+  });
+
+  it("clears an expired active marker even when it has no candidates", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-05T00:00:00Z"));
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    await dispatchMessage(chrome, {
+      type: "X_PLAYER_ACTIVE", contentRef, durationMs: 0,
+    }, contentSender());
+    const alarmName = chrome.alarms.create.mock.calls.at(-1)?.[0];
+
+    vi.advanceTimersByTime(15_001);
+    chrome.events.alarm.listeners[0]({ name: alarmName });
+    await flushMicrotasks();
+
+    expect(chrome.getStored()).toEqual(expect.objectContaining({ xMediaCapture: {} }));
+    vi.useRealTimers();
+  });
+
+  it("reschedules cleanup from active expiry to candidate expiry", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-05T00:00:00Z"));
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    await dispatchMessage(chrome, {
+      type: "X_PLAYER_ACTIVE", contentRef, durationMs: 0,
+    }, contentSender());
+    await capture(chrome, "https://video.twimg.com/path/lifecycle.mp4");
+    await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 7, contentRef,
+    }, contentSender());
+    const firstWhen = chrome.alarms.create.mock.calls.at(-1)?.[1]?.when;
+
+    vi.advanceTimersByTime(15_001);
+    chrome.events.alarm.listeners[0]({ name: "xMediaCandidateCleanup" });
+    await flushMicrotasks();
+    const secondWhen = chrome.alarms.create.mock.calls.at(-1)?.[1]?.when;
+
+    expect(firstWhen).toBe(new Date("2026-09-05T00:00:00Z").getTime() + 15_000);
+    expect(secondWhen).toBe(new Date("2026-09-05T00:00:00Z").getTime() + 10 * 60_000);
+    expect(chrome.getStored().xMediaCapture).toEqual(expect.objectContaining({
+      "7": expect.objectContaining({ active: null }),
+    }));
+    vi.useRealTimers();
+  });
+
+  it("caps cached candidates across content keys and evicts the oldest deterministically", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-05T00:00:00Z"));
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    for (let mediaIndex = 1; mediaIndex <= 5; mediaIndex += 1) {
+      const ref = { ...contentRef, mediaIndex };
+      const url = `https://x.com/owner/status/${contentRef.sourceContentId}/video/${mediaIndex}`;
+      await dispatchMessage(chrome, {
+        type: "X_PLAYER_ACTIVE", contentRef: ref, durationMs: 0,
+      }, contentSender(7, url));
+      for (let index = 0; index < 50; index += 1) {
+        vi.advanceTimersByTime(1);
+        await capture(chrome, `https://video.twimg.com/path/${mediaIndex}-${index}.mp4`);
+      }
+    }
+    const lastRef = { ...contentRef, mediaIndex: 5 };
+    const lastUrl = `https://x.com/owner/status/${contentRef.sourceContentId}/video/5`;
+    await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 7, contentRef: lastRef,
+    }, contentSender(7, lastUrl));
+
+    const captureState = chrome.getStored().xMediaCapture as Record<
+      string,
+      { candidates: Record<string, Array<{ url: string }>> }
+    >;
+    const urls = Object.values(captureState["7"].candidates).flat().map(({ url }) => url);
+    expect(urls.length).toBeLessThanOrEqual(200);
+    expect(urls).not.toContain("https://video.twimg.com/path/1-0.mp4");
+    expect(captureState["7"].candidates[`x:${contentRef.sourceContentId}:5`]).toEqual(
+      expect.arrayContaining([expect.objectContaining({
+        url: "https://video.twimg.com/path/5-49.mp4",
+      })]),
+    );
+    vi.useRealTimers();
+  });
+
+  it("caps aggregate candidate URL bytes", async () => {
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    await dispatchMessage(chrome, {
+      type: "X_PLAYER_ACTIVE", contentRef, durationMs: 0,
+    }, contentSender());
+    for (let index = 0; index < 10; index += 1) {
+      await capture(chrome, `https://video.twimg.com/path/${index}.mp4?token=${"x".repeat(20_000)}`);
+    }
+    await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 7, contentRef,
+    }, contentSender());
+
+    const captureState = chrome.getStored().xMediaCapture as Record<
+      string,
+      { candidates: Record<string, Array<{ url: string }>> }
+    >;
+    const urls = Object.values(captureState["7"].candidates).flat().map(({ url }) => url);
+    expect(urls.reduce((total, url) => total + url.length * 2, 0)).toBeLessThanOrEqual(128_000);
+  });
+
+  it("applies the aggregate candidate cap across tabs", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    const candidate = (tabId: number, index: number) => ({
+      url: `https://video.twimg.com/path/${tabId}-${index}.mp4`,
+      kind: "mp4" as const,
+      capturedAt: 1_000 + tabId * 1_000 + index,
+    });
+    const chrome = createChrome({
+      xMediaCapture: {
+        "7": { active: null, candidates: { "x:2075545587093807111:1": Array.from(
+          { length: 120 }, (_, index) => candidate(7, index),
+        ) } },
+        "8": { active: null, candidates: { "x:2075545587093807222:1": Array.from(
+          { length: 120 }, (_, index) => candidate(8, index),
+        ) } },
+      },
+    });
+    installBackgroundHandlers(chrome as never);
+    await flushMicrotasks();
+
+    const captureState = chrome.getStored().xMediaCapture as Record<
+      string,
+      { candidates: Record<string, Array<{ url: string }>> }
+    >;
+    const urls = Object.values(captureState).flatMap((tabState) => (
+      Object.values(tabState.candidates).flat().map(({ url }) => url)
+    ));
+    expect(urls.length).toBeLessThanOrEqual(200);
+    expect(urls).not.toContain("https://video.twimg.com/path/7-0.mp4");
+    expect(urls).toContain("https://video.twimg.com/path/8-119.mp4");
+    vi.useRealTimers();
+  });
+
+  it("restores no more than 50 candidates for one content key", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    const candidates = Array.from({ length: 80 }, (_, index) => ({
+      url: `https://video.twimg.com/path/restored-${index}.mp4`,
+      kind: "mp4" as const,
+      capturedAt: 1_000 + index,
+    }));
+    const chrome = createChrome({
+      xMediaCapture: {
+        "7": { active: null, candidates: { [contentKey(contentRef)]: candidates } },
+      },
+    });
+    installBackgroundHandlers(chrome as never);
+    await flushMicrotasks();
+
+    const captureState = chrome.getStored().xMediaCapture as Record<
+      string,
+      { candidates: Record<string, Array<{ url: string }>> }
+    >;
+    expect(captureState["7"].candidates[contentKey(contentRef)]).toHaveLength(50);
+    expect(captureState["7"].candidates[contentKey(contentRef)][0].url)
+      .toBe("https://video.twimg.com/path/restored-79.mp4");
     vi.useRealTimers();
   });
 
