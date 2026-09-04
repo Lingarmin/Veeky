@@ -22,6 +22,8 @@ function createChrome(initialStored: Record<string, unknown> = {}) {
   const message = new FakeEvent();
   const beforeRequest = new FakeEvent();
   const alarm = new FakeEvent();
+  const historyStateUpdated = new FakeEvent();
+  const navigationCommitted = new FakeEvent();
   let stored: Record<string, unknown> = structuredClone(initialStored);
 
   return {
@@ -44,6 +46,10 @@ function createChrome(initialStored: Record<string, unknown> = {}) {
       clear: vi.fn(async () => true),
     },
     webRequest: { onBeforeRequest: beforeRequest },
+    webNavigation: {
+      onHistoryStateUpdated: historyStateUpdated,
+      onCommitted: navigationCommitted,
+    },
     sidePanel: {
       setOptions: vi.fn(async () => undefined),
       open: vi.fn(async () => undefined),
@@ -55,7 +61,17 @@ function createChrome(initialStored: Record<string, unknown> = {}) {
         set: vi.fn(async (value: Record<string, unknown>) => { stored = { ...stored, ...value }; }),
       },
     },
-    events: { actionClicked, tabActivated, tabUpdated, tabRemoved, message, beforeRequest, alarm },
+    events: {
+      actionClicked,
+      tabActivated,
+      tabUpdated,
+      tabRemoved,
+      message,
+      beforeRequest,
+      alarm,
+      historyStateUpdated,
+      navigationCommitted,
+    },
     getStored: () => stored,
   };
 }
@@ -82,7 +98,12 @@ describe("background tab isolation", () => {
   });
 
   it("declares X content-script and media-capture access", () => {
-    expect(manifest.permissions).toEqual(expect.arrayContaining(["webRequest", "offscreen", "alarms"]));
+    expect(manifest.permissions).toEqual(expect.arrayContaining([
+      "webRequest",
+      "webNavigation",
+      "offscreen",
+      "alarms",
+    ]));
     expect(manifest.host_permissions).toEqual(expect.arrayContaining([
       "https://*.youtube.com/*",
       "https://youtu.be/*",
@@ -95,6 +116,14 @@ describe("background tab isolation", () => {
       js: ["content.js"],
       run_at: "document_idle",
     }]);
+  });
+
+  it("tracks SPA and full-document navigation", () => {
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+
+    expect(chrome.events.historyStateUpdated.listeners).toHaveLength(1);
+    expect(chrome.events.navigationCommitted.listeners).toHaveLength(1);
   });
 
   it("declares the Veeky brand and toolbar icons", () => {
@@ -135,7 +164,7 @@ describe("background tab isolation", () => {
     expect(chrome.sidePanel.open).toHaveBeenCalledWith({ tabId: 7 });
   });
 
-  it("keeps the panel disabled on X pages without an explicit video route", async () => {
+  it("opens a bare X status synchronously even before a player is detected", async () => {
     const chrome = createChrome();
     installBackgroundHandlers(chrome as never);
     await flushMicrotasks();
@@ -143,10 +172,15 @@ describe("background tab isolation", () => {
     const url = "https://x.com/viktoroddy/status/2075545587093807111";
     chrome.events.tabUpdated.listeners[0](7, { url }, { id: 7, url });
     await flushMicrotasks();
-    expect(chrome.sidePanel.setOptions).toHaveBeenLastCalledWith({ tabId: 7, enabled: false });
+    expect(chrome.sidePanel.setOptions).toHaveBeenLastCalledWith({
+      tabId: 7,
+      path: "sidepanel.html",
+      enabled: true,
+    });
 
-    chrome.events.actionClicked.listeners[0]({ id: 7, url });
-    expect(chrome.sidePanel.open).not.toHaveBeenCalled();
+    const clicked = chrome.events.actionClicked.listeners[0]({ id: 7, url });
+    expect(clicked).toBeUndefined();
+    expect(chrome.sidePanel.open).toHaveBeenCalledWith({ tabId: 7 });
   });
 
   it("contains rejected async tab event work", async () => {
@@ -342,6 +376,14 @@ describe("X media candidate capture", () => {
     return { tab: { id: tabId, url }, url };
   }
 
+  function observeStatusRoute(
+    chrome: ReturnType<typeof createChrome>,
+    tabId = 7,
+    url = statusUrl,
+  ) {
+    chrome.events.historyStateUpdated.listeners[0]({ tabId, frameId: 0, url });
+  }
+
   async function capture(
     chrome: ReturnType<typeof createChrome>,
     url: string,
@@ -424,12 +466,38 @@ describe("X media candidate capture", () => {
     })] });
   });
 
+  it("preserves a player route observed before stale startup tab initialization completes", async () => {
+    const chrome = createChrome();
+    let resolveActiveTab: ((tabs: Array<{ id: number; url: string; title: string }>) => void) | undefined;
+    chrome.tabs.query.mockImplementation(() => new Promise((resolve) => { resolveActiveTab = resolve; }));
+    installBackgroundHandlers(chrome as never);
+    await flushMicrotasks();
+
+    const active = dispatchMessage(chrome, {
+      type: "X_PLAYER_ACTIVE", contentRef, durationMs: 0,
+    }, contentSender());
+    resolveActiveTab?.([{
+      id: 7,
+      url: "https://www.youtube.com/watch?v=aircAruvnKk",
+      title: "Stale active tab",
+    }]);
+    await active;
+
+    await capture(chrome, "https://video.twimg.com/path/after-startup.mp4");
+    expect(await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 7, contentRef,
+    }, contentSender())).toEqual({ candidates: [expect.objectContaining({
+      url: "https://video.twimg.com/path/after-startup.mp4",
+    })] });
+  });
+
   it("claims a recent request that arrives just before the active-player signal", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-09-05T00:00:00Z"));
     const chrome = createChrome();
     installBackgroundHandlers(chrome as never);
     await flushMicrotasks();
+    observeStatusRoute(chrome);
     await capture(chrome, "https://video.twimg.com/path/pre-active.m3u8");
     await capture(chrome, "https://video.twimg.com/path/pre-active.mp4");
     vi.advanceTimersByTime(100);
@@ -453,8 +521,10 @@ describe("X media candidate capture", () => {
     const chrome = createChrome();
     installBackgroundHandlers(chrome as never);
     await flushMicrotasks();
+    observeStatusRoute(chrome);
     await capture(chrome, "https://video.twimg.com/path/stale.mp4");
     vi.advanceTimersByTime(2_001);
+    observeStatusRoute(chrome, 8);
     await capture(chrome, "https://video.twimg.com/path/other-tab.mp4", { tabId: 8 });
 
     await dispatchMessage(chrome, {
@@ -471,6 +541,7 @@ describe("X media candidate capture", () => {
     const chrome = createChrome();
     installBackgroundHandlers(chrome as never);
     await flushMicrotasks();
+    observeStatusRoute(chrome);
     await capture(chrome, "https://video.twimg.com/path/pre-active.ts");
 
     await dispatchMessage(chrome, {
@@ -485,6 +556,12 @@ describe("X media candidate capture", () => {
   it("claims a new-status request that precedes both onUpdated and the active signal", async () => {
     const chrome = createChrome();
     installBackgroundHandlers(chrome as never);
+    await flushMicrotasks();
+    chrome.events.historyStateUpdated.listeners[0]({
+      tabId: 7,
+      frameId: 0,
+      url: statusUrl,
+    });
     await dispatchMessage(chrome, {
       type: "X_PLAYER_ACTIVE", contentRef, durationMs: 0,
     }, contentSender());
@@ -492,10 +569,16 @@ describe("X media candidate capture", () => {
       type: "X_PLAYER_INACTIVE", contentRef,
     }, contentSender());
 
+    void capture(chrome, "https://video.twimg.com/path/old-status.mp4");
     const candidateUrl = "https://video.twimg.com/path/new-status.mp4";
-    await capture(chrome, candidateUrl);
     const nextRef = { ...contentRef, sourceContentId: "2075545587093807222" };
     const nextUrl = "https://x.com/owner/status/2075545587093807222/video/1";
+    chrome.events.historyStateUpdated.listeners[0]({
+      tabId: 7,
+      frameId: 0,
+      url: nextUrl,
+    });
+    void capture(chrome, candidateUrl);
     chrome.events.tabUpdated.listeners[0](7, { url: nextUrl }, { id: 7, url: nextUrl });
     await flushMicrotasks();
 
@@ -511,10 +594,38 @@ describe("X media candidate capture", () => {
     })] });
   });
 
+  it("does not claim an old-status request after a full navigation", async () => {
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    await flushMicrotasks();
+    chrome.events.navigationCommitted.listeners[0]({
+      tabId: 7,
+      frameId: 0,
+      url: statusUrl,
+    });
+    void capture(chrome, "https://video.twimg.com/path/old-navigation.mp4");
+
+    const nextRef = { ...contentRef, sourceContentId: "2075545587093807222" };
+    const nextUrl = "https://x.com/owner/status/2075545587093807222/video/1";
+    chrome.events.navigationCommitted.listeners[0]({
+      tabId: 7,
+      frameId: 0,
+      url: nextUrl,
+    });
+    await dispatchMessage(chrome, {
+      type: "X_PLAYER_ACTIVE", contentRef: nextRef, durationMs: 0,
+    }, contentSender(7, nextUrl));
+
+    expect(await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 7, contentRef: nextRef,
+    }, contentSender(7, nextUrl))).toEqual({ candidates: [] });
+  });
+
   it("bounds the recent request ring by count and URL bytes", async () => {
     const chrome = createChrome();
     installBackgroundHandlers(chrome as never);
     await flushMicrotasks();
+    observeStatusRoute(chrome);
     for (let index = 0; index < 20; index += 1) {
       await capture(chrome, `https://video.twimg.com/path/recent-${index}.mp4`);
     }
@@ -543,6 +654,7 @@ describe("X media candidate capture", () => {
     const chrome = createChrome();
     installBackgroundHandlers(chrome as never);
     await flushMicrotasks();
+    observeStatusRoute(chrome);
 
     await capture(chrome, "https://video.twimg.com/path/timed.mp4");
     await flushMicrotasks();
@@ -560,6 +672,7 @@ describe("X media candidate capture", () => {
     installBackgroundHandlers(chrome as never);
     await flushMicrotasks();
     for (let tabId = 7; tabId <= 11; tabId += 1) {
+      observeStatusRoute(chrome, tabId);
       for (let index = 0; index < 12; index += 1) {
         vi.advanceTimersByTime(1);
         await capture(chrome, `https://video.twimg.com/path/recent-${tabId}-${index}.mp4`, { tabId });
@@ -577,7 +690,7 @@ describe("X media candidate capture", () => {
       total += response.candidates.length;
     }
 
-    expect(total).toBeLessThanOrEqual(48);
+    expect(total).toBe(48);
     vi.useRealTimers();
   });
 
@@ -586,6 +699,7 @@ describe("X media candidate capture", () => {
     installBackgroundHandlers(chrome as never);
     await flushMicrotasks();
     for (let tabId = 7; tabId <= 11; tabId += 1) {
+      observeStatusRoute(chrome, tabId);
       await capture(
         chrome,
         `https://video.twimg.com/path/recent-${tabId}.mp4?token=${"x".repeat(8_000)}`,
@@ -604,6 +718,7 @@ describe("X media candidate capture", () => {
       totalBytes += response.candidates.reduce((total, candidate) => total + candidate.url.length * 2, 0);
     }
 
+    expect(totalBytes).toBeGreaterThan(0);
     expect(totalBytes).toBeLessThanOrEqual(64_000);
   });
 
@@ -835,7 +950,7 @@ describe("X media candidate capture", () => {
     expect(restarted.sidePanel.open).toHaveBeenCalledWith({ tabId: 7 });
   });
 
-  it("opens a cold-start bare status from the first click after initialization", async () => {
+  it("opens a cold-start bare status before the first microtask", async () => {
     const bareUrl = "https://x.com/owner/status/2075545587093807111";
     const chrome = createChrome({
       xLastDetectedContent: {
@@ -845,15 +960,15 @@ describe("X media candidate capture", () => {
     let resolveActiveTab: ((tabs: Array<{ id: number; url: string; title: string }>) => void) | undefined;
     chrome.tabs.query.mockImplementation(() => new Promise((resolve) => { resolveActiveTab = resolve; }));
     installBackgroundHandlers(chrome as never);
-    await flushMicrotasks();
 
     const clicked = chrome.events.actionClicked.listeners[0]({ id: 7, url: bareUrl });
+    expect(clicked).toBeUndefined();
     expect(chrome.sidePanel.setPanelBehavior).toHaveBeenCalledWith({ openPanelOnActionClick: false });
-    expect(chrome.sidePanel.open).not.toHaveBeenCalled();
-
-    resolveActiveTab?.([{ id: 7, url: bareUrl, title: "X status" }]);
-    if (clicked instanceof Promise) await clicked;
     expect(chrome.sidePanel.open).toHaveBeenCalledWith({ tabId: 7 });
+
+    await Promise.resolve();
+    expect(chrome.sidePanel.open).toHaveBeenCalledTimes(1);
+    resolveActiveTab?.([{ id: 7, url: bareUrl, title: "X status" }]);
   });
 
   it("closes a persisted active capture window when the service worker restarts", async () => {
@@ -897,7 +1012,7 @@ describe("X media candidate capture", () => {
     expect(restarted.getStored()).toEqual(expect.objectContaining({ xLastDetectedContent: {} }));
     restarted.events.actionClicked.listeners[0]({ id: 7, url: otherStatusUrl });
     await flushMicrotasks();
-    expect(restarted.sidePanel.open).not.toHaveBeenCalled();
+    expect(restarted.sidePanel.open).toHaveBeenCalledWith({ tabId: 7 });
   });
 
   it("does not let stale panel cleanup overwrite another tab's detected content", async () => {

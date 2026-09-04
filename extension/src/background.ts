@@ -38,16 +38,37 @@ interface LastDetectedContent {
 
 type LastDetectedContentState = Record<string, LastDetectedContent>;
 
+interface XRouteEpoch {
+  epoch: number;
+  statusId: string | null;
+  mediaIndex: number | null;
+  routeKey: string | null;
+}
+
+interface BufferedMediaCandidate extends MediaCandidate {
+  routeEpoch: number;
+  statusId: string;
+}
+
 interface BackgroundState {
   lastDetectedContentByTab: Map<number, ContentRef>;
-  recentRequestsByTab: Map<number, MediaCandidate[]>;
+  recentRequestsByTab: Map<number, BufferedMediaCandidate[]>;
+  routeEpochByTab: Map<number, XRouteEpoch>;
   rescheduleRecentRequestCleanup: () => void;
   runCaptureTask: <T>(task: () => Promise<T>) => Promise<T>;
 }
 
 type ChromeApi = Pick<
   typeof chrome,
-  "action" | "alarms" | "runtime" | "sidePanel" | "scripting" | "storage" | "tabs" | "webRequest"
+  | "action"
+  | "alarms"
+  | "runtime"
+  | "sidePanel"
+  | "scripting"
+  | "storage"
+  | "tabs"
+  | "webNavigation"
+  | "webRequest"
 >;
 
 export function parseVideoId(url?: string): string | null {
@@ -57,7 +78,8 @@ export function parseVideoId(url?: string): string | null {
 
 export function installBackgroundHandlers(chromeApi: ChromeApi): void {
   const lastDetectedContentByTab = new Map<number, ContentRef>();
-  const recentRequestsByTab = new Map<number, MediaCandidate[]>();
+  const recentRequestsByTab = new Map<number, BufferedMediaCandidate[]>();
+  const routeEpochByTab = new Map<number, XRouteEpoch>();
   let recentRequestCleanupTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
   const rescheduleRecentRequestCleanup = () => {
     if (recentRequestCleanupTimer !== null) globalThis.clearTimeout(recentRequestCleanupTimer);
@@ -81,6 +103,7 @@ export function installBackgroundHandlers(chromeApi: ChromeApi): void {
   const state: BackgroundState = {
     lastDetectedContentByTab,
     recentRequestsByTab,
+    routeEpochByTab,
     rescheduleRecentRequestCleanup,
     runCaptureTask,
   };
@@ -89,25 +112,22 @@ export function installBackgroundHandlers(chromeApi: ChromeApi): void {
     .catch(reportBackgroundError);
   const initialization = runCaptureTask(async () => {
     await initializeMediaCapture(chromeApi);
-    await configureActiveTab(chromeApi, lastDetectedContentByTab);
+    await configureActiveTab(chromeApi, lastDetectedContentByTab, routeEpochByTab);
   });
   void initialization.catch(reportBackgroundError);
 
   chromeApi.action.onClicked.addListener((tab) => {
     const tabId = tab.id;
-    if (tabId === undefined) return;
-    const explicitRef = parseContentRef(tab.url);
-    const rememberedRef = lastDetectedContentByTab.get(tabId);
-    if (explicitRef || activeContentMatchesUrl(rememberedRef, tab.url)) {
-      openPanelForTab(chromeApi, tabId);
-      return;
-    }
-    return initialization.then(() => {
-      if (activeContentMatchesUrl(lastDetectedContentByTab.get(tabId), tab.url)) {
-        openPanelForTab(chromeApi, tabId);
-      }
-    }).catch(reportBackgroundError);
+    if (tabId === undefined || !isSupportedPanelUrl(tab.url)) return;
+    openPanelForTab(chromeApi, tabId);
   });
+
+  const observeNavigation = (details: { frameId: number; tabId: number; url: string }) => {
+    if (details.frameId !== 0) return;
+    updateRouteEpoch(routeEpochByTab, details.tabId, details.url);
+  };
+  chromeApi.webNavigation.onHistoryStateUpdated.addListener(observeNavigation);
+  chromeApi.webNavigation.onCommitted.addListener(observeNavigation);
 
   chromeApi.tabs.onActivated.addListener(({ tabId }) => {
     void runCaptureTask(() => updatePanelForActivatedTab(
@@ -120,12 +140,14 @@ export function installBackgroundHandlers(chromeApi: ChromeApi): void {
 
   chromeApi.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (!changeInfo.url) return;
+    updateRouteEpoch(routeEpochByTab, tabId, changeInfo.url);
     const explicitRef = parseContentRef(tab.url);
+    const supportedPanelUrl = isSupportedPanelUrl(tab.url);
     const rememberedRef = lastDetectedContentByTab.get(tabId);
     const rememberedRefStillMatches = activeContentMatchesUrl(rememberedRef, tab.url);
     if (!rememberedRefStillMatches) lastDetectedContentByTab.delete(tabId);
     void chromeApi.sidePanel.setOptions(
-      explicitRef || rememberedRefStillMatches
+      supportedPanelUrl || rememberedRefStillMatches
         ? { tabId, path: "sidepanel.html", enabled: true }
         : { tabId, enabled: false },
     ).catch(reportBackgroundError);
@@ -149,6 +171,7 @@ export function installBackgroundHandlers(chromeApi: ChromeApi): void {
   chromeApi.tabs.onRemoved.addListener((tabId) => {
     lastDetectedContentByTab.delete(tabId);
     recentRequestsByTab.delete(tabId);
+    routeEpochByTab.delete(tabId);
     rescheduleRecentRequestCleanup();
     return runCaptureTask(() => removeAllTabState(chromeApi, tabId))
       .catch(reportBackgroundError);
@@ -156,10 +179,12 @@ export function installBackgroundHandlers(chromeApi: ChromeApi): void {
 
   chromeApi.webRequest.onBeforeRequest.addListener(
     (details) => {
+      const requestRoute = routeEpochByTab.get(details.tabId) ?? null;
       void runCaptureTask(() => captureMediaCandidate(
         chromeApi,
         details,
         recentRequestsByTab,
+        requestRoute,
         rescheduleRecentRequestCleanup,
       )).catch(reportBackgroundError);
     },
@@ -210,6 +235,11 @@ async function handleMessage(
       return { ok: false };
     }
     const signalAt = Date.now();
+    const activeRoute = updateRouteEpoch(
+      state.routeEpochByTab,
+      tabId,
+      sender.url ?? sender.tab?.url,
+    );
     return state.runCaptureTask(async () => {
       const mediaState = await loadMediaCaptureState(chromeApi);
       const tabKey = String(tabId);
@@ -222,6 +252,8 @@ async function handleMessage(
         state.recentRequestsByTab,
         tabId,
         signalAt,
+        activeRoute,
+        message.contentRef,
       );
       state.rescheduleRecentRequestCleanup();
       const candidates = pruneCandidateMap(prior?.candidates ?? {}, Date.now());
@@ -362,7 +394,8 @@ async function handleMessage(
 async function captureMediaCandidate(
   chromeApi: ChromeApi,
   details: chrome.webRequest.WebRequestBodyDetails,
-  recentRequestsByTab: Map<number, MediaCandidate[]>,
+  recentRequestsByTab: Map<number, BufferedMediaCandidate[]>,
+  requestRoute: XRouteEpoch | null,
   rescheduleRecentRequestCleanup: () => void,
 ): Promise<void> {
   if (details.tabId < 0 || (details.type !== "media" && details.type !== "xmlhttprequest")) return;
@@ -372,8 +405,13 @@ async function captureMediaCandidate(
   const state = await loadMediaCaptureState(chromeApi);
   const tabState = state[String(details.tabId)];
   const now = Date.now();
-  if (!tabState?.active) {
-    bufferRecentRequest(recentRequestsByTab, details.tabId, candidate, now);
+  if (!tabState?.active || !routeMatchesContentRef(requestRoute, tabState.active.contentRef)) {
+    if (!requestRoute?.statusId) return;
+    bufferRecentRequest(recentRequestsByTab, details.tabId, {
+      ...candidate,
+      routeEpoch: requestRoute.epoch,
+      statusId: requestRoute.statusId,
+    }, now);
     rescheduleRecentRequestCleanup();
     return;
   }
@@ -397,9 +435,9 @@ function mergeCandidates(
 }
 
 function bufferRecentRequest(
-  recentRequestsByTab: Map<number, MediaCandidate[]>,
+  recentRequestsByTab: Map<number, BufferedMediaCandidate[]>,
   tabId: number,
-  candidate: MediaCandidate,
+  candidate: BufferedMediaCandidate,
   now: number,
 ): void {
   const recent = (recentRequestsByTab.get(tabId) ?? [])
@@ -419,21 +457,26 @@ function bufferRecentRequest(
 }
 
 function claimRecentRequests(
-  recentRequestsByTab: Map<number, MediaCandidate[]>,
+  recentRequestsByTab: Map<number, BufferedMediaCandidate[]>,
   tabId: number,
   signalAt: number,
+  activeRoute: XRouteEpoch,
+  contentRef: ContentRef,
 ): MediaCandidate[] {
   pruneRecentRequestMap(recentRequestsByTab, signalAt);
   const claimed = (recentRequestsByTab.get(tabId) ?? []).filter((candidate) => (
     candidate.capturedAt <= signalAt
     && signalAt - candidate.capturedAt <= RECENT_REQUEST_MAX_AGE_MS
+    && candidate.routeEpoch === activeRoute.epoch
+    && candidate.statusId === activeRoute.statusId
+    && candidate.statusId === contentRef.sourceContentId
   ));
   recentRequestsByTab.delete(tabId);
-  return claimed;
+  return claimed.map(({ routeEpoch: _routeEpoch, statusId: _statusId, ...candidate }) => candidate);
 }
 
 function pruneRecentRequestMap(
-  recentRequestsByTab: Map<number, MediaCandidate[]>,
+  recentRequestsByTab: Map<number, BufferedMediaCandidate[]>,
   now: number,
 ): void {
   for (const [tabId, candidates] of recentRequestsByTab) {
@@ -446,7 +489,7 @@ function pruneRecentRequestMap(
 }
 
 function nextRecentRequestExpiry(
-  recentRequestsByTab: Map<number, MediaCandidate[]>,
+  recentRequestsByTab: Map<number, BufferedMediaCandidate[]>,
 ): number | null {
   let nextExpiry = Number.POSITIVE_INFINITY;
   for (const candidates of recentRequestsByTab.values()) {
@@ -458,7 +501,7 @@ function nextRecentRequestExpiry(
 }
 
 function enforceAggregateRecentRequestLimits(
-  recentRequestsByTab: Map<number, MediaCandidate[]>,
+  recentRequestsByTab: Map<number, BufferedMediaCandidate[]>,
 ): void {
   const entries = [...recentRequestsByTab.entries()].flatMap(([tabId, candidates]) => (
     candidates.map((candidate) => ({ tabId, candidate }))
@@ -611,6 +654,65 @@ function xUrlMatchesRef(candidate: string | undefined, contentRef: ContentRef): 
 
 function activeContentMatchesUrl(contentRef: ContentRef | undefined, url: string | undefined): boolean {
   return Boolean(contentRef && xUrlMatchesRef(url, contentRef));
+}
+
+function updateRouteEpoch(
+  routeEpochByTab: Map<number, XRouteEpoch>,
+  tabId: number,
+  candidate: string | undefined,
+): XRouteEpoch {
+  const route = parseXStatusRoute(candidate);
+  const routeKey = route
+    ? `${route.sourceContentId}:${route.mediaIndex ?? "status"}`
+    : null;
+  const current = routeEpochByTab.get(tabId);
+  if (current?.routeKey === routeKey) return current;
+  const next = {
+    epoch: (current?.epoch ?? 0) + 1,
+    statusId: route?.sourceContentId ?? null,
+    mediaIndex: route?.mediaIndex ?? null,
+    routeKey,
+  };
+  routeEpochByTab.set(tabId, next);
+  return next;
+}
+
+function routeMatchesContentRef(route: XRouteEpoch | null, contentRef: ContentRef): boolean {
+  return Boolean(
+    route?.statusId === contentRef.sourceContentId
+    && (route.mediaIndex === null || route.mediaIndex === contentRef.mediaIndex),
+  );
+}
+
+function parseXStatusRoute(candidate: string | undefined): {
+  sourceContentId: string;
+  mediaIndex: number | null;
+} | null {
+  if (!candidate) return null;
+  let url: URL;
+  try {
+    url = new URL(candidate);
+  } catch {
+    return null;
+  }
+  if (
+    url.protocol !== "https:"
+    || (url.hostname !== "x.com" && url.hostname !== "www.x.com")
+    || url.username
+    || url.password
+    || url.port
+  ) return null;
+  const match = X_STATUS_PATH.exec(url.pathname);
+  if (!match) return null;
+  return {
+    sourceContentId: match[1],
+    mediaIndex: match[2] ? Number(match[2]) : null,
+  };
+}
+
+function isSupportedPanelUrl(candidate: string | undefined): boolean {
+  if (parseContentRef(candidate)) return true;
+  return parseXStatusRoute(candidate) !== null;
 }
 
 function isValidXContentRef(contentRef: ContentRef): boolean {
@@ -797,7 +899,7 @@ async function updatePanelForTab(
 ): Promise<ContentRef | null> {
   const explicitRef = parseContentRef(url);
   const rememberedRef = await resolveLastDetectedContent(chromeApi, tabId, url);
-  const isSupportedVideo = explicitRef !== null || rememberedRef !== null;
+  const isSupportedVideo = explicitRef !== null || rememberedRef !== null || isSupportedPanelUrl(url);
   await chromeApi.sidePanel.setOptions(
     isSupportedVideo
       ? { tabId, path: "sidepanel.html", enabled: true }
@@ -816,9 +918,13 @@ function openPanelForTab(chromeApi: ChromeApi, tabId: number): void {
 async function configureActiveTab(
   chromeApi: ChromeApi,
   lastDetectedContentByTab: Map<number, ContentRef>,
+  routeEpochByTab: Map<number, XRouteEpoch>,
 ): Promise<void> {
   const [tab] = await chromeApi.tabs.query({ active: true, currentWindow: true });
   if (tab?.id !== undefined) {
+    if (!routeEpochByTab.has(tab.id)) {
+      updateRouteEpoch(routeEpochByTab, tab.id, tab.url);
+    }
     const rememberedRef = await updatePanelForTab(chromeApi, tab.id, tab.url);
     if (rememberedRef) lastDetectedContentByTab.set(tab.id, rememberedRef);
   }
