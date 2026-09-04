@@ -42,13 +42,19 @@ class Base(DeclarativeBase):
 class Installation(Base):
     __tablename__ = "installations"
     __table_args__ = (
-        CheckConstraint("length(token_hash) = 64", name="ck_installation_token_hash_length"),
+        CheckConstraint(
+            "length(token_hash) = 64", name="ck_installation_token_hash_length"
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_string)
     token_hash: Mapped[str] = mapped_column(String(64), unique=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
 
     jobs: Mapped[list[AnalysisJob]] = relationship(back_populates="installation")
     media_upload_sessions: Mapped[list[MediaUploadSession]] = relationship(
@@ -60,9 +66,7 @@ class Video(Base):
     __tablename__ = "videos"
     __table_args__ = (
         UniqueConstraint("content_id", name="uq_videos_content_id"),
-        UniqueConstraint(
-            "video_id", "content_id", name="uq_videos_video_content"
-        ),
+        UniqueConstraint("video_id", "content_id", name="uq_videos_video_content"),
         UniqueConstraint(
             "platform",
             "source_content_id",
@@ -81,7 +85,9 @@ class Video(Base):
     title: Mapped[str] = mapped_column(String(500))
     duration_ms: Mapped[int] = mapped_column(Integer)
     source_url: Mapped[str] = mapped_column(String(1000))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
 
     tracks: Mapped[list[TranscriptTrack]] = relationship(
         back_populates="video",
@@ -142,7 +148,13 @@ class TranscriptTrack(Base):
     is_generated: Mapped[bool] = mapped_column(Boolean)
     is_translatable: Mapped[bool] = mapped_column(Boolean)
     transcript_version: Mapped[str] = mapped_column(String(100))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    transcript_source: Mapped[str] = mapped_column(
+        String(40), default="youtube_caption"
+    )
+    asr_model: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
 
     video: Mapped[Video] = relationship(
         back_populates="tracks", foreign_keys=[video_id]
@@ -200,7 +212,9 @@ class Translation(Base):
     provider_version: Mapped[str] = mapped_column(String(80))
     transcript_version: Mapped[str] = mapped_column(String(100))
     segments: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
 
     track: Mapped[TranscriptTrack] = relationship(back_populates="translations")
 
@@ -209,8 +223,9 @@ class AnalysisJob(Base):
     __tablename__ = "analysis_jobs"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('queued', 'fetching_transcript', 'translating', "
-            "'analyzing', 'completed', 'failed')",
+            "status IN ('queued', 'waiting_for_media', 'downloading_media', "
+            "'extracting_audio', 'transcribing', 'fetching_transcript', "
+            "'translating', 'analyzing', 'completed', 'failed')",
             name="ck_analysis_job_status",
         ),
         ForeignKeyConstraint(
@@ -219,16 +234,25 @@ class AnalysisJob(Base):
             name="fk_analysis_jobs_video_content_videos",
             ondelete="CASCADE",
         ),
-        Index("ix_analysis_jobs_video_languages", "video_id", "source_language", "target_language"),
+        Index(
+            "ix_analysis_jobs_video_languages",
+            "video_id",
+            "source_language",
+            "target_language",
+        ),
         Index(
             "uq_analysis_jobs_one_active_per_installation",
             "installation_id",
             unique=True,
             postgresql_where=text(
-                "status IN ('queued', 'fetching_transcript', 'translating', 'analyzing')"
+                "status IN ('queued', 'waiting_for_media', 'downloading_media', "
+                "'extracting_audio', 'transcribing', 'fetching_transcript', "
+                "'translating', 'analyzing')"
             ),
             sqlite_where=text(
-                "status IN ('queued', 'fetching_transcript', 'translating', 'analyzing')"
+                "status IN ('queued', 'waiting_for_media', 'downloading_media', "
+                "'extracting_audio', 'transcribing', 'fetching_transcript', "
+                "'translating', 'analyzing')"
             ),
         ),
     )
@@ -254,16 +278,23 @@ class AnalysisJob(Base):
     llm_credential_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    media_url_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    media_session_id: Mapped[str | None] = mapped_column(
+        ForeignKey("media_upload_sessions.id", ondelete="SET NULL"), nullable=True
+    )
+    force_run: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(String(40), default="queued")
     failure_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
     failure_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     installation: Mapped[Installation] = relationship(back_populates="jobs")
-    video: Mapped[Video] = relationship(
-        back_populates="jobs", foreign_keys=[video_id]
-    )
+    video: Mapped[Video] = relationship(back_populates="jobs", foreign_keys=[video_id])
     content: Mapped[Video] = relationship(
         back_populates="content_jobs", foreign_keys=[content_id]
     )
@@ -285,7 +316,9 @@ class AnalysisResult(Base):
     highlights: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
     model_name: Mapped[str] = mapped_column(String(120))
     model_version: Mapped[str] = mapped_column(String(120))
-    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
 
     job: Mapped[AnalysisJob] = relationship(back_populates="result")
 
@@ -309,9 +342,7 @@ class MediaUploadSession(Base):
             "received_bytes >= 0 AND received_bytes <= expected_bytes",
             name="ck_media_upload_session_received_bytes",
         ),
-        CheckConstraint(
-            "part_count > 0", name="ck_media_upload_session_part_count"
-        ),
+        CheckConstraint("part_count > 0", name="ck_media_upload_session_part_count"),
         CheckConstraint(
             "part_size_bytes > 0", name="ck_media_upload_session_part_size_bytes"
         ),
@@ -341,8 +372,12 @@ class MediaUploadSession(Base):
         JSON, nullable=True
     )
     directory_key: Mapped[str] = mapped_column(String(36), unique=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
     installation: Mapped[Installation] = relationship(
@@ -375,6 +410,8 @@ class MediaUploadPart(Base):
     part_number: Mapped[int] = mapped_column(Integer, primary_key=True)
     byte_size: Mapped[int] = mapped_column(BigInteger)
     sha256: Mapped[str] = mapped_column(String(64))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now
+    )
 
     upload_session: Mapped[MediaUploadSession] = relationship(back_populates="parts")

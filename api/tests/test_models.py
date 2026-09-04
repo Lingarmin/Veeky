@@ -181,6 +181,46 @@ async def test_analysis_job_rejects_mismatched_video_and_content_ids(session):
 
 
 @pytest.mark.asyncio
+async def test_x_worker_statuses_and_media_handoff_fields_are_persisted(session):
+    installation = Installation(
+        id="88888888-8888-4888-8888-888888888888", token_hash="f" * 64
+    )
+    video = Video(
+        video_id="x:2075545587093807111:1",
+        platform="x",
+        source_content_id="2075545587093807111",
+        media_index=1,
+        title="X video",
+        duration_ms=0,
+        source_url="https://x.com/i/status/2075545587093807111/video/1",
+    )
+    job = AnalysisJob(
+        installation=installation,
+        video=video,
+        source_language="auto",
+        target_language="zh-Hans",
+        transcript_version="pending:x-job",
+        cache_key="pending:x-job",
+        status="waiting_for_media",
+        media_url_ciphertext="encrypted",
+        force_run=True,
+    )
+    session.add(job)
+    await session.commit()
+
+    row = (
+        await session.execute(
+            text(
+                "SELECT status, media_url_ciphertext, force_run "
+                "FROM analysis_jobs WHERE id = :id"
+            ),
+            {"id": job.id},
+        )
+    ).one()
+    assert tuple(row) == ("waiting_for_media", "encrypted", 1)
+
+
+@pytest.mark.asyncio
 async def test_translation_cache_allows_same_version_from_different_providers(session):
     video = Video(
         video_id="aircAruvnKk",
@@ -286,7 +326,9 @@ async def test_installation_cannot_have_two_active_analysis_jobs(session):
 
 
 @pytest.mark.asyncio
-async def test_analysis_job_belongs_to_installation_and_stores_encrypted_credentials(session):
+async def test_analysis_job_belongs_to_installation_and_stores_encrypted_credentials(
+    session,
+):
     installation = Installation(
         id="22222222-2222-4222-8222-222222222222", token_hash="b" * 64
     )
@@ -339,9 +381,7 @@ async def test_installation_token_hash_is_unique(session):
 @pytest.mark.asyncio
 async def test_installation_token_hash_must_be_64_characters(session):
     session.add(
-        Installation(
-            id="55555555-5555-4555-8555-555555555555", token_hash="too-short"
-        )
+        Installation(id="55555555-5555-4555-8555-555555555555", token_hash="too-short")
     )
 
     with pytest.raises(IntegrityError):

@@ -73,7 +73,9 @@ class FakeTranslationProvider:
         if self.fails:
             raise TranslationProviderError("translation_unavailable", "offline")
         return [
-            TranslatedSegment(item.segment_id, item.start_ms, item.duration_ms, f"ZH:{item.text}")
+            TranslatedSegment(
+                item.segment_id, item.start_ms, item.duration_ms, f"ZH:{item.text}"
+            )
             for item in segments
         ]
 
@@ -87,7 +89,9 @@ class FakeAnalysisService:
         return AnalysisResult(
             one_line_summary="神经网络从像素中学习。",
             summary_points=["像素进入输入层", "权重控制连接", "偏置调整激活"],
-            chapters=[TimedSummary(start_ms=0, end_ms=2000, title="输入", summary="像素")],
+            chapters=[
+                TimedSummary(start_ms=0, end_ms=2000, title="输入", summary="像素")
+            ],
             highlights=[
                 Highlight(
                     start_ms=1000,
@@ -150,9 +154,13 @@ async def test_pipeline_persists_transcript_translation_and_result(pipeline_cont
 
     async with factory() as session:
         job = await session.scalar(
-            select(AnalysisJob).options(selectinload(AnalysisJob.result)).where(AnalysisJob.id == job_id)
+            select(AnalysisJob)
+            .options(selectinload(AnalysisJob.result))
+            .where(AnalysisJob.id == job_id)
         )
-        segment_count = await session.scalar(select(func.count()).select_from(StoredSegment))
+        segment_count = await session.scalar(
+            select(func.count()).select_from(StoredSegment)
+        )
         assert job.status == "completed"
         assert job.result.one_line_summary == "神经网络从像素中学习。"
         assert segment_count == 2
@@ -226,7 +234,9 @@ async def test_translation_failure_preserves_original_transcript(pipeline_contex
 
     async with factory() as session:
         job = await session.get(AnalysisJob, job_id)
-        segment_count = await session.scalar(select(func.count()).select_from(StoredSegment))
+        segment_count = await session.scalar(
+            select(func.count()).select_from(StoredSegment)
+        )
         assert job.status == "failed"
         assert job.failure_code == "translation_failed"
         assert segment_count == 2
@@ -248,7 +258,9 @@ async def test_default_pipeline_fails_when_temporary_credentials_expired(
             "model": "kimi-k2.5",
         }
         job.llm_credential_ciphertext = cipher.encrypt(job.id, "secret")
-        job.llm_credential_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        job.llm_credential_expires_at = datetime.now(timezone.utc) - timedelta(
+            seconds=1
+        )
         await session.commit()
     pipeline = AnalysisPipeline(
         factory,
@@ -311,7 +323,10 @@ async def test_expired_credential_cleanup_clears_only_expired_secrets(pipeline_c
         expired = await session.get(AnalysisJob, expired_job_id)
         expired.status = "failed"
         expired.llm_credential_ciphertext = "expired"
-        expired.llm_credential_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        expired.media_url_ciphertext = "expired-media"
+        expired.llm_credential_expires_at = datetime.now(timezone.utc) - timedelta(
+            seconds=1
+        )
         current = AnalysisJob(
             installation_id=expired.installation_id,
             video_id=expired.video_id,
@@ -320,6 +335,7 @@ async def test_expired_credential_cleanup_clears_only_expired_secrets(pipeline_c
             transcript_version=expired.transcript_version,
             cache_key="current-credential",
             llm_credential_ciphertext="current",
+            media_url_ciphertext="current-media",
             llm_credential_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
         )
         session.add(current)
@@ -336,7 +352,9 @@ async def test_expired_credential_cleanup_clears_only_expired_secrets(pipeline_c
         current = await session.get(AnalysisJob, current_job_id)
         assert expired.llm_credential_ciphertext is None
         assert expired.llm_credential_expires_at is None
+        assert expired.media_url_ciphertext is None
         assert current.llm_credential_ciphertext == "current"
+        assert current.media_url_ciphertext == "current-media"
 
 
 @pytest.mark.asyncio
@@ -362,8 +380,24 @@ async def test_translation_failure_preserves_the_generated_summary(pipeline_cont
         assert job.result.one_line_summary == "神经网络从像素中学习。"
 
 
+def test_analyze_video_accepts_explicit_resume_without_serializing_media(monkeypatch):
+    captured = {}
+
+    async def fake_run(job_id, *, resume=False):
+        captured.update(job_id=job_id, resume=resume)
+
+    monkeypatch.setattr("app.workers.tasks.run_analysis_task", fake_run)
+    from app.workers.tasks import analyze_video
+
+    analyze_video.run("job-id", resume=True)
+
+    assert captured == {"job_id": "job-id", "resume": True}
+
+
 @pytest.mark.asyncio
-async def test_retry_after_translation_failure_reuses_existing_analysis_result(pipeline_context):
+async def test_retry_after_translation_failure_reuses_existing_analysis_result(
+    pipeline_context,
+):
     factory, job_id = pipeline_context
     pipeline = AnalysisPipeline(
         factory,
@@ -414,7 +448,9 @@ async def test_transcript_failure_does_not_create_result(pipeline_context):
 
     async with factory() as session:
         job = await session.scalar(
-            select(AnalysisJob).options(selectinload(AnalysisJob.result)).where(AnalysisJob.id == job_id)
+            select(AnalysisJob)
+            .options(selectinload(AnalysisJob.result))
+            .where(AnalysisJob.id == job_id)
         )
         assert job.status == "failed"
         assert job.failure_code == "captions_disabled"
@@ -474,7 +510,9 @@ async def test_changed_transcript_fails_before_persistence(pipeline_context):
 
     async with factory() as session:
         job = await session.get(AnalysisJob, job_id)
-        segment_count = await session.scalar(select(func.count()).select_from(StoredSegment))
+        segment_count = await session.scalar(
+            select(func.count()).select_from(StoredSegment)
+        )
         assert job.status == "failed"
         assert job.failure_code == "transcript_changed"
         assert segment_count == 0

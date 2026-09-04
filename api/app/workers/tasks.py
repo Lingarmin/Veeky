@@ -2,6 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import binascii
+import hashlib
+import json
+import math
+import shutil
+from pathlib import Path
+from types import SimpleNamespace
 from datetime import datetime, timezone
 
 from celery import Celery
@@ -21,7 +27,11 @@ from app.db.models import (
     TranscriptSegment as StoredTranscriptSegment,
     TranscriptTrack,
     Translation,
+    MediaUploadSession,
+    Video,
 )
+from app.services.asr import AsrError, get_default_transcriber
+from app.services.media_download import MediaDownloadError, MediaDownloader
 from app.services.analysis import (
     AnalysisGenerationError,
     AnalysisSegment,
@@ -34,6 +44,7 @@ from app.services.transcripts import TranscriptService, transcript_version
 from app.services.video_metadata import VideoMetadataService
 from app.sources.base import ContentRef, SourceRegistry
 from app.sources.youtube import YouTubeAdapter
+from app.sources.x import XAdapter
 from app.services.translation import (
     CachedTranslationService,
     LibreTranslateProvider,
@@ -47,8 +58,128 @@ from app.services.translation import (
 from app.security.credentials import JobCredentialCipher
 
 
+class AudioExtractionError(RuntimeError):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+class FFmpegAudioExtractor:
+    def __init__(
+        self,
+        media_root: str,
+        *,
+        timeout_seconds: int,
+        max_bytes: int,
+        runner=None,
+    ):
+        self.media_root = Path(media_root).resolve()
+        self.timeout_seconds = timeout_seconds
+        self.max_bytes = max_bytes
+        self.runner = runner or self._run_subprocess
+
+    async def probe_duration_ms(self, media_path: Path) -> int:
+        self._validate_path(media_path)
+        process = await self.runner(
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+            str(media_path),
+        )
+        if process.returncode:
+            raise AudioExtractionError("media_probe_failed", "无法读取媒体时长")
+        try:
+            duration = float(json.loads(process.stdout)["format"]["duration"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            raise AudioExtractionError(
+                "media_probe_failed", "无法读取媒体时长"
+            ) from None
+        if not math.isfinite(duration) or duration < 0:
+            raise AudioExtractionError("media_probe_failed", "无法读取媒体时长")
+        return round(duration * 1000)
+
+    async def extract(self, media_path: Path, audio_path: Path) -> Path:
+        self._validate_path(media_path)
+        self._validate_path(audio_path)
+        process = await self.runner(
+            "ffmpeg",
+            "-nostdin",
+            "-v",
+            "error",
+            "-i",
+            str(media_path),
+            "-map",
+            "0:a:0",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            "-fs",
+            str(self.max_bytes),
+            "-y",
+            str(audio_path),
+        )
+        if process.returncode:
+            stderr = process.stderr.lower()
+            code = (
+                "audio_track_missing"
+                if any(
+                    marker in stderr
+                    for marker in (
+                        "matches no streams",
+                        "stream map",
+                        "does not contain any stream",
+                    )
+                )
+                else "audio_extraction_failed"
+            )
+            raise AudioExtractionError(
+                code,
+                "媒体没有可用音轨" if code == "audio_track_missing" else "音频提取失败",
+            )
+        if not audio_path.is_file() or audio_path.stat().st_size > self.max_bytes:
+            raise AudioExtractionError("media_too_large", "媒体文件过大")
+        return audio_path
+
+    async def _run_subprocess(self, *arguments: str):
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *arguments,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=self.timeout_seconds
+            )
+        except (OSError, TimeoutError):
+            if "process" in locals() and process.returncode is None:
+                process.kill()
+                await process.communicate()
+            raise AudioExtractionError(
+                "audio_extraction_failed", "音频提取失败"
+            ) from None
+        return SimpleNamespace(
+            returncode=process.returncode,
+            stdout=stdout.decode("utf-8", "replace"),
+            stderr=stderr.decode("utf-8", "replace"),
+        )
+
+    def _validate_path(self, path: Path) -> None:
+        resolved = path.resolve()
+        if resolved != self.media_root and self.media_root not in resolved.parents:
+            raise AudioExtractionError("unsafe_media_path", "媒体路径无效")
+
+
 settings = get_settings()
-celery_app = Celery("youtube_preview", broker=settings.redis_url, backend=settings.redis_url)
+celery_app = Celery(
+    "youtube_preview", broker=settings.redis_url, backend=settings.redis_url
+)
 celery_app.conf.update(
     task_acks_late=True,
     task_reject_on_worker_lost=True,
@@ -103,9 +234,13 @@ class SqlTranslationCache:
         )
 
 
-def build_llm_services(config: dict[str, str]) -> tuple[TranslationProvider, StructuredAnalysisService]:
+def build_llm_services(
+    config: dict[str, str]
+) -> tuple[TranslationProvider, StructuredAnalysisService]:
     client = build_llm_client(config)
-    return LlmTranslationProvider(client), StructuredAnalysisService(LlmAnalysisProvider(client))
+    return LlmTranslationProvider(client), StructuredAnalysisService(
+        LlmAnalysisProvider(client)
+    )
 
 
 class AnalysisPipeline:
@@ -116,6 +251,10 @@ class AnalysisPipeline:
         translation_provider: TranslationProvider,
         analysis_service: StructuredAnalysisService,
         credential_cipher: JobCredentialCipher | None = None,
+        media_downloader=None,
+        audio_extractor=None,
+        transcriber=None,
+        settings=None,
     ):
         self.session_factory = session_factory
         if isinstance(source_registry, SourceRegistry):
@@ -136,7 +275,12 @@ class AnalysisPipeline:
         self.translation_provider = translation_provider
         self.analysis_service = analysis_service
         self.credential_cipher = credential_cipher
+        self.settings = settings or get_settings()
+        self.media_downloader = media_downloader
+        self.audio_extractor = audio_extractor
+        self.transcriber = transcriber
         self._uses_default_providers = False
+
     async def run(self, job_id: str, *, resume: bool = False) -> None:
         job = await self._claim(job_id, resume=resume)
         if job is None:
@@ -164,47 +308,16 @@ class AnalysisPipeline:
                 api_key = ""
                 provider_config.clear()
 
-            ref = ContentRef(
-                platform=job.video.platform,
-                source_content_id=job.video.source_content_id,
-                media_index=job.video.media_index,
+            acquired = (
+                await self._acquire_x(job)
+                if job.video.platform == "x"
+                else await self._acquire_youtube(job)
             )
-            source_adapter = self.source_registry.adapter_for(ref.platform)
-            inspection = await source_adapter.acquire_transcript(
-                ref,
-                [job.source_language],
-            )
-            if not inspection.available:
-                await self._fail(
-                    job_id,
-                    inspection.failure_code or "transcript_unavailable",
-                    inspection.failure_detail,
-                )
+            if acquired is None:
                 return
-            if (
-                inspection.selected is None
-                or inspection.selected.language_code != job.source_language
-            ):
-                await self._fail(job_id, "source_language_unavailable", None)
-                return
+            track, stored_segments, version = acquired
 
-            version = transcript_version(inspection.segments)
-            if version != job.transcript_version:
-                await self._fail(
-                    job_id,
-                    "transcript_changed",
-                    "YouTube captions changed after the task was created",
-                )
-                return
-            async with self.session_factory() as session:
-                track = await self._persist_transcript(
-                    session, job.video_id, inspection, version
-                )
-                stored_segments = list(track.segments)
-                job_row = await session.get(AnalysisJob, job_id)
-                job_row.status = "analyzing"
-                await session.commit()
-
+            await self._set_status(job_id, "analyzing")
             analysis_segments = [
                 AnalysisSegment(
                     segment_id=segment.id,
@@ -229,7 +342,9 @@ class AnalysisPipeline:
                     "one_line_summary": result.one_line_summary,
                     "summary_points": result.summary_points,
                     "chapters": [chapter.model_dump() for chapter in result.chapters],
-                    "highlights": [highlight.model_dump() for highlight in result.highlights],
+                    "highlights": [
+                        highlight.model_dump() for highlight in result.highlights
+                    ],
                     "model_name": result.model_name,
                     "model_version": result.model_version,
                     "generated_at": result.generated_at,
@@ -256,29 +371,348 @@ class AnalysisPipeline:
                 translation_service = CachedTranslationService(
                     translation_provider, cache
                 )
-                translated = await translation_service.translate(
+                await translation_service.translate(
                     track.id,
                     translation_inputs,
-                    job.source_language,
+                    track.language_code,
                     job.target_language,
                     version,
                 )
                 await session.commit()
-            async with self.session_factory() as session:
-                job_row = await session.get(AnalysisJob, job_id)
-                job_row.status = "completed"
-                job_row.completed_at = datetime.now(timezone.utc)
-                job_row.failure_code = None
-                job_row.failure_detail = None
-                self._clear_credential(job_row)
-                await session.commit()
+            await self._complete(job_id)
+        except MediaDownloadError:
+            await self._wait_for_media(job_id)
+        except (AudioExtractionError, AsrError) as error:
+            await self._fail(job_id, error.code, str(error))
         except TranslationProviderError as error:
             await self._fail(job_id, "translation_failed", f"{error.code}: {error}")
         except AnalysisGenerationError as error:
             await self._fail(job_id, error.code, str(error))
         except Exception as error:
-            await self._fail(job_id, "analysis_internal_error", str(error))
+            await self._fail(job_id, "analysis_internal_error", None)
             raise
+        finally:
+            await self._cleanup_job_temp(job_id)
+
+    async def _acquire_youtube(self, job):
+        ref = ContentRef(
+            platform=job.video.platform,
+            source_content_id=job.video.source_content_id,
+            media_index=job.video.media_index,
+        )
+        source_adapter = self.source_registry.adapter_for(ref.platform)
+        inspection = await source_adapter.acquire_transcript(ref, [job.source_language])
+        if not inspection.available:
+            await self._fail(
+                job.id,
+                inspection.failure_code or "transcript_unavailable",
+                inspection.failure_detail,
+            )
+            return None
+        if (
+            inspection.selected is None
+            or inspection.selected.language_code != job.source_language
+        ):
+            await self._fail(job.id, "source_language_unavailable", None)
+            return None
+
+        version = transcript_version(inspection.segments)
+        if version != job.transcript_version:
+            await self._fail(
+                job.id,
+                "transcript_changed",
+                "YouTube captions changed after the task was created",
+            )
+            return None
+        async with self.session_factory() as session:
+            track = await self._persist_transcript(
+                session, job.video_id, inspection, version
+            )
+            stored_segments = list(track.segments)
+            await session.commit()
+        return track, stored_segments, version
+
+    async def _acquire_x(self, job):
+        root = Path(self.settings.media_temp_root).resolve()
+        job_dir = root / f"job-{job.id}"
+        job_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        media_path = job_dir / "media.bin"
+        uploaded_dir = None
+        if job.media_url_ciphertext:
+            if self.credential_cipher is None:
+                raise MediaDownloadError("media candidate expired")
+            try:
+                media_url = self.credential_cipher.decrypt(
+                    job.id, job.media_url_ciphertext
+                )
+            except (ValueError, binascii.Error, InvalidTag, UnicodeDecodeError):
+                raise MediaDownloadError("media candidate expired") from None
+            await self._set_status(job.id, "downloading_media")
+            downloader = self.media_downloader or MediaDownloader(
+                max_bytes=self.settings.max_media_bytes,
+                timeout_seconds=self.settings.media_download_timeout_seconds,
+            )
+            try:
+                await downloader.download(media_url, media_path)
+            except MediaDownloadError:
+                await self._clear_media_candidate(job.id)
+                if not job.media_session_id:
+                    raise
+            media_url = ""
+            await self._clear_media_candidate(job.id)
+        if not media_path.exists():
+            async with self.session_factory() as session:
+                upload = await session.scalar(
+                    select(MediaUploadSession)
+                    .where(
+                        MediaUploadSession.id == job.media_session_id,
+                        MediaUploadSession.installation_id == job.installation_id,
+                        MediaUploadSession.content_id == job.content_id,
+                        MediaUploadSession.status == "complete",
+                        MediaUploadSession.expires_at > datetime.now(timezone.utc),
+                    )
+                    .with_for_update()
+                )
+                if upload is None:
+                    raise MediaDownloadError("media upload required")
+                upload.status = "consumed"
+                uploaded_dir = root / upload.directory_key
+                await asyncio.to_thread(
+                    self._copy_upload_artifact,
+                    uploaded_dir,
+                    upload.media_kind,
+                    media_path,
+                    self.settings.max_media_bytes,
+                )
+                await session.commit()
+        media_size = media_path.stat().st_size
+        if media_size > min(
+            self.settings.max_media_bytes, self.settings.max_temp_bytes_per_job
+        ):
+            raise AudioExtractionError("media_too_large", "媒体文件过大")
+        max_audio_bytes = self.settings.max_temp_bytes_per_job - media_size
+        if max_audio_bytes <= 0:
+            raise AudioExtractionError("media_too_large", "媒体文件过大")
+        extractor = self.audio_extractor or FFmpegAudioExtractor(
+            str(root),
+            timeout_seconds=self.settings.asr_job_timeout_seconds,
+            max_bytes=max_audio_bytes,
+        )
+        duration_ms = await extractor.probe_duration_ms(media_path)
+        if duration_ms > self.settings.max_video_duration_seconds * 1000:
+            raise AudioExtractionError("video_too_long", "视频时长不能超过 4 小时")
+        job.video.duration_ms = duration_ms
+        await self._set_status(job.id, "extracting_audio")
+        audio_path = await extractor.extract(media_path, job_dir / "audio.wav")
+        if (
+            media_size + audio_path.stat().st_size
+            > self.settings.max_temp_bytes_per_job
+        ):
+            raise AudioExtractionError("media_too_large", "媒体文件过大")
+        await self._set_status(job.id, "transcribing")
+        transcriber = self.transcriber or get_default_transcriber(
+            settings=self.settings
+        )
+        segments, language = await asyncio.to_thread(transcriber.transcribe, audio_path)
+        artifact_hash = await asyncio.to_thread(self._sha256_file, media_path)
+        version = self._x_transcript_version(
+            segments, artifact_hash, transcriber.version
+        )
+        async with self.session_factory() as session:
+            current = await session.get(AnalysisJob, job.id)
+            final_cache_key = ":".join(
+                (
+                    current.installation_id,
+                    current.content_id,
+                    language,
+                    current.target_language,
+                    version,
+                )
+            )
+            cached = None
+            if not current.force_run:
+                cached = await session.scalar(
+                    select(AnalysisJob)
+                    .options(selectinload(AnalysisJob.result))
+                    .where(
+                        AnalysisJob.id != current.id,
+                        AnalysisJob.installation_id == current.installation_id,
+                        AnalysisJob.content_id == current.content_id,
+                        AnalysisJob.source_language == language,
+                        AnalysisJob.target_language == current.target_language,
+                        AnalysisJob.transcript_version == version,
+                        AnalysisJob.status == "completed",
+                    )
+                )
+            if cached is not None and cached.result is not None:
+                current.source_language = language
+                current.transcript_version = version
+                current.cache_key = f"{final_cache_key}:reuse:{current.id}"
+                current.result = StoredAnalysisResult(
+                    one_line_summary=cached.result.one_line_summary,
+                    summary_points=cached.result.summary_points,
+                    chapters=cached.result.chapters,
+                    highlights=cached.result.highlights,
+                    model_name=cached.result.model_name,
+                    model_version=cached.result.model_version,
+                    generated_at=cached.result.generated_at,
+                )
+                current.status = "completed"
+                current.completed_at = datetime.now(timezone.utc)
+                self._clear_credential(current)
+                await session.commit()
+                if uploaded_dir is not None:
+                    await asyncio.to_thread(shutil.rmtree, uploaded_dir, True)
+                return None
+            current.source_language = language
+            current.transcript_version = version
+            current.cache_key = final_cache_key
+            if current.force_run:
+                current.cache_key += f":run:{current.id}"
+            video = await session.get(Video, current.video_id)
+            video.duration_ms = duration_ms
+            inspection = type("Inspection", (), {})()
+            inspection.selected = type(
+                "Selected",
+                (),
+                {
+                    "language_code": language,
+                    "language_name": language,
+                    "is_generated": True,
+                    "is_translatable": False,
+                },
+            )()
+            inspection.segments = segments
+            track = await self._persist_transcript(
+                session, current.video_id, inspection, version
+            )
+            track.transcript_source = "faster_whisper"
+            track.asr_model = transcriber.model_size
+            await session.commit()
+            stored_segments = list(track.segments)
+        if uploaded_dir is not None:
+            await asyncio.to_thread(shutil.rmtree, uploaded_dir, True)
+        return track, stored_segments, version
+
+    async def _set_status(self, job_id: str, status: str) -> None:
+        async with self.session_factory() as session:
+            job = await session.get(AnalysisJob, job_id)
+            if job is not None:
+                job.status = status
+                await session.commit()
+
+    async def _clear_media_candidate(self, job_id: str) -> None:
+        async with self.session_factory() as session:
+            job = await session.get(AnalysisJob, job_id)
+            if job is not None:
+                job.media_url_ciphertext = None
+                await session.commit()
+
+    async def _wait_for_media(self, job_id: str) -> None:
+        async with self.session_factory() as session:
+            job = await session.get(AnalysisJob, job_id)
+            if job is None:
+                return
+            job.status = "waiting_for_media"
+            job.failure_code = None
+            job.failure_detail = None
+            job.completed_at = None
+            job.media_url_ciphertext = None
+            await session.commit()
+
+    async def _complete(self, job_id: str) -> None:
+        async with self.session_factory() as session:
+            job = await session.get(AnalysisJob, job_id)
+            if job is None:
+                return
+            job.status = "completed"
+            job.completed_at = datetime.now(timezone.utc)
+            job.failure_code = None
+            job.failure_detail = None
+            self._clear_credential(job)
+            await session.commit()
+        await self._cleanup_consumed_upload(job_id)
+
+    async def _cleanup_job_temp(self, job_id: str) -> None:
+        root = Path(self.settings.media_temp_root).resolve()
+        await asyncio.to_thread(shutil.rmtree, root / f"job-{job_id}", True)
+
+    async def _cleanup_consumed_upload(self, job_id: str) -> None:
+        async with self.session_factory() as session:
+            job = await session.get(AnalysisJob, job_id)
+            if job is None or not job.media_session_id:
+                return
+            upload = await session.get(MediaUploadSession, job.media_session_id)
+            if upload is None or upload.status != "consumed":
+                return
+            directory = (
+                Path(self.settings.media_temp_root).resolve() / upload.directory_key
+            )
+        await asyncio.to_thread(shutil.rmtree, directory, True)
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _copy_upload_artifact(
+        directory: Path, kind: str, destination: Path, max_bytes: int
+    ) -> None:
+        if kind == "mp4":
+            source = directory / "media.mp4"
+            if not source.is_file():
+                raise AudioExtractionError("media_artifact_missing", "媒体文件不存在")
+            shutil.copyfile(source, destination)
+            return
+        try:
+            part_numbers = json.loads((directory / "manifest.json").read_text())[
+                "parts"
+            ]
+        except (OSError, KeyError, TypeError, json.JSONDecodeError):
+            raise AudioExtractionError(
+                "media_artifact_missing", "媒体文件不存在"
+            ) from None
+        total = 0
+        with destination.open("xb") as output:
+            for part_number in part_numbers:
+                if type(part_number) is not int or part_number < 0:
+                    raise AudioExtractionError(
+                        "media_artifact_missing", "媒体文件不存在"
+                    )
+                part = directory / f"part-{part_number:08d}.bin"
+                try:
+                    with part.open("rb") as source:
+                        while chunk := source.read(1024 * 1024):
+                            total += len(chunk)
+                            if total > max_bytes:
+                                raise AudioExtractionError(
+                                    "media_too_large", "媒体文件过大"
+                                )
+                            output.write(chunk)
+                except FileNotFoundError:
+                    raise AudioExtractionError(
+                        "media_artifact_missing", "媒体文件不存在"
+                    ) from None
+
+    @staticmethod
+    def _x_transcript_version(segments, artifact_hash, asr_version):
+        body = json.dumps(
+            [[s.sequence, s.start_ms, s.duration_ms, s.text] for s in segments],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return (
+            "schema:x-asr-v1:artifact:"
+            + artifact_hash[:16]
+            + ":asr:"
+            + hashlib.sha256(asr_version.encode()).hexdigest()[:16]
+            + ":segments:"
+            + hashlib.sha256(body.encode()).hexdigest()[:16]
+        )
 
     async def _claim(self, job_id: str, *, resume: bool) -> AnalysisJob | None:
         async with self.session_factory() as session:
@@ -289,13 +723,23 @@ class AnalysisPipeline:
                 .with_for_update()
             )
             resumable = job is not None and job.status in {
+                "waiting_for_media",
+                "downloading_media",
+                "extracting_audio",
+                "transcribing",
                 "fetching_transcript",
                 "translating",
                 "analyzing",
             }
+            if job is not None and job.video.platform == "x":
+                resumable = job.status == "waiting_for_media"
             if job is None or (job.status != "queued" and not (resume and resumable)):
                 return None
-            job.status = "fetching_transcript"
+            job.status = (
+                "downloading_media"
+                if job.video.platform == "x"
+                else "fetching_transcript"
+            )
             await session.commit()
             return job
 
@@ -347,6 +791,7 @@ class AnalysisPipeline:
             job.completed_at = datetime.now(timezone.utc)
             self._clear_credential(job)
             await session.commit()
+        await self._cleanup_consumed_upload(job_id)
 
     def _credential_is_current(self, job: AnalysisJob) -> bool:
         if (
@@ -365,6 +810,7 @@ class AnalysisPipeline:
     def _clear_credential(job: AnalysisJob) -> None:
         job.llm_credential_ciphertext = None
         job.llm_credential_expires_at = None
+        job.media_url_ciphertext = None
 
 
 def build_default_pipeline(
@@ -400,21 +846,18 @@ def build_default_pipeline(
         SourceRegistry(
             [
                 YouTubeAdapter(
-                    TranscriptService(
-                        proxy_url=current.youtube_transcript_proxy_url
-                    ),
+                    TranscriptService(proxy_url=current.youtube_transcript_proxy_url),
                     VideoMetadataService(
                         proxy_url=current.youtube_transcript_proxy_url
                     ),
                     max_duration_seconds=current.max_video_duration_seconds,
-                )
+                ),
+                XAdapter(),
             ]
         ),
         translation_provider,
         StructuredAnalysisService(analysis_provider),
-        credential_cipher=JobCredentialCipher(
-            current.llm_credential_encryption_key
-        ),
+        credential_cipher=JobCredentialCipher(current.llm_credential_encryption_key),
     )
     pipeline._uses_default_providers = True
     return pipeline
@@ -447,6 +890,7 @@ async def clear_expired_llm_credentials_async(
             .values(
                 llm_credential_ciphertext=None,
                 llm_credential_expires_at=None,
+                media_url_ciphertext=None,
             )
         )
         await session.commit()
@@ -464,12 +908,12 @@ async def run_expired_credential_cleanup() -> int:
 
 
 @celery_app.task(bind=True, name="analysis.analyze_video")
-def analyze_video(task, job_id: str) -> None:
+def analyze_video(task, job_id: str, *, resume: bool = False) -> None:
     delivery_info = task.request.delivery_info or {}
     asyncio.run(
         run_analysis_task(
             job_id,
-            resume=bool(delivery_info.get("redelivered")),
+            resume=resume or bool(delivery_info.get("redelivered")),
         )
     )
 

@@ -9,10 +9,11 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import ConfigDict, Field, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from app.api.analyses import ApiModel, enforce_read_quota, enforce_write_quota
 from app.core.settings import Settings, get_settings
-from app.db.models import Installation, MediaUploadSession
+from app.db.models import AnalysisJob, Installation, MediaUploadSession
 from app.db.session import get_session
 from app.security.installations import require_installation
 from app.services.media_upload import (
@@ -119,9 +120,7 @@ async def get_media_session(
     _: None = Depends(enforce_read_quota),
 ) -> MediaSessionResponse:
     try:
-        upload = await get_owned_upload(
-            database, settings, session_id, installation.id
-        )
+        upload = await get_owned_upload(database, settings, session_id, installation.id)
     except MediaUploadError as error:
         raise _http_error(error) from error
     return _session_response(upload)
@@ -139,9 +138,7 @@ async def upload_media_part(
     _: None = Depends(enforce_write_quota),
 ) -> Response:
     try:
-        upload = await get_owned_upload(
-            database, settings, session_id, installation.id
-        )
+        upload = await get_owned_upload(database, settings, session_id, installation.id)
     except MediaUploadError as error:
         raise _http_error(error) from error
     if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != (
@@ -182,10 +179,9 @@ async def complete_media_session(
     settings: Settings = Depends(get_settings),
     _: None = Depends(enforce_write_quota),
 ) -> MediaArtifactResponse:
+    installation_id = installation.id
     try:
-        upload = await get_owned_upload(
-            database, settings, session_id, installation.id
-        )
+        upload = await get_owned_upload(database, settings, session_id, installation.id)
         request = await _read_completion_request(http_request)
         artifact = await complete_upload(
             database,
@@ -195,6 +191,27 @@ async def complete_media_session(
             request.total_bytes,
             request.manifest.model_dump() if request.manifest is not None else None,
         )
+        from app.api.analyses import attach_completed_upload_to_waiting_job
+        from app.workers.tasks import analyze_video
+
+        job_id = await attach_completed_upload_to_waiting_job(
+            database, artifact.session_id, installation_id
+        )
+        if job_id is not None:
+            try:
+                analyze_video.delay(job_id, resume=True)
+            except Exception:
+                job = await database.scalar(
+                    select(AnalysisJob).where(
+                        AnalysisJob.id == job_id,
+                        AnalysisJob.installation_id == installation_id,
+                        AnalysisJob.media_session_id == artifact.session_id,
+                        AnalysisJob.status == "queued",
+                    )
+                )
+                if job is not None:
+                    job.status = "waiting_for_media"
+                    await database.commit()
     except MediaUploadError as error:
         raise _http_error(error) from error
     return _artifact_response(artifact)

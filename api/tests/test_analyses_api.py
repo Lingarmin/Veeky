@@ -158,7 +158,9 @@ AUTH_HEADERS = {
     "X-Veeky-Installation-Id": INSTALLATION_ID,
 }
 OTHER_INSTALLATION_ID = "22222222-2222-4222-8222-222222222222"
-OTHER_INSTALLATION_TOKEN = "other-installation-token-with-at-least-forty-three-characters"
+OTHER_INSTALLATION_TOKEN = (
+    "other-installation-token-with-at-least-forty-three-characters"
+)
 OTHER_AUTH_HEADERS = {
     "Authorization": f"Bearer {OTHER_INSTALLATION_TOKEN}",
     "X-Veeky-Installation-Id": OTHER_INSTALLATION_ID,
@@ -221,7 +223,9 @@ async def api_context(tmp_path):
 @pytest.mark.asyncio
 async def test_inspect_rejects_non_youtube_url(api_context):
     client, _, _, _ = api_context
-    response = await client.post("/v1/videos/inspect", json={"url": "https://example.com/watch?v=aircAruvnKk"})
+    response = await client.post(
+        "/v1/videos/inspect", json={"url": "https://example.com/watch?v=aircAruvnKk"}
+    )
 
     assert response.status_code == 422
     assert response.json()["detail"]["code"] == "invalid_youtube_url"
@@ -378,9 +382,7 @@ async def test_inspect_rejects_invalid_media_candidates(api_context, candidate):
             "activeMediaIndex": True,
         },
         {
-            "url": (
-                "https://x.com/viktoroddy/status/2075545587093807111/video/1"
-            ),
+            "url": ("https://x.com/viktoroddy/status/2075545587093807111/video/1"),
             "clientDurationMs": True,
         },
     ],
@@ -448,9 +450,7 @@ async def test_inspect_stores_only_canonical_source_url(api_context):
                 "https://x.com/viktoroddy/status/2075545587093807111/video/1"
                 "?private_marker=discard"
             ),
-            "mediaCandidates": [
-                {"url": media_url, "kind": "mp4", "capturedAt": 1}
-            ],
+            "mediaCandidates": [{"url": media_url, "kind": "mp4", "capturedAt": 1}],
         },
     )
     repeated = await client.post(
@@ -460,9 +460,7 @@ async def test_inspect_stores_only_canonical_source_url(api_context):
                 "https://x.com/another/status/2075545587093807111/video/1"
                 "?private_marker=still-discard"
             ),
-            "mediaCandidates": [
-                {"url": media_url, "kind": "mp4", "capturedAt": 2}
-            ],
+            "mediaCandidates": [{"url": media_url, "kind": "mp4", "capturedAt": 2}],
         },
     )
 
@@ -501,9 +499,7 @@ async def test_concurrent_inspects_share_one_content_row(api_context):
 
     first, second = await asyncio.gather(
         client.post("/v1/videos/inspect", json=payload),
-        client.post(
-            "/v1/videos/inspect", json=payload, headers=OTHER_AUTH_HEADERS
-        ),
+        client.post("/v1/videos/inspect", json=payload, headers=OTHER_AUTH_HEADERS),
     )
 
     assert first.status_code == 200
@@ -551,7 +547,9 @@ async def test_inspect_does_not_expose_registry_configuration_errors(api_context
 @pytest.mark.asyncio
 async def test_inspect_reports_no_caption_track(api_context):
     client, app, _, _ = api_context
-    app.dependency_overrides[get_transcript_service] = lambda: FakeTranscriptService(False)
+    app.dependency_overrides[get_transcript_service] = lambda: FakeTranscriptService(
+        False
+    )
 
     response = await client.post(
         "/v1/videos/inspect", json={"url": "https://youtu.be/aircAruvnKk"}
@@ -614,8 +612,8 @@ async def test_inspect_does_not_fall_back_to_caption_duration_when_metadata_fail
     api_context,
 ):
     client, app, _, _ = api_context
-    app.dependency_overrides[get_video_metadata_service] = lambda: FakeVideoMetadataService(
-        error=VideoMetadataError("lookup failed")
+    app.dependency_overrides[get_video_metadata_service] = (
+        lambda: FakeVideoMetadataService(error=VideoMetadataError("lookup failed"))
     )
 
     response = await client.post(
@@ -650,7 +648,9 @@ async def test_create_rechecks_video_duration(api_context):
 
 
 @pytest.mark.asyncio
-async def test_write_rate_limit_rejects_request_twenty_one_with_retry_after(api_context):
+async def test_write_rate_limit_rejects_request_twenty_one_with_retry_after(
+    api_context,
+):
     client, app, _, _ = api_context
     limiter = BoundaryQuotaLimiter()
     app.dependency_overrides[get_quota_limiter] = lambda: limiter
@@ -689,9 +689,7 @@ async def test_read_rate_limit_is_independent_per_installation(api_context):
         response = await client.get("/v1/analyses/history")
         assert response.status_code == 200
     blocked = await client.get("/v1/analyses/history")
-    other = await client.get(
-        "/v1/analyses/history", headers=OTHER_AUTH_HEADERS
-    )
+    other = await client.get("/v1/analyses/history", headers=OTHER_AUTH_HEADERS)
 
     assert blocked.status_code == 429
     assert other.status_code == 200
@@ -713,7 +711,11 @@ async def test_create_requires_llm_configuration(api_context):
     client, _, _, dispatched = api_context
     response = await client.post(
         "/v1/analyses",
-        json={"videoId": "aircAruvnKk", "sourceLanguage": "en", "targetLanguage": "zh-Hans"},
+        json={
+            "videoId": "aircAruvnKk",
+            "sourceLanguage": "en",
+            "targetLanguage": "zh-Hans",
+        },
     )
 
     assert response.status_code == 422
@@ -1046,7 +1048,10 @@ async def test_create_reuses_active_and_completed_jobs(api_context):
     assert dispatched == [first.json()["jobId"]]
 
     async with factory() as session:
-        job = await session.get(__import__("app.db.models", fromlist=["AnalysisJob"]).AnalysisJob, first.json()["jobId"])
+        job = await session.get(
+            __import__("app.db.models", fromlist=["AnalysisJob"]).AnalysisJob,
+            first.json()["jobId"],
+        )
         job.status = "completed"
         await session.commit()
 
@@ -1068,9 +1073,7 @@ async def test_legacy_youtube_cache_key_reuses_completed_job(api_context):
     job_id = first.json()["jobId"]
     async with factory() as session:
         job = await session.get(AnalysisJob, job_id)
-        job.cache_key = job.cache_key.replace(
-            "youtube:aircAruvnKk:1", "aircAruvnKk"
-        )
+        job.cache_key = job.cache_key.replace("youtube:aircAruvnKk:1", "aircAruvnKk")
         job.status = "completed"
         job.completed_at = datetime.now(timezone.utc)
         await session.commit()
@@ -1171,9 +1174,7 @@ async def test_active_job_limit_is_independent_per_installation(api_context):
     }
 
     first = await client.post("/v1/analyses", json=payload)
-    other = await client.post(
-        "/v1/analyses", json=payload, headers=OTHER_AUTH_HEADERS
-    )
+    other = await client.post("/v1/analyses", json=payload, headers=OTHER_AUTH_HEADERS)
 
     assert first.status_code == 202
     assert other.status_code == 202
@@ -1241,9 +1242,7 @@ async def test_simultaneous_different_analyses_create_only_one_active_job(api_co
     }
 
     first, second = await asyncio.gather(
-        client.post(
-            "/v1/analyses", json={**base, "targetLanguage": "zh-Hans"}
-        ),
+        client.post("/v1/analyses", json={**base, "targetLanguage": "zh-Hans"}),
         client.post("/v1/analyses", json={**base, "targetLanguage": "fr"}),
     )
 
@@ -1292,9 +1291,7 @@ async def test_history_and_job_reads_are_private_to_the_installation(api_context
         await session.commit()
 
     history_a = await client.get("/v1/analyses/history")
-    history_b = await client.get(
-        "/v1/analyses/history", headers=OTHER_AUTH_HEADERS
-    )
+    history_b = await client.get("/v1/analyses/history", headers=OTHER_AUTH_HEADERS)
 
     assert [item["jobId"] for item in history_a.json()["items"]] == [job_a]
     assert [item["jobId"] for item in history_b.json()["items"]] == [job_b]
@@ -1370,9 +1367,7 @@ async def test_x_analysis_uses_content_id_for_history_without_weakening_ownershi
         )
         await session.commit()
 
-    history = await client.get(
-        "/v1/analyses/history", params={"contentId": content_id}
-    )
+    history = await client.get("/v1/analyses/history", params={"contentId": content_id})
     assert history.status_code == 200
     assert [item["jobId"] for item in history.json()["items"]] == [job_id]
     assert history.json()["items"][0]["videoId"] is None
@@ -1389,6 +1384,43 @@ async def test_x_analysis_uses_content_id_for_history_without_weakening_ownershi
     )
     assert hidden.status_code == 404
     assert hidden.json()["detail"]["code"] == "analysis_not_found"
+
+
+@pytest.mark.asyncio
+async def test_x_create_uses_pending_identity_and_encrypts_direct_media_url(
+    api_context,
+):
+    client, app, factory, dispatched = api_context
+    app.dependency_overrides[get_source_registry] = lambda: SourceRegistry(
+        [FakeXAdapter()]
+    )
+    media_url = "https://video.twimg.com/ext_tw_video/file.mp4?token=private"
+
+    created = await client.post(
+        "/v1/analyses",
+        json={
+            "contentRef": {
+                "platform": "x",
+                "sourceContentId": "2075545587093807111",
+                "mediaIndex": 1,
+            },
+            "targetLanguage": "zh-Hans",
+            "mediaUrl": media_url,
+            "llmConfig": LLM_CONFIG,
+        },
+    )
+
+    assert created.status_code == 202
+    job_id = created.json()["jobId"]
+    async with factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        assert job.source_language == "auto"
+        assert job.transcript_version == f"pending:{job_id}"
+        assert job.cache_key == f"pending:{INSTALLATION_ID}:{job_id}"
+        assert job.media_url_ciphertext
+        assert media_url not in job.media_url_ciphertext
+        assert job.force_run is False
+    assert dispatched == [job_id]
 
 
 async def _store_history_job(
@@ -1542,9 +1574,7 @@ async def test_history_filters_by_video_and_paginates(api_context):
         reversed(expected_ids[1:])
     )
     assert first_page.json()["hasMore"] is True
-    assert [item["jobId"] for item in second_page.json()["items"]] == [
-        expected_ids[0]
-    ]
+    assert [item["jobId"] for item in second_page.json()["items"]] == [expected_ids[0]]
     assert second_page.json()["hasMore"] is False
 
 
@@ -1597,7 +1627,10 @@ async def test_force_create_generates_new_jobs_and_preserves_cached_result(api_c
     assert cached.json()["cacheHit"] is True
     assert forced_once.status_code == 202
     assert forced_twice.status_code == 202
-    assert len({original_id, forced_once.json()["jobId"], forced_twice.json()["jobId"]}) == 3
+    assert (
+        len({original_id, forced_once.json()["jobId"], forced_twice.json()["jobId"]})
+        == 3
+    )
     assert dispatched == [
         original_id,
         forced_once.json()["jobId"],
@@ -1713,7 +1746,9 @@ async def test_status_and_result_endpoints(api_context):
         job.result = AnalysisResult(
             one_line_summary="神经网络从样本中学习。",
             summary_points=["输入层保存像素值"],
-            chapters=[{"start_ms": 0, "end_ms": 1500, "title": "输入", "summary": "像素"}],
+            chapters=[
+                {"start_ms": 0, "end_ms": 1500, "title": "输入", "summary": "像素"}
+            ],
             highlights=[],
             model_name="fake",
             model_version="test",
@@ -1844,7 +1879,9 @@ async def test_result_returns_summary_while_translation_is_still_running(api_con
         job.result = AnalysisResult(
             one_line_summary="视频介绍了神经网络的输入层。",
             summary_points=["像素输入", "权重连接", "逐层计算"],
-            chapters=[{"start_ms": 0, "end_ms": 1500, "title": "输入", "summary": "像素"}],
+            chapters=[
+                {"start_ms": 0, "end_ms": 1500, "title": "输入", "summary": "像素"}
+            ],
             highlights=[],
             model_name="fake",
             model_version="test",
@@ -1932,9 +1969,7 @@ async def test_dispatch_failure_can_be_retried(api_context):
 
 
 def test_dispatch_requires_a_live_celery_worker(monkeypatch):
-    monkeypatch.setattr(
-        "app.workers.tasks.celery_app.control.ping", lambda timeout: []
-    )
+    monkeypatch.setattr("app.workers.tasks.celery_app.control.ping", lambda timeout: [])
 
     with pytest.raises(WorkerUnavailableError, match="Worker"):
         dispatch_analysis_job("aircAruvnKk")

@@ -33,9 +33,7 @@ X_RESULT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
 @pytest.fixture
 def migration_database_url() -> Iterator[str]:
-    if subprocess.run(
-        ["docker", "info"], capture_output=True, check=False
-    ).returncode:
+    if subprocess.run(["docker", "info"], capture_output=True, check=False).returncode:
         pytest.skip("Docker is required for the PostgreSQL migration test")
 
     container_name = f"veeky-platform-content-test-{uuid.uuid4().hex}"
@@ -61,12 +59,15 @@ def migration_database_url() -> Iterator[str]:
     ).strip()
     try:
         _wait_for_postgres(container_id)
-        port = subprocess.check_output(
-            ["docker", "port", container_id, "5432/tcp"], text=True
-        ).strip().rsplit(":", 1)[1]
+        port = (
+            subprocess.check_output(
+                ["docker", "port", container_id, "5432/tcp"], text=True
+            )
+            .strip()
+            .rsplit(":", 1)[1]
+        )
         yield (
-            "postgresql+asyncpg://veeky:veeky@127.0.0.1:"
-            f"{port}/veeky_migration_test"
+            "postgresql+asyncpg://veeky:veeky@127.0.0.1:" f"{port}/veeky_migration_test"
         )
     finally:
         subprocess.run(["docker", "rm", "--force", container_id], check=False)
@@ -324,6 +325,22 @@ async def test_platform_content_migration_preserves_youtube_history_on_round_tri
         x_translation_count = await connection.fetchval(
             "SELECT COUNT(*) FROM translations WHERE id = $1", X_TRANSLATION_ID
         )
+        x_worker_columns = await connection.fetchrow(
+            """
+            SELECT transcript_source, asr_model
+            FROM transcript_tracks WHERE id = $1
+            """,
+            X_TRACK_ID,
+        )
+        await connection.execute(
+            """
+            UPDATE analysis_jobs
+            SET status = 'waiting_for_media', media_url_ciphertext = 'encrypted',
+                force_run = TRUE
+            WHERE id = $1
+            """,
+            X_JOB_ID,
+        )
     finally:
         await connection.close()
 
@@ -346,6 +363,7 @@ async def test_platform_content_migration_preserves_youtube_history_on_round_tri
         {"text": "迁移译文"}
     ]
     assert x_translation_count == 1
+    assert tuple(x_worker_columns) == ("youtube_caption", None)
 
     _alembic(migration_database_url, "downgrade", "0005_one_active_job")
 

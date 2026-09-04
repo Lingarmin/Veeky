@@ -18,6 +18,7 @@ from app.db.models import (
     AnalysisJob,
     AnalysisResult,
     Installation,
+    MediaUploadSession,
     TranscriptTrack,
     Translation,
     Video,
@@ -38,6 +39,7 @@ from app.sources.base import (
     UnsupportedSourceUrl,
 )
 from app.sources.youtube import YouTubeAdapter, parse_youtube_url
+from app.sources.x import XAdapter
 from app.services.translation import provider_translation_version
 from app.services.llm import (
     LLM_PROVIDER_DEFAULTS,
@@ -59,7 +61,15 @@ from app.security.quotas import (
 
 router = APIRouter(prefix="/v1")
 JobDispatcher = Callable[[str], object]
-INTERRUPTIBLE_JOB_STATUSES = {"fetching_transcript", "translating", "analyzing"}
+INTERRUPTIBLE_JOB_STATUSES = {
+    "downloading_media",
+    "extracting_audio",
+    "transcribing",
+    "fetching_transcript",
+    "translating",
+    "analyzing",
+}
+ACTIVE_JOB_STATUSES = INTERRUPTIBLE_JOB_STATUSES | {"queued", "waiting_for_media"}
 MAX_DATABASE_INTEGER = 2_147_483_647
 MAX_JAVASCRIPT_INTEGER = 9_007_199_254_740_991
 MAX_X_SOURCE_CONTENT_ID = (1 << 64) - 1
@@ -124,9 +134,7 @@ class ApiModel(BaseModel):
 class MediaCandidateRequest(ApiModel):
     url: str = Field(min_length=1, max_length=2000)
     kind: Literal["mp4", "hls", "segment"]
-    captured_at: int = Field(
-        strict=True, ge=0, le=MAX_JAVASCRIPT_INTEGER
-    )
+    captured_at: int = Field(strict=True, ge=0, le=MAX_JAVASCRIPT_INTEGER)
 
     @field_validator("url")
     @classmethod
@@ -190,9 +198,7 @@ class LlmConfigRequest(ApiModel):
 class ContentRefRequest(ApiModel):
     platform: Literal["youtube", "x"]
     source_content_id: str = Field(min_length=1, max_length=100)
-    media_index: int = Field(
-        default=1, strict=True, ge=1, le=MAX_DATABASE_INTEGER
-    )
+    media_index: int = Field(default=1, strict=True, ge=1, le=MAX_DATABASE_INTEGER)
 
     def to_domain(self) -> ContentRef:
         return ContentRef(
@@ -354,7 +360,8 @@ def get_source_registry(
                 transcript_service,
                 metadata_service,
                 max_duration_seconds=settings.max_video_duration_seconds,
-            )
+            ),
+            XAdapter(),
         ]
     )
 
@@ -373,6 +380,41 @@ def dispatch_analysis_job(job_id: str) -> object:
 
 def get_job_dispatcher() -> JobDispatcher:
     return dispatch_analysis_job
+
+
+async def attach_completed_upload_to_waiting_job(
+    session: AsyncSession, session_id: str, installation_id: str
+) -> str | None:
+    upload = await session.scalar(
+        select(MediaUploadSession)
+        .where(
+            MediaUploadSession.id == session_id,
+            MediaUploadSession.installation_id == installation_id,
+            MediaUploadSession.status == "complete",
+            MediaUploadSession.expires_at > datetime.now(timezone.utc),
+        )
+        .with_for_update()
+    )
+    if upload is None:
+        return None
+    job = await session.scalar(
+        select(AnalysisJob)
+        .join(Video, AnalysisJob.video_id == Video.video_id)
+        .where(
+            AnalysisJob.installation_id == installation_id,
+            AnalysisJob.content_id == upload.content_id,
+            AnalysisJob.status == "waiting_for_media",
+            AnalysisJob.media_session_id.is_(None),
+            Video.platform == "x",
+        )
+        .with_for_update()
+    )
+    if job is None:
+        return None
+    job.media_session_id = upload.id
+    job.status = "queued"
+    await session.commit()
+    return job.id
 
 
 def get_job_credential_cipher(
@@ -418,7 +460,10 @@ async def inspect_video(
         raise _source_adapter_unavailable() from error
     _validate_content_ref(ref)
     adapter = _source_adapter(source_registry, ref.platform)
-    inspection = await _inspect_source(adapter, ref, request.preferred_languages)
+    if ref.platform == "x" and isinstance(adapter, XAdapter):
+        inspection = await adapter.inspect_media(ref, request.media_candidates)
+    else:
+        inspection = await _inspect_source(adapter, ref, request.preferred_languages)
     inspected_duration_ms = (
         request.client_duration_ms
         if ref.platform == "x" and request.client_duration_ms is not None
@@ -436,9 +481,7 @@ async def inspect_video(
     await session.commit()
     await session.refresh(video)
 
-    selected_language = (
-        "auto" if ref.platform == "x" else inspection.selected_language
-    )
+    selected_language = "auto" if ref.platform == "x" else inspection.selected_language
     assert selected_language is not None
     tracks = [
         TrackResponse.model_validate(track, from_attributes=True)
@@ -476,19 +519,24 @@ async def create_analysis(
     ref, video = await _resolve_content_locator(session, request)
     adapter = _source_adapter(source_registry, ref.platform)
     preferred_languages = [request.source_language] if request.source_language else []
-    source_inspection = await _inspect_source(
-        adapter, ref, preferred_languages
-    )
+    source_inspection = await _inspect_source(adapter, ref, preferred_languages)
     inspection = source_inspection.transcript
-    if inspection is None:
-        raise RuntimeError("source adapter did not return transcript data")
-    source_language = request.source_language or source_inspection.selected_language
-    if (
-        source_language is None
-        or inspection.selected is None
-        or inspection.selected.language_code != source_language
-    ):
-        raise _api_error(422, "source_language_unavailable", "所选字幕语言不可读取")
+    if ref.platform == "x":
+        if request.source_language not in (None, "auto"):
+            raise _api_error(
+                422, "source_language_unavailable", "X 视频使用自动语言检测"
+            )
+        source_language = "auto"
+    else:
+        if inspection is None:
+            raise RuntimeError("source adapter did not return transcript data")
+        source_language = request.source_language or source_inspection.selected_language
+        if (
+            source_language is None
+            or inspection.selected is None
+            or inspection.selected.language_code != source_language
+        ):
+            raise _api_error(422, "source_language_unavailable", "所选字幕语言不可读取")
     duration_ms = source_inspection.duration_ms or (video.duration_ms if video else 0)
     if video is None:
         video, _ = await _get_or_create_video(
@@ -502,17 +550,23 @@ async def create_analysis(
             video.title = request.title
         if source_inspection.duration_ms:
             video.duration_ms = source_inspection.duration_ms
-    version = transcript_version(inspection.segments)
-    cache_key = analysis_cache_key(
-        installation_id,
-        _cache_content_key(ref),
-        source_language,
-        request.target_language,
-        version,
-        f"{pipeline_revision}|{request.llm_config.provider}|{request.llm_config.model or ''}|{normalize_chat_completions_url(request.llm_config.api_url)}",
-    )
-    if request.force:
-        cache_key = f"{cache_key}:run:{uuid.uuid4().hex}"
+    job_id = str(uuid.uuid4())
+    if ref.platform == "x":
+        version = f"pending:{job_id}"
+        cache_key = f"pending:{installation_id}:{job_id}"
+    else:
+        assert inspection is not None
+        version = transcript_version(inspection.segments)
+        cache_key = analysis_cache_key(
+            installation_id,
+            _cache_content_key(ref),
+            source_language,
+            request.target_language,
+            version,
+            f"{pipeline_revision}|{request.llm_config.provider}|{request.llm_config.model or ''}|{normalize_chat_completions_url(request.llm_config.api_url)}",
+        )
+        if request.force:
+            cache_key = f"{cache_key}:run:{uuid.uuid4().hex}"
     existing = await session.scalar(
         select(AnalysisJob).where(
             AnalysisJob.cache_key == cache_key,
@@ -569,16 +623,13 @@ async def create_analysis(
         .select_from(AnalysisJob)
         .where(
             AnalysisJob.installation_id == installation_id,
-            AnalysisJob.status.in_(
-                {"queued", "fetching_transcript", "translating", "analyzing"}
-            ),
+            AnalysisJob.status.in_(ACTIVE_JOB_STATUSES),
         )
     )
     if (active_jobs or 0) >= settings.max_active_jobs_per_installation:
         raise _analysis_concurrency_error()
 
     if existing is None:
-        job_id = str(uuid.uuid4())
         job = AnalysisJob(
             id=job_id,
             installation_id=installation_id,
@@ -589,7 +640,28 @@ async def create_analysis(
             transcript_version=version,
             cache_key=cache_key,
             llm_config=_llm_snapshot(request.llm_config),
+            force_run=request.force,
         )
+        if ref.platform == "x" and request.media_url:
+            _validate_direct_media_url(request.media_url)
+            job.media_url_ciphertext = credential_cipher.encrypt(
+                job.id, request.media_url
+            )
+        if ref.platform == "x" and request.media_session_id:
+            upload = await session.scalar(
+                select(MediaUploadSession).where(
+                    MediaUploadSession.id == request.media_session_id,
+                    MediaUploadSession.installation_id == installation_id,
+                    MediaUploadSession.content_id == video.content_id,
+                    MediaUploadSession.status == "complete",
+                    MediaUploadSession.expires_at > datetime.now(timezone.utc),
+                )
+            )
+            if upload is None:
+                raise _api_error(
+                    409, "media_session_incompatible", "媒体上传不可用于此任务"
+                )
+            job.media_session_id = upload.id
         _store_llm_credential(
             job,
             request.llm_config,
@@ -626,9 +698,7 @@ async def create_analysis(
             active_job = await session.scalar(
                 select(AnalysisJob).where(
                     AnalysisJob.installation_id == installation_id,
-                    AnalysisJob.status.in_(
-                        {"queued", "fetching_transcript", "translating", "analyzing"}
-                    ),
+                    AnalysisJob.status.in_(ACTIVE_JOB_STATUSES),
                 )
             )
             if active_job is not None:
@@ -667,7 +737,9 @@ async def create_analysis(
         job.completed_at = datetime.now(timezone.utc)
         _clear_llm_credential(job)
         await session.commit()
-        raise _api_error(503, "dispatch_failed", "后台任务暂时无法启动，请重试") from error
+        raise _api_error(
+            503, "dispatch_failed", "后台任务暂时无法启动，请重试"
+        ) from error
     response.status_code = 202
     return AnalysisCreateResponse(
         job_id=job.id,
@@ -762,9 +834,8 @@ async def get_analysis_result(
         installation_id,
         options=(selectinload(AnalysisJob.result), selectinload(AnalysisJob.video)),
     )
-    partial = (
-        (job.status == "failed" and job.failure_code == "translation_failed")
-        or (job.status == "translating" and job.result is not None)
+    partial = (job.status == "failed" and job.failure_code == "translation_failed") or (
+        job.status == "translating" and job.result is not None
     )
     if not partial and (job.status != "completed" or job.result is None):
         raise _api_error(409, "analysis_not_complete", "分析结果还没有准备好")
@@ -791,7 +862,8 @@ async def get_analysis_result(
             translation_filters.extend(
                 [
                     Translation.provider == job.llm_config.get("provider", "kimi"),
-                    Translation.provider_version == provider_translation_version(
+                    Translation.provider_version
+                    == provider_translation_version(
                         normalize_chat_completions_url(job.llm_config["api_url"]),
                         provider=job.llm_config.get("provider", "kimi"),
                         version=job.llm_config.get("model", "kimi-k2.5"),
@@ -885,9 +957,7 @@ async def _resolve_content_locator(
     return ref, await _find_video_by_ref(session, ref)
 
 
-async def _find_video_by_ref(
-    session: AsyncSession, ref: ContentRef
-) -> Video | None:
+async def _find_video_by_ref(session: AsyncSession, ref: ContentRef) -> Video | None:
     return await session.scalar(
         select(Video).where(
             Video.platform == ref.platform,
@@ -934,7 +1004,9 @@ def _new_video(
     source_url: str,
 ) -> Video:
     return Video(
-        video_id=(ref.source_content_id if ref.platform == "youtube" else ref.stable_key),
+        video_id=(
+            ref.source_content_id if ref.platform == "youtube" else ref.stable_key
+        ),
         content_id=str(uuid.uuid4()),
         platform=ref.platform,
         source_content_id=ref.source_content_id,
@@ -953,9 +1025,7 @@ def _default_video_title(ref: ContentRef) -> str:
 def _source_url(ref: ContentRef) -> str:
     if ref.platform == "youtube":
         return f"https://www.youtube.com/watch?v={ref.source_content_id}"
-    return (
-        f"https://x.com/i/status/{ref.source_content_id}/video/{ref.media_index}"
-    )
+    return f"https://x.com/i/status/{ref.source_content_id}/video/{ref.media_index}"
 
 
 def _cache_content_key(ref: ContentRef) -> str:
@@ -1052,7 +1122,9 @@ def _validate_llm_config(config: LlmConfigRequest | None) -> None:
     if config is None:
         raise _api_error(422, "llm_config_required", "请先配置 LLM 服务")
     try:
-        normalize_provider_config(config.provider, config.api_url, config.api_key, config.model)
+        normalize_provider_config(
+            config.provider, config.api_url, config.api_key, config.model
+        )
     except ValueError as error:
         raise _api_error(422, "llm_config_invalid", str(error)) from error
 
@@ -1086,6 +1158,22 @@ def _store_llm_credential(
 def _clear_llm_credential(job: AnalysisJob) -> None:
     job.llm_credential_ciphertext = None
     job.llm_credential_expires_at = None
+    job.media_url_ciphertext = None
+
+
+def _validate_direct_media_url(url: str) -> None:
+    try:
+        parsed = urlsplit(url)
+    except ValueError as error:
+        raise _api_error(422, "invalid_media_url", "媒体地址无效") from error
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "video.twimg.com"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
+        raise _api_error(422, "invalid_media_url", "媒体地址无效")
 
 
 async def _enforce_quota(
@@ -1165,8 +1253,12 @@ def _source_adapter_unavailable() -> HTTPException:
 
 
 def _is_video_id(video_id: str) -> bool:
-    return len(video_id) == 11 and all(character.isalnum() or character in "-_" for character in video_id)
+    return len(video_id) == 11 and all(
+        character.isalnum() or character in "-_" for character in video_id
+    )
 
 
 def _api_error(status_code: int, code: str, message: str) -> HTTPException:
-    return HTTPException(status_code=status_code, detail={"code": code, "message": message})
+    return HTTPException(
+        status_code=status_code, detail={"code": code, "message": message}
+    )
