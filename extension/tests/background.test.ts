@@ -52,8 +52,7 @@ function dispatchMessage(chrome: ReturnType<typeof createChrome>, message: objec
 }
 
 async function flushMicrotasks() {
-  await Promise.resolve();
-  await Promise.resolve();
+  for (let index = 0; index < 6; index += 1) await Promise.resolve();
 }
 
 describe("background tab isolation", () => {
@@ -70,11 +69,14 @@ describe("background tab isolation", () => {
   it("declares X content-script and media-capture access", () => {
     expect(manifest.permissions).toEqual(expect.arrayContaining(["webRequest", "offscreen"]));
     expect(manifest.host_permissions).toEqual(expect.arrayContaining([
-      "https://x.com/*",
+      "https://*.youtube.com/*",
+      "https://youtu.be/*",
+      "https://www.youtu.be/*",
+      "https://*.x.com/*",
       "https://video.twimg.com/*",
     ]));
     expect(manifest.content_scripts).toEqual([{
-      matches: ["https://x.com/*"],
+      matches: ["https://x.com/*", "https://www.x.com/*"],
       js: ["content.js"],
       run_at: "document_idle",
     }]);
@@ -106,7 +108,8 @@ describe("background tab isolation", () => {
     await flushMicrotasks();
 
     const url = "https://x.com/viktoroddy/status/2075545587093807111/video/1";
-    await chrome.events.tabUpdated.listeners[0](7, { url }, { id: 7, url });
+    chrome.events.tabUpdated.listeners[0](7, { url }, { id: 7, url });
+    await flushMicrotasks();
     expect(chrome.sidePanel.setOptions).toHaveBeenLastCalledWith({
       tabId: 7,
       path: "sidepanel.html",
@@ -123,11 +126,39 @@ describe("background tab isolation", () => {
     await flushMicrotasks();
 
     const url = "https://x.com/viktoroddy/status/2075545587093807111";
-    await chrome.events.tabUpdated.listeners[0](7, { url }, { id: 7, url });
+    chrome.events.tabUpdated.listeners[0](7, { url }, { id: 7, url });
+    await flushMicrotasks();
     expect(chrome.sidePanel.setOptions).toHaveBeenLastCalledWith({ tabId: 7, enabled: false });
 
     chrome.events.actionClicked.listeners[0]({ id: 7, url });
     expect(chrome.sidePanel.open).not.toHaveBeenCalled();
+  });
+
+  it("contains rejected async tab event work", async () => {
+    const chrome = createChrome();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    installBackgroundHandlers(chrome as never);
+    await flushMicrotasks();
+
+    chrome.sidePanel.setOptions.mockRejectedValueOnce(new Error("tab closed"));
+    const updated = chrome.events.tabUpdated.listeners[0](
+      7,
+      { url: "https://x.com/u/status/2075545587093807111/video/1" },
+      { id: 7, url: "https://x.com/u/status/2075545587093807111/video/1" },
+    );
+    if (updated instanceof Promise) await updated.catch(() => undefined);
+    expect(updated).toBeUndefined();
+
+    chrome.tabs.get.mockRejectedValueOnce(new Error("tab removed"));
+    const activated = chrome.events.tabActivated.listeners[0]({ tabId: 7 });
+    if (activated instanceof Promise) await activated.catch(() => undefined);
+    expect(activated).toBeUndefined();
+
+    await flushMicrotasks();
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenNthCalledWith(1, "Veeky background event failed");
+    expect(warn).toHaveBeenNthCalledWith(2, "Veeky background event failed");
+    warn.mockRestore();
   });
 
   it("opens the panel before asynchronous tab configuration completes", () => {
@@ -153,10 +184,12 @@ describe("background tab isolation", () => {
     );
 
     chrome.tabs.get.mockResolvedValueOnce({ id: 8, url: "https://example.com" });
-    await chrome.events.tabActivated.listeners[0]({ tabId: 8 });
+    chrome.events.tabActivated.listeners[0]({ tabId: 8 });
+    await flushMicrotasks();
     expect(chrome.sidePanel.setOptions).toHaveBeenLastCalledWith({ tabId: 8, enabled: false });
 
-    await chrome.events.tabActivated.listeners[0]({ tabId: 7 });
+    chrome.events.tabActivated.listeners[0]({ tabId: 7 });
+    await flushMicrotasks();
     expect(chrome.sidePanel.setOptions).toHaveBeenLastCalledWith({ tabId: 7, path: "sidepanel.html", enabled: true });
   });
 
@@ -168,14 +201,16 @@ describe("background tab isolation", () => {
       { type: "REGISTER_ANALYSIS", tabId: 7, videoId: "aircAruvnKk", jobId: "job-1" },
     );
 
-    await chrome.events.tabUpdated.listeners[0](7, { url: "https://example.com" }, { id: 7, url: "https://example.com" });
+    chrome.events.tabUpdated.listeners[0](7, { url: "https://example.com" }, { id: 7, url: "https://example.com" });
+    await flushMicrotasks();
     expect(chrome.sidePanel.setOptions).toHaveBeenLastCalledWith({ tabId: 7, enabled: false });
 
-    await chrome.events.tabUpdated.listeners[0](
+    chrome.events.tabUpdated.listeners[0](
       7,
       { url: "https://www.youtube.com/watch?v=aircAruvnKk" },
       { id: 7, url: "https://www.youtube.com/watch?v=aircAruvnKk" },
     );
+    await flushMicrotasks();
     expect(chrome.sidePanel.setOptions).toHaveBeenLastCalledWith({ tabId: 7, path: "sidepanel.html", enabled: true });
   });
 
@@ -217,42 +252,65 @@ describe("background tab isolation", () => {
       { type: "REGISTER_ANALYSIS", tabId: 7, videoId: "aircAruvnKk", jobId: "job-1" },
     );
 
-    await chrome.events.tabRemoved.listeners[0](7);
+    chrome.events.tabRemoved.listeners[0](7);
+    await flushMicrotasks();
     expect(chrome.storage.session.set).toHaveBeenLastCalledWith({ analyzedTabs: {} });
   });
 
-  it("does not reuse analysis state for another media item in the same tab", async () => {
+  it("restores each analysis when switching between media items in the same tab", async () => {
     const chrome = createChrome();
     installBackgroundHandlers(chrome as never);
+    const mediaOne = {
+      platform: "x" as const,
+      sourceContentId: "2075545587093807111",
+      mediaIndex: 1,
+    };
+    const mediaTwo = { ...mediaOne, mediaIndex: 2 };
     await dispatchMessage(
       chrome,
       {
         type: "REGISTER_ANALYSIS",
         tabId: 7,
-        contentRef: {
-          platform: "x",
-          sourceContentId: "2075545587093807111",
-          mediaIndex: 1,
-        },
+        contentRef: mediaOne,
         jobId: "job-1",
       },
     );
+    await dispatchMessage(
+      chrome,
+      { type: "REGISTER_ANALYSIS", tabId: 7, contentRef: mediaTwo, jobId: "job-2" },
+    );
+
+    chrome.tabs.query.mockResolvedValueOnce([{
+      id: 7,
+      url: "https://x.com/viktoroddy/status/2075545587093807111/video/1",
+      title: "X video",
+    }]);
+    const firstContext = await dispatchMessage(chrome, { type: "GET_ACTIVE_TAB_CONTEXT" });
+    expect(firstContext).toEqual(expect.objectContaining({
+      contentRef: mediaOne,
+      analysis: expect.objectContaining({ contentRef: mediaOne, jobId: "job-1" }),
+    }));
 
     chrome.tabs.query.mockResolvedValueOnce([{
       id: 7,
       url: "https://x.com/viktoroddy/status/2075545587093807111/video/2",
       title: "X video",
     }]);
-    const context = await dispatchMessage(chrome, { type: "GET_ACTIVE_TAB_CONTEXT" });
+    const secondContext = await dispatchMessage(chrome, { type: "GET_ACTIVE_TAB_CONTEXT" });
+    expect(secondContext).toEqual(expect.objectContaining({
+      contentRef: mediaTwo,
+      analysis: expect.objectContaining({ contentRef: mediaTwo, jobId: "job-2" }),
+    }));
 
-    expect(context).toEqual(expect.objectContaining({
-      contentRef: {
-        platform: "x",
-        sourceContentId: "2075545587093807111",
-        mediaIndex: 2,
-      },
-      videoId: null,
-      analysis: null,
+    chrome.tabs.query.mockResolvedValueOnce([{
+      id: 7,
+      url: "https://x.com/viktoroddy/status/2075545587093807111/video/1",
+      title: "X video",
+    }]);
+    const restoredContext = await dispatchMessage(chrome, { type: "GET_ACTIVE_TAB_CONTEXT" });
+    expect(restoredContext).toEqual(expect.objectContaining({
+      contentRef: mediaOne,
+      analysis: expect.objectContaining({ contentRef: mediaOne, jobId: "job-1" }),
     }));
   });
 });

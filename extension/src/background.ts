@@ -15,30 +15,31 @@ export function parseVideoId(url?: string): string | null {
 }
 
 export function installBackgroundHandlers(chromeApi: ChromeApi): void {
-  chromeApi.sidePanel.setPanelBehavior({ openPanelOnActionClick: false }).catch(() => undefined);
-  void configureActiveTab(chromeApi).catch(() => undefined);
+  void chromeApi.sidePanel
+    .setPanelBehavior({ openPanelOnActionClick: false })
+    .catch(reportBackgroundError);
+  void configureActiveTab(chromeApi).catch(reportBackgroundError);
 
   chromeApi.action.onClicked.addListener((tab) => {
     const tabId = tab.id;
     if (tabId === undefined || !parseContentRef(tab.url)) return;
-    void chromeApi.sidePanel.setOptions({ tabId, path: "sidepanel.html", enabled: true }).catch(() => undefined);
-    void chromeApi.sidePanel.open({ tabId }).catch(() => undefined);
+    void chromeApi.sidePanel
+      .setOptions({ tabId, path: "sidepanel.html", enabled: true })
+      .catch(reportBackgroundError);
+    void chromeApi.sidePanel.open({ tabId }).catch(reportBackgroundError);
   });
 
-  chromeApi.tabs.onActivated.addListener(async ({ tabId }) => {
-    const tab = await chromeApi.tabs.get(tabId);
-    await updatePanelForTab(chromeApi, tabId, tab.url);
+  chromeApi.tabs.onActivated.addListener(({ tabId }) => {
+    void updatePanelForActivatedTab(chromeApi, tabId).catch(reportBackgroundError);
   });
 
-  chromeApi.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  chromeApi.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (!changeInfo.url) return;
-    await updatePanelForTab(chromeApi, tabId, tab.url);
+    void updatePanelForTab(chromeApi, tabId, tab.url).catch(reportBackgroundError);
   });
 
-  chromeApi.tabs.onRemoved.addListener(async (tabId) => {
-    const analyzedTabs = await loadAnalyzedTabs(chromeApi);
-    delete analyzedTabs[String(tabId)];
-    await chromeApi.storage.session.set({ [STORAGE_KEY]: analyzedTabs });
+  chromeApi.tabs.onRemoved.addListener((tabId) => {
+    void removeTabState(chromeApi, tabId).catch(reportBackgroundError);
   });
 
   chromeApi.runtime.onMessage.addListener(
@@ -49,6 +50,21 @@ export function installBackgroundHandlers(chromeApi: ChromeApi): void {
       return true;
     },
   );
+}
+
+function reportBackgroundError(_error: unknown): void {
+  console.warn("Veeky background event failed");
+}
+
+async function updatePanelForActivatedTab(chromeApi: ChromeApi, tabId: number): Promise<void> {
+  const tab = await chromeApi.tabs.get(tabId);
+  await updatePanelForTab(chromeApi, tabId, tab.url);
+}
+
+async function removeTabState(chromeApi: ChromeApi, tabId: number): Promise<void> {
+  const analyzedTabs = await loadAnalyzedTabs(chromeApi);
+  delete analyzedTabs[String(tabId)];
+  await chromeApi.storage.session.set({ [STORAGE_KEY]: analyzedTabs });
 }
 
 async function handleMessage(chromeApi: ChromeApi, message: ExtensionMessage): Promise<unknown> {

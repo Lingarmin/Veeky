@@ -15,7 +15,12 @@ export function parseContentRef(url?: string): ContentRef | null {
     return null;
   }
 
-  if (!hasSafeAuthority(url, parsed) || parsed.protocol !== "https:" || parsed.hash) {
+  if (
+    parsed.protocol !== "https:"
+    || parsed.username
+    || parsed.password
+    || parsed.port
+  ) {
     return null;
   }
 
@@ -56,12 +61,6 @@ export function contentKey(ref: ContentRef): string {
 function youtubeRef(candidate: string | null): ContentRef | null {
   if (!candidate || !YOUTUBE_ID_PATTERN.test(candidate)) return null;
   return { platform: "youtube", sourceContentId: candidate, mediaIndex: 1 };
-}
-
-function hasSafeAuthority(url: string, parsed: URL): boolean {
-  if (parsed.username || parsed.password || parsed.port) return false;
-  const authority = /^https:\/\/([^/?#]*)/i.exec(url)?.[1];
-  return authority?.toLowerCase() === parsed.hostname.toLowerCase();
 }
 
 function isValidXSourceContentId(candidate: string): boolean {
