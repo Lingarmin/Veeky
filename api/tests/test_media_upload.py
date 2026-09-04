@@ -704,7 +704,7 @@ async def test_mp4_assembly_releases_parts_as_the_output_grows(
 
 
 @pytest.mark.asyncio
-async def test_mp4_assembly_storage_failure_is_non_retryable_and_cleans_partial_output(
+async def test_mp4_assembly_resumes_after_failure_past_a_durable_part_boundary(
     media_context, monkeypatch
 ):
     client, _, factory, media_root = media_context
@@ -737,13 +737,26 @@ async def test_mp4_assembly_storage_failure_is_non_retryable_and_cleans_partial_
     assert response.json()["detail"]["code"] == "storage_unavailable"
     async with factory() as session:
         upload = await session.get(MediaUploadSession, session_id)
-        assert upload.status == "failed"
+        assert upload.status == "uploading"
     assert not (directory / "media.mp4").exists()
-    assert list(directory.glob(".assemble-*.tmp")) == []
+    assembly = directory / ".media.mp4.assembling"
+    assert assembly.read_bytes() == b"0123456789abcdef"
+    assert not (directory / "part-00000000.bin").exists()
+    assert (directory / "part-00000001.bin").exists()
+
+    monkeypatch.setattr(media_upload, "_fsync_directory_sync", original_fsync)
+    retried = await client.post(
+        f"/v1/media-sessions/{session_id}/complete",
+        json={"partCount": 2, "totalBytes": 20},
+    )
+
+    assert retried.status_code == 200
+    assert (directory / "media.mp4").read_bytes() == b"0123456789abcdeftail"
+    assert not assembly.exists()
 
 
 @pytest.mark.asyncio
-async def test_mp4_assembly_fsync_failure_after_publish_removes_artifact(
+async def test_mp4_assembly_fsync_failure_after_publish_is_retryable(
     media_context, monkeypatch
 ):
     client, _, factory, media_root = media_context
@@ -774,9 +787,171 @@ async def test_mp4_assembly_fsync_failure_after_publish_removes_artifact(
     assert response.status_code == 503
     async with factory() as session:
         upload = await session.get(MediaUploadSession, session_id)
+        assert upload.status == "uploading"
+    assert (directory / "media.mp4").read_bytes() == b"part"
+
+    monkeypatch.setattr(media_upload, "_fsync_directory_sync", original_fsync)
+    retried = await client.post(
+        f"/v1/media-sessions/{session_id}/complete",
+        json={"partCount": 1, "totalBytes": 4},
+    )
+
+    assert retried.status_code == 200
+    async with factory() as session:
+        upload = await session.get(MediaUploadSession, session_id)
+        assert upload.status == "complete"
+
+
+@pytest.mark.asyncio
+async def test_mp4_complete_recovers_published_artifact_after_commit_interruption(
+    media_context, monkeypatch
+):
+    client, _, factory, media_root = media_context
+    session_id = (
+        await create_session(client, expected_bytes=4, part_count=1)
+    ).json()["sessionId"]
+    await upload_part(client, session_id, 0, b"part")
+
+    async with factory() as session:
+        upload = await get_owned_upload(
+            session, media_settings(media_root), session_id, INSTALLATION_ID
+        )
+        directory = media_root / upload.directory_key
+
+        async def interrupt_commit():
+            raise RuntimeError("injected commit interruption")
+
+        monkeypatch.setattr(session, "commit", interrupt_commit)
+        with pytest.raises(RuntimeError, match="commit interruption"):
+            await complete_upload(
+                session, media_settings(media_root), upload, 1, 4, None
+            )
+
+    async with factory() as session:
+        upload = await session.get(MediaUploadSession, session_id)
+        assert upload.status == "uploading"
+    assert (directory / "media.mp4").read_bytes() == b"part"
+    assert not (directory / "part-00000000.bin").exists()
+
+    retried = await client.post(
+        f"/v1/media-sessions/{session_id}/complete",
+        json={"partCount": 1, "totalBytes": 4},
+    )
+
+    assert retried.status_code == 200
+    async with factory() as session:
+        upload = await session.get(MediaUploadSession, session_id)
+        assert upload.status == "complete"
+
+
+@pytest.mark.asyncio
+async def test_mp4_assembly_truncates_a_partial_tail_before_resuming(media_context):
+    client, _, factory, media_root = media_context
+    session_id = (await create_session(client)).json()["sessionId"]
+    await upload_part(client, session_id, 0, b"0123456789abcdef")
+    await upload_part(client, session_id, 1, b"tail")
+    async with factory() as session:
+        upload = await session.get(MediaUploadSession, session_id)
+        directory = media_root / upload.directory_key
+
+    assembly = directory / ".media.mp4.assembling"
+    assembly.write_bytes(b"0123456789abcdefta")
+    (directory / "part-00000000.bin").unlink()
+
+    response = await client.post(
+        f"/v1/media-sessions/{session_id}/complete",
+        json={"partCount": 2, "totalBytes": 20},
+    )
+
+    assert response.status_code == 200
+    assert (directory / "media.mp4").read_bytes() == b"0123456789abcdeftail"
+    assert not assembly.exists()
+
+
+@pytest.mark.asyncio
+async def test_mp4_complete_rejects_a_tampered_published_artifact(
+    media_context, monkeypatch
+):
+    client, _, factory, media_root = media_context
+    session_id = (
+        await create_session(client, expected_bytes=4, part_count=1)
+    ).json()["sessionId"]
+    await upload_part(client, session_id, 0, b"part")
+    async with factory() as session:
+        upload = await session.get(MediaUploadSession, session_id)
+        directory = media_root / upload.directory_key
+
+    (directory / "media.mp4").write_bytes(b"evil")
+    (directory / "part-00000000.bin").unlink()
+
+    def assembly_must_not_run(*args):
+        raise AssertionError("published artifacts must be verified directly")
+
+    monkeypatch.setattr(media_upload, "_assemble_mp4_sync", assembly_must_not_run)
+    response = await client.post(
+        f"/v1/media-sessions/{session_id}/complete",
+        json={"partCount": 1, "totalBytes": 4},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "part_integrity_failed"
+    async with factory() as session:
+        upload = await session.get(MediaUploadSession, session_id)
         assert upload.status == "failed"
-    assert not (directory / "media.mp4").exists()
-    assert list(directory.glob(".assemble-*.tmp")) == []
+
+
+@pytest.mark.asyncio
+async def test_mp4_complete_cancellation_holds_lock_until_assembly_finishes(
+    media_context, monkeypatch
+):
+    client, _, factory, media_root = media_context
+    settings = media_settings(media_root)
+    session_id = (
+        await create_session(client, expected_bytes=4, part_count=1)
+    ).json()["sessionId"]
+    await upload_part(client, session_id, 0, b"part")
+    entered = threading.Event()
+    release = threading.Event()
+    original_assemble = media_upload._assemble_mp4_sync
+
+    def blocked_assemble(*args):
+        entered.set()
+        assert release.wait(5)
+        return original_assemble(*args)
+
+    monkeypatch.setattr(media_upload, "_assemble_mp4_sync", blocked_assemble)
+
+    async def complete_one():
+        async with factory() as session:
+            upload = await get_owned_upload(
+                session, settings, session_id, INSTALLATION_ID
+            )
+            return await complete_upload(session, settings, upload, 1, 4, None)
+
+    async def acquire_write_lock():
+        async with factory() as session:
+            await media_upload._serialize_sqlite_write(session)
+            await session.rollback()
+
+    complete_task = asyncio.create_task(complete_one())
+    assert await asyncio.to_thread(entered.wait, 5)
+    complete_task.cancel()
+    lock_task = asyncio.create_task(acquire_write_lock())
+    await asyncio.sleep(0.05)
+    assert not complete_task.done()
+    assert not lock_task.done()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await complete_task
+    await asyncio.wait_for(lock_task, timeout=5)
+
+    monkeypatch.setattr(media_upload, "_assemble_mp4_sync", original_assemble)
+    retried = await client.post(
+        f"/v1/media-sessions/{session_id}/complete",
+        json={"partCount": 1, "totalBytes": 4},
+    )
+    assert retried.status_code == 200
 
 
 @pytest.mark.asyncio
@@ -938,6 +1113,41 @@ async def test_cleanup_primitive_expires_only_due_sessions(media_context):
         assert future.status == "uploading"
     assert not due_directory.exists()
     assert future_directory.exists()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_removes_only_old_uuid_staging_files(media_context):
+    _, _, factory, media_root = media_context
+    settings = media_settings(media_root)
+    staging = media_root / ".staging"
+    staging.mkdir(parents=True)
+    old_file = staging / f"{uuid.uuid4()}.tmp"
+    fresh_file = staging / f"{uuid.uuid4()}.tmp"
+    malformed_file = staging / "client-upload.tmp"
+    symlink_target = media_root / "outside-staging.bin"
+    symlink = staging / f"{uuid.uuid4()}.tmp"
+    old_file.write_bytes(b"old")
+    fresh_file.write_bytes(b"fresh")
+    malformed_file.write_bytes(b"malformed")
+    symlink_target.write_bytes(b"target")
+    symlink.symlink_to(symlink_target)
+    old_timestamp = time.time() - settings.media_upload_session_ttl_seconds - 1
+    os.utime(old_file, (old_timestamp, old_timestamp))
+    os.utime(malformed_file, (old_timestamp, old_timestamp))
+    os.utime(symlink_target, (old_timestamp, old_timestamp))
+    os.utime(
+        symlink, (old_timestamp, old_timestamp), follow_symlinks=False
+    )
+
+    async with factory() as session:
+        cleaned = await cleanup_expired_uploads(session, settings)
+
+    assert cleaned == 0
+    assert not old_file.exists()
+    assert fresh_file.read_bytes() == b"fresh"
+    assert malformed_file.read_bytes() == b"malformed"
+    assert symlink.is_symlink()
+    assert symlink_target.read_bytes() == b"target"
 
 
 @pytest.mark.asyncio

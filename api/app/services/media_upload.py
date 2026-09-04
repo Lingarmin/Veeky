@@ -5,8 +5,10 @@ import hashlib
 import json
 import os
 import shutil
+import stat
+import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -65,6 +67,25 @@ class MediaArtifact:
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+async def _to_thread_uninterruptibly(
+    function: Callable[..., Any], /, *args: Any
+) -> Any:
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                pass
+        try:
+            task.result()
+        except BaseException:
+            pass
+        raise
 
 
 async def create_upload_session(
@@ -248,7 +269,7 @@ async def store_part(
         directory = _session_directory(settings, locked)
         final_path = _part_path(directory, part_number)
         try:
-            created_file = await asyncio.to_thread(
+            created_file = await _to_thread_uninterruptibly(
                 _publish_part_sync,
                 temporary,
                 final_path,
@@ -289,7 +310,7 @@ async def store_part(
         ) from error
     finally:
         if created_file and final_path is not None:
-            await asyncio.to_thread(_unlink_and_fsync_sync, final_path)
+            await _to_thread_uninterruptibly(_unlink_and_fsync_sync, final_path)
         await asyncio.to_thread(_unlink_if_exists_sync, temporary)
 
 
@@ -324,13 +345,13 @@ async def complete_upload(
     directory = _session_directory(settings, locked)
     if locked.status == "complete":
         artifact_path = _artifact_path(directory, locked.media_kind)
-        if not await asyncio.to_thread(artifact_path.is_file):
+        if not await _to_thread_uninterruptibly(artifact_path.is_file):
             _transition(locked, "failed")
             await database.commit()
             raise _error(409, "upload_failed", "completed media artifact is missing")
         if locked.media_kind == "mp4":
             try:
-                await asyncio.to_thread(
+                await _to_thread_uninterruptibly(
                     _remove_part_files_sync, directory, locked.parts
                 )
             except OSError as error:
@@ -354,29 +375,48 @@ async def complete_upload(
                 raise _error(
                     422, "unexpected_manifest", "MP4 uploads do not use a manifest"
                 )
-            artifact_path = await asyncio.to_thread(
-                _assemble_mp4_sync, directory, locked.expected_bytes, locked.parts
-            )
+            artifact_path = directory / "media.mp4"
+            if await _to_thread_uninterruptibly(artifact_path.is_file):
+                await _to_thread_uninterruptibly(
+                    _verify_mp4_artifact_sync,
+                    artifact_path,
+                    locked.expected_bytes,
+                    locked.parts,
+                )
+                await _to_thread_uninterruptibly(
+                    _remove_mp4_work_files_sync, directory, locked.parts
+                )
+            else:
+                artifact_path = await _to_thread_uninterruptibly(
+                    _assemble_mp4_sync,
+                    directory,
+                    locked.expected_bytes,
+                    locked.parts,
+                )
         else:
             canonical_manifest = _validate_hls_manifest(manifest, locked.part_count)
-            await asyncio.to_thread(_verify_parts_sync, directory, locked.parts)
+            await _to_thread_uninterruptibly(
+                _verify_parts_sync, directory, locked.parts
+            )
             artifact_path = directory / "manifest.json"
-            await asyncio.to_thread(
+            await _to_thread_uninterruptibly(
                 _atomic_write_sync,
                 artifact_path,
                 json.dumps(canonical_manifest, separators=(",", ":")).encode("utf-8"),
             )
             locked.hls_manifest = canonical_manifest
-    # MP4 assembly releases verified parts as it advances, so failures are terminal.
     except PartIntegrityError as error:
         _transition(locked, "failed")
         locked.updated_at = utc_now()
         await database.commit()
         raise _error(409, "part_integrity_failed", str(error)) from error
     except OSError as error:
-        _transition(locked, "failed")
-        locked.updated_at = utc_now()
-        await database.commit()
+        if locked.media_kind == "mp4":
+            await database.rollback()
+        else:
+            _transition(locked, "failed")
+            locked.updated_at = utc_now()
+            await database.commit()
         raise _error(
             503, "storage_unavailable", "media storage is unavailable"
         ) from error
@@ -407,6 +447,10 @@ async def cleanup_expired_uploads(
     *,
     limit: int = 100,
 ) -> int:
+    cutoff = time.time() - settings.media_upload_session_ttl_seconds
+    await _to_thread_uninterruptibly(
+        _cleanup_stale_staging_files_sync, settings, cutoff
+    )
     bounded_limit = max(1, min(limit, 1000))
     session_ids = list(
         await database.scalars(
@@ -479,7 +523,9 @@ async def _expire_uncommitted(
     upload: MediaUploadSession,
 ) -> None:
     try:
-        await asyncio.to_thread(_remove_session_directory_sync, settings, upload)
+        await _to_thread_uninterruptibly(
+            _remove_session_directory_sync, settings, upload
+        )
     except OSError as error:
         await database.rollback()
         raise _error(
@@ -524,47 +570,112 @@ def _assemble_mp4_sync(
     directory: Path, expected_bytes: int, parts: list[MediaUploadPart]
 ) -> Path:
     artifact_path = directory / "media.mp4"
-    temporary = directory / f".assemble-{uuid.uuid4()}.tmp"
-    total_bytes = 0
-    published = False
-    durable = False
+    assembly_path = directory / ".media.mp4.assembling"
     try:
-        with temporary.open("xb") as destination:
-            for part in parts:
-                source_path = _part_path(directory, part.part_number)
-                digest = hashlib.sha256()
-                part_size = 0
-                try:
-                    with source_path.open("rb") as source:
-                        while chunk := source.read(1024 * 1024):
-                            digest.update(chunk)
-                            part_size += len(chunk)
-                            destination.write(chunk)
-                except FileNotFoundError as error:
-                    raise PartIntegrityError(
-                        "a verified media part is missing or changed"
-                    ) from error
-                if part_size != part.byte_size or digest.hexdigest() != part.sha256:
-                    raise PartIntegrityError("a verified media part is missing or changed")
-                total_bytes += part_size
+        destination = assembly_path.open("r+b")
+    except FileNotFoundError:
+        destination = assembly_path.open("x+b")
+
+    with destination:
+        verified_bytes, next_part = _verified_assembly_prefix(destination, parts)
+        destination.flush()
+        os.fsync(destination.fileno())
+
+        for part in parts[:next_part]:
+            source_path = _part_path(directory, part.part_number)
+            if source_path.exists():
+                source_path.unlink()
+                _fsync_directory_sync(directory)
+
+        destination.seek(verified_bytes)
+        for part in parts[next_part:]:
+            source_path = _part_path(directory, part.part_number)
+            part_start = destination.tell()
+            digest = hashlib.sha256()
+            part_size = 0
+            try:
+                with source_path.open("rb") as source:
+                    while chunk := source.read(1024 * 1024):
+                        digest.update(chunk)
+                        part_size += len(chunk)
+                        destination.write(chunk)
+            except FileNotFoundError as error:
+                raise PartIntegrityError(
+                    "a verified media part is missing or changed"
+                ) from error
+            if part_size != part.byte_size or digest.hexdigest() != part.sha256:
+                destination.truncate(part_start)
                 destination.flush()
                 os.fsync(destination.fileno())
-                source_path.unlink(missing_ok=True)
-                _fsync_directory_sync(directory)
+                raise PartIntegrityError("a verified media part is missing or changed")
+            verified_bytes += part_size
             destination.flush()
             os.fsync(destination.fileno())
-        if total_bytes != expected_bytes:
+            source_path.unlink(missing_ok=True)
+            _fsync_directory_sync(directory)
+
+        if verified_bytes != expected_bytes:
             raise PartIntegrityError("assembled media size is incorrect")
-        os.replace(temporary, artifact_path)
-        published = True
-        _fsync_directory_sync(directory)
-        durable = True
-    finally:
-        temporary.unlink(missing_ok=True)
-        if published and not durable:
-            artifact_path.unlink(missing_ok=True)
-            _fsync_directory_if_exists_sync(directory)
+
+    os.replace(assembly_path, artifact_path)
+    _fsync_directory_sync(directory)
     return artifact_path
+
+
+def _verified_assembly_prefix(
+    destination, parts: list[MediaUploadPart]
+) -> tuple[int, int]:
+    destination.seek(0)
+    verified_bytes = 0
+    for index, part in enumerate(parts):
+        part_size, checksum = _read_segment_identity(destination, part.byte_size)
+        if part_size == 0:
+            destination.truncate(verified_bytes)
+            return verified_bytes, index
+        if part_size < part.byte_size:
+            destination.truncate(verified_bytes)
+            return verified_bytes, index
+        if checksum != part.sha256:
+            raise PartIntegrityError("assembled media data is missing or changed")
+        verified_bytes += part_size
+    if destination.read(1):
+        raise PartIntegrityError("assembled media size is incorrect")
+    return verified_bytes, len(parts)
+
+
+def _verify_mp4_artifact_sync(
+    artifact_path: Path,
+    expected_bytes: int,
+    parts: list[MediaUploadPart],
+) -> None:
+    try:
+        with artifact_path.open("rb") as source:
+            total_bytes = 0
+            for part in parts:
+                part_size, checksum = _read_segment_identity(source, part.byte_size)
+                if part_size != part.byte_size or checksum != part.sha256:
+                    raise PartIntegrityError(
+                        "published media data is missing or changed"
+                    )
+                total_bytes += part_size
+            if source.read(1) or total_bytes != expected_bytes:
+                raise PartIntegrityError("published media size is incorrect")
+    except FileNotFoundError as error:
+        raise PartIntegrityError(
+            "published media data is missing or changed"
+        ) from error
+
+
+def _read_segment_identity(source, expected_size: int) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    size = 0
+    while size < expected_size:
+        chunk = source.read(min(1024 * 1024, expected_size - size))
+        if not chunk:
+            break
+        size += len(chunk)
+        digest.update(chunk)
+    return size, digest.hexdigest()
 
 
 def _verify_parts_sync(directory: Path, parts: list[MediaUploadPart]) -> None:
@@ -625,6 +736,53 @@ def _remove_part_files_sync(directory: Path, parts: list[MediaUploadPart]) -> No
     for part in parts:
         _part_path(directory, part.part_number).unlink(missing_ok=True)
     _fsync_directory_if_exists_sync(directory)
+
+
+def _remove_mp4_work_files_sync(
+    directory: Path, parts: list[MediaUploadPart]
+) -> None:
+    _remove_part_files_sync(directory, parts)
+    (directory / ".media.mp4.assembling").unlink(missing_ok=True)
+    _fsync_directory_if_exists_sync(directory)
+
+
+def _cleanup_stale_staging_files_sync(
+    settings: Settings, cutoff_timestamp: float
+) -> None:
+    staging = Path(settings.media_temp_root).resolve() / ".staging"
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(staging, flags)
+    except (FileNotFoundError, NotADirectoryError):
+        return
+    removed = False
+    try:
+        with os.scandir(descriptor) as entries:
+            for entry in entries:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                name = entry.name
+                if not name.endswith(".tmp"):
+                    continue
+                stem = name.removesuffix(".tmp")
+                try:
+                    parsed = uuid.UUID(stem)
+                except ValueError:
+                    continue
+                if str(parsed) != stem:
+                    continue
+                metadata = entry.stat(follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_mtime > cutoff_timestamp
+                ):
+                    continue
+                os.unlink(name, dir_fd=descriptor)
+                removed = True
+        if removed:
+            os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _remove_session_directory_sync(
