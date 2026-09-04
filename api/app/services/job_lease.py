@@ -174,6 +174,72 @@ async def finish_owned_job(
     return True
 
 
+async def timeout_job_delivery(
+    session: AsyncSession,
+    job_id: str,
+    lease_token: str | None,
+) -> tuple[str | None, datetime | None]:
+    ownership_condition = (
+        AnalysisJob.lease_token == lease_token
+        if lease_token is not None
+        else AnalysisJob.lease_token.is_(None)
+    )
+    status_condition = (
+        AnalysisJob.status.in_(ACTIVE_JOB_STATUSES)
+        if lease_token is not None
+        else AnalysisJob.status == "queued"
+    )
+    changed = (
+        await session.execute(
+            update(AnalysisJob)
+            .where(
+                AnalysisJob.id == job_id,
+                status_condition,
+                ownership_condition,
+            )
+            .values(
+                status="failed",
+                failure_code="analysis_timeout",
+                failure_detail=None,
+                completed_at=datetime.now(timezone.utc),
+                lease_token=None,
+                lease_expires_at=None,
+                llm_credential_ciphertext=None,
+                llm_credential_expires_at=None,
+                media_url_ciphertext=None,
+            )
+            .execution_options(synchronize_session=False)
+            .returning(AnalysisJob.id, AnalysisJob.media_session_id)
+        )
+    ).one_or_none()
+    if changed is not None:
+        await session.commit()
+        return changed.media_session_id, None
+
+    row = (
+        await session.execute(
+            select(
+                AnalysisJob.status,
+                AnalysisJob.lease_token,
+                AnalysisJob.lease_expires_at,
+            ).where(AnalysisJob.id == job_id)
+        )
+    ).one_or_none()
+    await session.rollback()
+    if (
+        row is not None
+        and row.status in ACTIVE_JOB_STATUSES
+        and row.lease_token is not None
+    ):
+        retry_at = row.lease_expires_at
+        if retry_at is None:
+            return None, datetime.now(timezone.utc) + timedelta(seconds=1)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return None, retry_at
+    return None, None
+
+
 async def _lease_timestamps(
     session: AsyncSession, lease_seconds: float
 ) -> tuple[object, object]:

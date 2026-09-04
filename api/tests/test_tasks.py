@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from billiard.exceptions import SoftTimeLimitExceeded
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import selectinload
@@ -13,9 +15,11 @@ from app.db.models import (
     AnalysisResult as StoredAnalysisResult,
     Base,
     Installation,
+    MediaUploadSession,
     TranscriptSegment as StoredSegment,
     Video,
 )
+from app.core.settings import Settings
 from app.services.analysis import AnalysisSegment
 from app.services.transcripts import (
     TranscriptInspection,
@@ -34,6 +38,7 @@ from app.workers.tasks import (
 )
 from app.security.credentials import JobCredentialCipher
 from app.workers.tasks import clear_expired_llm_credentials_async
+import app.workers.tasks as worker_tasks
 
 
 VALID_TEST_KEY = base64.b64encode(b"v" * 32).decode("ascii")
@@ -394,7 +399,7 @@ async def test_translation_failure_preserves_the_generated_summary(pipeline_cont
 def test_analyze_video_accepts_explicit_resume_without_serializing_media(monkeypatch):
     captured = {}
 
-    async def fake_run(job_id, *, resume=False):
+    async def fake_run(job_id, *, resume=False, lease_state=None):
         captured.update(job_id=job_id, resume=resume)
 
     monkeypatch.setattr("app.workers.tasks.run_analysis_task", fake_run)
@@ -409,7 +414,7 @@ def test_analyze_video_retries_when_another_worker_owns_the_lease(monkeypatch):
     retry_at = datetime.now(timezone.utc) + timedelta(seconds=30)
     captured = {}
 
-    async def fake_run(job_id, *, resume=False):
+    async def fake_run(job_id, *, resume=False, lease_state=None):
         return retry_at
 
     class RetryRequested(RuntimeError):
@@ -431,7 +436,7 @@ def test_analyze_video_retries_when_another_worker_owns_the_lease(monkeypatch):
 
 
 def test_analyze_video_terminates_worker_after_pipeline_timeout(monkeypatch):
-    async def fake_run(job_id, *, resume=False):
+    async def fake_run(job_id, *, resume=False, lease_state=None):
         return WORKER_TERMINATION_REQUIRED
 
     class WorkerTerminated(BaseException):
@@ -442,6 +447,108 @@ def test_analyze_video_terminates_worker_after_pipeline_timeout(monkeypatch):
 
     with pytest.raises(WorkerTerminated):
         analyze_video.run("job-id")
+
+
+def test_analyze_video_recovers_when_soft_limit_escapes_asyncio_run(
+    tmp_path, monkeypatch
+):
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'soft-timeout.db'}"
+    job_id = "soft-timeout-job"
+    lease_token = "soft-timeout-lease"
+    media_root = tmp_path / "media"
+    upload_dir = media_root / "11111111-1111-4111-8111-111111111112"
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "media.mp4").write_bytes(b"media")
+
+    async def seed_job():
+        engine = create_async_engine(database_url)
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with factory() as session:
+            installation = Installation(
+                id="11111111-1111-4111-8111-111111111111",
+                token_hash="a" * 64,
+            )
+            video = Video(
+                video_id="aircAruvnKk",
+                title="Soft timeout fixture",
+                duration_ms=2000,
+                source_url="https://www.youtube.com/watch?v=aircAruvnKk",
+            )
+            job = AnalysisJob(
+                id=job_id,
+                installation=installation,
+                video=video,
+                source_language="en",
+                target_language="zh-Hans",
+                transcript_version="soft-timeout-version",
+                cache_key="soft-timeout-cache-key",
+                status="analyzing",
+                lease_token=lease_token,
+                lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+                llm_credential_ciphertext="encrypted-secret",
+                llm_credential_expires_at=datetime.now(timezone.utc)
+                + timedelta(minutes=1),
+                media_url_ciphertext="encrypted-media-url",
+            )
+            upload = MediaUploadSession(
+                id="soft-timeout-upload",
+                installation=installation,
+                content=video,
+                status="consumed",
+                expected_bytes=5,
+                received_bytes=5,
+                media_kind="mp4",
+                part_count=1,
+                part_size_bytes=5,
+                directory_key=upload_dir.name,
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+            )
+            job.media_session_id = upload.id
+            session.add_all([job, upload])
+            await session.commit()
+        await engine.dispose()
+
+    asyncio.run(seed_job())
+    test_settings = Settings(
+        database_url=database_url,
+        media_temp_root=str(media_root),
+    )
+    monkeypatch.setattr(worker_tasks, "get_settings", lambda: test_settings)
+
+    async def raise_soft_limit(job_id, *, resume=False, lease_state=None):
+        if lease_state is not None:
+            lease_state.token = lease_token
+        await asyncio.sleep(0)
+        raise SoftTimeLimitExceeded()
+
+    class WorkerTerminated(BaseException):
+        pass
+
+    monkeypatch.setattr(worker_tasks, "run_analysis_task", raise_soft_limit)
+    monkeypatch.setattr(worker_tasks, "WorkerTerminate", WorkerTerminated)
+
+    with pytest.raises(WorkerTerminated):
+        analyze_video.run(job_id)
+
+    async def load_job():
+        engine = create_async_engine(database_url)
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with factory() as session:
+            job = await session.get(AnalysisJob, job_id)
+        await engine.dispose()
+        return job
+
+    job = asyncio.run(load_job())
+    assert job.status == "failed"
+    assert job.failure_code == "analysis_timeout"
+    assert job.lease_token is None
+    assert job.lease_expires_at is None
+    assert job.llm_credential_ciphertext is None
+    assert job.llm_credential_expires_at is None
+    assert job.media_url_ciphertext is None
+    assert not upload_dir.exists()
 
 
 @pytest.mark.asyncio

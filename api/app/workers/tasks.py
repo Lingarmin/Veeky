@@ -6,9 +6,10 @@ import hashlib
 import json
 import math
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import anyio
 from billiard.exceptions import SoftTimeLimitExceeded
@@ -51,6 +52,7 @@ from app.services.job_lease import (
     JobLeaseClaim,
     claim_job_lease,
     finish_owned_job,
+    timeout_job_delivery,
     update_owned_job,
 )
 from app.services.media_upload import expire_complete_upload_if_unreferenced
@@ -91,6 +93,11 @@ WAV_HEADER_BYTES = 44
 PCM_DURATION_TOLERANCE_MS = 100
 CELERY_HARD_LIMIT_GRACE_SECONDS = 60
 WORKER_TERMINATION_REQUIRED = "worker_termination_required"
+
+
+@dataclass
+class TaskLeaseState:
+    token: str | None = None
 
 
 class FFmpegAudioExtractor:
@@ -378,6 +385,8 @@ class AnalysisPipeline:
         self.audio_extractor = audio_extractor
         self.transcriber = transcriber
         self._uses_default_providers = False
+        self.lease_state: TaskLeaseState | None = None
+        self._lease_released: asyncio.Event | None = None
 
     async def run(
         self, job_id: str, *, resume: bool = False
@@ -390,12 +399,15 @@ class AnalysisPipeline:
         if claim.token is None:
             return None
         lease_token = claim.token
+        if self.lease_state is not None:
+            self.lease_state.token = lease_token
         job = await self._load_claimed_job(job_id, lease_token)
         if job is None:
             return None
         owner_task = asyncio.current_task()
         assert owner_task is not None
         lease_lost = asyncio.Event()
+        self._lease_released = asyncio.Event()
         lease_deadline = claim_started_at + self._lease_seconds
         heartbeat_task = asyncio.create_task(
             self._heartbeat_lease(
@@ -698,6 +710,16 @@ class AnalysisPipeline:
                         raise
                     raise MediaDownloadError("media upload required") from None
                 upload.status = "consumed"
+                now = datetime.now(timezone.utc)
+                retention_seconds = max(
+                    self.settings.media_upload_session_ttl_seconds,
+                    self.settings.asr_job_timeout_seconds
+                    + CELERY_HARD_LIMIT_GRACE_SECONDS
+                    + self.settings.analysis_job_lease_seconds,
+                )
+                retained_until = now + timedelta(seconds=retention_seconds)
+                if self._as_utc(upload.expires_at) < retained_until:
+                    upload.expires_at = retained_until
                 if not await update_owned_job(
                     session,
                     job.id,
@@ -821,6 +843,7 @@ class AnalysisPipeline:
                     model_version=cached.result.model_version,
                     generated_at=cached.result.generated_at,
                 )
+                self._mark_lease_released()
                 if not await finish_owned_job(
                     session,
                     current.id,
@@ -922,6 +945,7 @@ class AnalysisPipeline:
                 raise JobLeaseLost()
 
     async def _wait_for_media(self, job_id: str, lease_token: str) -> None:
+        self._mark_lease_released()
         async with self.session_factory() as session:
             job = await session.scalar(
                 select(AnalysisJob)
@@ -954,6 +978,7 @@ class AnalysisPipeline:
             )
 
     async def _complete(self, job_id: str, lease_token: str) -> None:
+        self._mark_lease_released()
         async with self.session_factory() as session:
             if not await finish_owned_job(
                 session,
@@ -1152,6 +1177,8 @@ class AnalysisPipeline:
             if renewed:
                 lease_deadline = renewal_started_at + self._lease_seconds
                 continue
+            if self._lease_released is not None and self._lease_released.is_set():
+                return
             lease_lost.set()
             owner_task.cancel()
             return
@@ -1345,6 +1372,7 @@ class AnalysisPipeline:
         *,
         expire_complete_upload: bool = False,
     ) -> None:
+        self._mark_lease_released()
         async with self.session_factory() as session:
             if not await finish_owned_job(
                 session,
@@ -1364,6 +1392,10 @@ class AnalysisPipeline:
         if expire_complete_upload:
             await self._expire_complete_upload(job_id)
         await self._cleanup_consumed_upload(job_id)
+
+    def _mark_lease_released(self) -> None:
+        if self._lease_released is not None:
+            self._lease_released.set()
 
     async def _expire_complete_upload(self, job_id: str) -> None:
         async with self.session_factory() as session:
@@ -1443,15 +1475,75 @@ def build_default_pipeline(
 
 
 async def run_analysis_task(
-    job_id: str, *, resume: bool = False
+    job_id: str,
+    *,
+    resume: bool = False,
+    lease_state: TaskLeaseState | None = None,
 ) -> datetime | str | None:
     current = get_settings()
     engine = create_async_engine(current.database_url, pool_pre_ping=True)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
-        return await build_default_pipeline(session_factory).run(job_id, resume=resume)
+        pipeline = build_default_pipeline(session_factory)
+        pipeline.lease_state = lease_state
+        return await pipeline.run(job_id, resume=resume)
     finally:
         await engine.dispose()
+
+
+async def recover_analysis_soft_timeout(
+    job_id: str,
+    lease_token: str | None,
+) -> datetime | None:
+    current = get_settings()
+    engine = create_async_engine(current.database_url, pool_pre_ping=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with session_factory() as session:
+            media_session_id, retry_at = await timeout_job_delivery(
+                session, job_id, lease_token
+            )
+        if media_session_id is not None:
+            await _cleanup_terminal_job_media(
+                session_factory,
+                current,
+                job_id,
+                media_session_id,
+            )
+        return retry_at
+    finally:
+        await engine.dispose()
+
+
+async def _cleanup_terminal_job_media(
+    session_factory: async_sessionmaker[AsyncSession],
+    current,
+    job_id: str,
+    media_session_id: str,
+) -> None:
+    async with session_factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        upload = await session.get(MediaUploadSession, media_session_id)
+        if job is None or upload is None:
+            return
+        if upload.status == "consumed":
+            root = Path(current.media_temp_root).resolve()
+            directory = (root / upload.directory_key).resolve()
+            if directory != root and root not in directory.parents:
+                return
+        elif upload.status == "complete":
+            await expire_complete_upload_if_unreferenced(
+                session,
+                current,
+                session_id=upload.id,
+                installation_id=job.installation_id,
+                content_id=job.content_id,
+                excluding_job_id=job.id,
+            )
+            return
+        else:
+            return
+    await anyio.to_thread.run_sync(shutil.rmtree, directory, True)
 
 
 async def clear_expired_llm_credentials_async(
@@ -1496,12 +1588,28 @@ async def run_expired_credential_cleanup() -> int:
 )
 def analyze_video(task, job_id: str, *, resume: bool = False) -> None:
     delivery_info = task.request.delivery_info or {}
-    retry_at = asyncio.run(
-        run_analysis_task(
-            job_id,
-            resume=resume or bool(delivery_info.get("redelivered")),
+    lease_state = TaskLeaseState()
+    try:
+        retry_at = asyncio.run(
+            run_analysis_task(
+                job_id,
+                resume=resume or bool(delivery_info.get("redelivered")),
+                lease_state=lease_state,
+            )
         )
-    )
+    except SoftTimeLimitExceeded:
+        retry_at = asyncio.run(
+            recover_analysis_soft_timeout(job_id, lease_state.token)
+        )
+        if retry_at is not None:
+            countdown = max(
+                1,
+                math.ceil(
+                    (retry_at - datetime.now(timezone.utc)).total_seconds()
+                ),
+            )
+            task.retry(countdown=countdown, kwargs={"resume": True})
+        raise WorkerTerminate() from None
     if retry_at == WORKER_TERMINATION_REQUIRED:
         raise WorkerTerminate()
     if retry_at is not None:

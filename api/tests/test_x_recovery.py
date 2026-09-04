@@ -9,8 +9,10 @@ from sqlalchemy import select
 
 import app.api.analyses as analyses_api
 import app.services.job_lease as job_lease
+import app.services.media_upload as media_upload
 from app.db.models import AnalysisJob, MediaUploadSession, TranscriptTrack
 from app.services.job_lease import finish_owned_job, update_owned_job
+from app.services.media_upload import cleanup_expired_uploads
 from app.services.translation import provider_translation_version
 from tests.test_x_pipeline import (
     INSTALLATION_ID,
@@ -413,8 +415,10 @@ async def test_expired_lease_retries_encrypted_direct_url_after_download_loss(x_
 
 
 @pytest.mark.asyncio
-async def test_expired_lease_reuses_consumed_upload_after_extraction_loss(x_context):
-    factory, _, _, media_root = x_context
+async def test_expired_lease_reuses_consumed_upload_after_extraction_loss(
+    x_context, monkeypatch
+):
+    factory, _, settings, media_root = x_context
     upload_dir = media_root / "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
     upload_dir.mkdir()
     (upload_dir / "media.mp4").write_bytes(b"uploaded-media")
@@ -433,7 +437,7 @@ async def test_expired_lease_reuses_consumed_upload_after_extraction_loss(x_cont
             part_count=1,
             part_size_bytes=14,
             directory_key=upload_dir.name,
-            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            expires_at=datetime.now(timezone.utc) + timedelta(seconds=1),
         )
         job.media_session_id = upload.id
         session.add(upload)
@@ -451,6 +455,17 @@ async def test_expired_lease_reuses_consumed_upload_after_extraction_loss(x_cont
     async with factory() as session:
         upload = await session.get(MediaUploadSession, "recoverable-upload")
         assert upload.status == "consumed"
+        extended_expires_at = upload.expires_at
+        if extended_expires_at.tzinfo is None:
+            extended_expires_at = extended_expires_at.replace(tzinfo=timezone.utc)
+        assert extended_expires_at > datetime.now(timezone.utc) + timedelta(minutes=2)
+
+    cleanup_time = datetime.now(timezone.utc) + timedelta(minutes=2)
+    monkeypatch.setattr(media_upload, "utc_now", lambda: cleanup_time)
+    async with factory() as session:
+        assert await cleanup_expired_uploads(session, settings) == 0
+    assert (upload_dir / "media.mp4").is_file()
+
     await expire_lease(factory)
     transcriber = CountingTranscriber()
     analysis = CountingAnalysis()
@@ -467,6 +482,32 @@ async def test_expired_lease_reuses_consumed_upload_after_extraction_loss(x_cont
     assert transcriber.calls == 1
     assert analysis.calls == 1
     assert not upload_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_terminal_cleanup_is_not_cancelled_by_heartbeat(x_context):
+    factory, _, settings, _ = x_context
+    settings.analysis_job_lease_seconds = 1
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    pipeline = make_pipeline(x_context)
+
+    async def blocking_cleanup(job_id):
+        cleanup_started.set()
+        await release_cleanup.wait()
+
+    pipeline._cleanup_consumed_upload = blocking_cleanup
+    running = asyncio.create_task(pipeline.run("job-x"))
+    await cleanup_started.wait()
+    await asyncio.sleep(0.5)
+
+    assert not running.done()
+    release_cleanup.set()
+    assert await asyncio.wait_for(running, timeout=1) is None
+    async with factory() as session:
+        job = await session.get(AnalysisJob, "job-x")
+        assert job.status == "completed"
+        assert job.lease_token is None
 
 
 @pytest.mark.asyncio
