@@ -183,6 +183,24 @@ describe("background tab isolation", () => {
     expect(chrome.sidePanel.open).toHaveBeenCalledWith({ tabId: 7 });
   });
 
+  it.each([
+    "https://x.com/u/status/0",
+    "https://x.com/u/status/18446744073709551616",
+    "https://x.com/u/status/2075545587093807111/video/2147483648",
+  ])("does not enable or open an invalid X status route: %s", async (url) => {
+    const chrome = createChrome();
+    installBackgroundHandlers(chrome as never);
+    await flushMicrotasks();
+    chrome.sidePanel.setOptions.mockClear();
+
+    chrome.events.tabUpdated.listeners[0](7, { url }, { id: 7, url });
+    await flushMicrotasks();
+    expect(chrome.sidePanel.setOptions).toHaveBeenLastCalledWith({ tabId: 7, enabled: false });
+
+    chrome.events.actionClicked.listeners[0]({ id: 7, url });
+    expect(chrome.sidePanel.open).not.toHaveBeenCalled();
+  });
+
   it("contains rejected async tab event work", async () => {
     const chrome = createChrome();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
@@ -446,6 +464,67 @@ describe("X media candidate capture", () => {
       contentRef,
     }, contentSender());
     expect(afterWindow).toEqual(response);
+    vi.useRealTimers();
+  });
+
+  it("lets a new player claim a pending request on a bare multi-video status", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-05T00:00:00Z"));
+    const chrome = createChrome();
+    const bareUrl = `https://x.com/owner/status/${contentRef.sourceContentId}`;
+    const mediaTwo = { ...contentRef, mediaIndex: 2 };
+    installBackgroundHandlers(chrome as never);
+    await flushMicrotasks();
+    observeStatusRoute(chrome, 7, bareUrl);
+    await dispatchMessage(chrome, {
+      type: "X_PLAYER_ACTIVE", contentRef, durationMs: 0,
+    }, contentSender(7, bareUrl));
+
+    const candidateUrl = "https://video.twimg.com/path/media-two.mp4";
+    await capture(chrome, candidateUrl);
+    expect(await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 7, contentRef,
+    }, contentSender(7, bareUrl))).toEqual({ candidates: [] });
+
+    vi.advanceTimersByTime(100);
+    await dispatchMessage(chrome, {
+      type: "X_PLAYER_ACTIVE", contentRef: mediaTwo, durationMs: 0,
+    }, contentSender(7, bareUrl));
+    expect(await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 7, contentRef: mediaTwo,
+    }, contentSender(7, bareUrl))).toEqual({ candidates: [expect.objectContaining({
+      url: candidateUrl,
+    })] });
+    expect(await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 7, contentRef,
+    }, contentSender(7, bareUrl))).toEqual({ candidates: [] });
+    vi.useRealTimers();
+  });
+
+  it("settles a pending bare-status request to its request-time player", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-05T00:00:00Z"));
+    const chrome = createChrome();
+    const bareUrl = `https://x.com/owner/status/${contentRef.sourceContentId}`;
+    installBackgroundHandlers(chrome as never);
+    await flushMicrotasks();
+    observeStatusRoute(chrome, 7, bareUrl);
+    await dispatchMessage(chrome, {
+      type: "X_PLAYER_ACTIVE", contentRef, durationMs: 0,
+    }, contentSender(7, bareUrl));
+
+    const candidateUrl = "https://video.twimg.com/path/single-player.mp4";
+    await capture(chrome, candidateUrl);
+    expect(await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 7, contentRef,
+    }, contentSender(7, bareUrl))).toEqual({ candidates: [] });
+
+    await vi.advanceTimersByTimeAsync(1_501);
+    expect(await dispatchMessage(chrome, {
+      type: "GET_MEDIA_CANDIDATES", tabId: 7, contentRef,
+    }, contentSender(7, bareUrl))).toEqual({ candidates: [expect.objectContaining({
+      url: candidateUrl,
+    })] });
     vi.useRealTimers();
   });
 

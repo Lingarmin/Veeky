@@ -1,6 +1,6 @@
+import { parseXStatusRoute } from "../shared/content";
 import type { ContentRef } from "../shared/types";
 
-const X_STATUS_PATH = /^\/[^/]+\/status\/([0-9]+)(?:\/video\/([1-9][0-9]*))?\/?$/;
 const ROUTE_POLL_MS = 250;
 
 export interface XPlayerTrackerOptions {
@@ -162,7 +162,7 @@ function pageRoute(pageWindow: Window): string {
 }
 
 function contentRefForVideo(video: HTMLVideoElement, pageUrl: string): ContentRef | null {
-  const route = parseXStatusRoute(pageUrl);
+  const route = parseXStatusRoute(pageUrl, "https://x.com");
   if (!route) return null;
   const scope = playerScope(video);
   if (!scope || owningStatusId(video, scope) !== route.sourceContentId) return null;
@@ -214,7 +214,10 @@ function owningStatusId(element: Element, scope: Element): string | null {
       ? container as HTMLAnchorElement
       : container.querySelector<HTMLAnchorElement>('a[href*="/status/"]');
     if (anchor) {
-      return parseXStatusRoute(anchor.getAttribute("href") ?? anchor.href)?.sourceContentId ?? null;
+      return parseXStatusRoute(
+        anchor.getAttribute("href") ?? anchor.href,
+        "https://x.com",
+      )?.sourceContentId ?? null;
     }
     if (container === scope) return null;
     container = container.parentElement;
@@ -229,38 +232,21 @@ function mediaIndexFromContainedLink(
 ): number | null {
   const containingAnchor = video.closest<HTMLAnchorElement>('a[href*="/status/"]');
   if (containingAnchor && scope.contains(containingAnchor)) {
-    const route = parseXStatusRoute(containingAnchor.getAttribute("href") ?? containingAnchor.href);
+    const route = parseXStatusRoute(
+      containingAnchor.getAttribute("href") ?? containingAnchor.href,
+      "https://x.com",
+    );
     if (route?.sourceContentId === statusId && route.mediaIndex) return route.mediaIndex;
   }
   if (!scope.matches('[role="dialog"]')) return null;
   for (const anchor of scope.querySelectorAll<HTMLAnchorElement>('a[href*="/status/"]')) {
-    const route = parseXStatusRoute(anchor.getAttribute("href") ?? anchor.href);
+    const route = parseXStatusRoute(
+      anchor.getAttribute("href") ?? anchor.href,
+      "https://x.com",
+    );
     if (route?.sourceContentId === statusId && route.mediaIndex) return route.mediaIndex;
   }
   return null;
-}
-
-function parseXStatusRoute(candidate: string): { sourceContentId: string; mediaIndex: number | null } | null {
-  let url: URL;
-  try {
-    url = new URL(candidate, "https://x.com");
-  } catch {
-    return null;
-  }
-  if (
-    url.protocol !== "https:"
-    || (url.hostname !== "x.com" && url.hostname !== "www.x.com")
-    || url.username
-    || url.password
-    || url.port
-  ) {
-    return null;
-  }
-  const match = X_STATUS_PATH.exec(url.pathname);
-  if (!match) return null;
-  const mediaIndex = match[2] ? Number(match[2]) : null;
-  if (mediaIndex !== null && (!Number.isSafeInteger(mediaIndex) || mediaIndex < 1)) return null;
-  return { sourceContentId: match[1], mediaIndex };
 }
 
 function playerDurationMs(video: HTMLVideoElement): number {

@@ -5,7 +5,7 @@ import type {
   ExtensionMessage,
   MediaCandidate,
 } from "./shared/types";
-import { contentKey, parseContentRef } from "./shared/content";
+import { contentKey, parseContentRef, parseXStatusRoute } from "./shared/content";
 
 const STORAGE_KEY = "analyzedTabs";
 const MEDIA_STORAGE_KEY = "xMediaCapture";
@@ -21,7 +21,6 @@ const MAX_RECENT_REQUESTS_PER_TAB = 12;
 const MAX_RECENT_REQUEST_URL_BYTES = 32_000;
 const MAX_TOTAL_RECENT_REQUESTS = 48;
 const MAX_TOTAL_RECENT_REQUEST_URL_BYTES = 64_000;
-const X_STATUS_PATH = /^\/[^/]+\/status\/([0-9]+)(?:\/video\/([1-9][0-9]*))?\/?$/;
 type AnalyzedTabs = Record<string, Record<string, AnalyzedTab>>;
 
 interface CaptureTabState {
@@ -48,6 +47,7 @@ interface XRouteEpoch {
 interface BufferedMediaCandidate extends MediaCandidate {
   routeEpoch: number;
   statusId: string;
+  fallbackContentRef: ContentRef | null;
 }
 
 interface BackgroundState {
@@ -80,10 +80,15 @@ export function installBackgroundHandlers(chromeApi: ChromeApi): void {
   const lastDetectedContentByTab = new Map<number, ContentRef>();
   const recentRequestsByTab = new Map<number, BufferedMediaCandidate[]>();
   const routeEpochByTab = new Map<number, XRouteEpoch>();
+  let captureQueue: Promise<void> = Promise.resolve();
+  const runCaptureTask = <T>(task: () => Promise<T>): Promise<T> => {
+    const result = captureQueue.then(task);
+    captureQueue = result.then(() => undefined, () => undefined);
+    return result;
+  };
   let recentRequestCleanupTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
   const rescheduleRecentRequestCleanup = () => {
     if (recentRequestCleanupTimer !== null) globalThis.clearTimeout(recentRequestCleanupTimer);
-    pruneRecentRequestMap(recentRequestsByTab, Date.now());
     const nextExpiry = nextRecentRequestExpiry(recentRequestsByTab);
     if (nextExpiry === null) {
       recentRequestCleanupTimer = null;
@@ -91,14 +96,24 @@ export function installBackgroundHandlers(chromeApi: ChromeApi): void {
     }
     recentRequestCleanupTimer = globalThis.setTimeout(() => {
       recentRequestCleanupTimer = null;
-      rescheduleRecentRequestCleanup();
+      void runCaptureTask(async () => {
+        const mediaState = await loadMediaCaptureState(chromeApi);
+        const settled = settleExpiredBufferedRequests(
+          recentRequestsByTab,
+          routeEpochByTab,
+          mediaState,
+          Date.now(),
+        );
+        if (settled) {
+          enforceAggregateCandidateLimits(mediaState);
+          await chromeApi.storage.session.set({ [MEDIA_STORAGE_KEY]: mediaState });
+          await scheduleMediaCleanupForState(chromeApi, mediaState);
+        }
+      }).then(rescheduleRecentRequestCleanup, (error) => {
+        reportBackgroundError(error);
+        rescheduleRecentRequestCleanup();
+      });
     }, Math.max(0, nextExpiry - Date.now()));
-  };
-  let captureQueue: Promise<void> = Promise.resolve();
-  const runCaptureTask = <T>(task: () => Promise<T>): Promise<T> => {
-    const result = captureQueue.then(task);
-    captureQueue = result.then(() => undefined, () => undefined);
-    return result;
   };
   const state: BackgroundState = {
     lastDetectedContentByTab,
@@ -185,6 +200,7 @@ export function installBackgroundHandlers(chromeApi: ChromeApi): void {
         details,
         recentRequestsByTab,
         requestRoute,
+        routeEpochByTab,
         rescheduleRecentRequestCleanup,
       )).catch(reportBackgroundError);
     },
@@ -242,6 +258,12 @@ async function handleMessage(
     );
     return state.runCaptureTask(async () => {
       const mediaState = await loadMediaCaptureState(chromeApi);
+      settleExpiredBufferedRequests(
+        state.recentRequestsByTab,
+        state.routeEpochByTab,
+        mediaState,
+        signalAt,
+      );
       const tabKey = String(tabId);
       const prior = mediaState[tabKey];
       const samePlayer = Boolean(
@@ -396,6 +418,7 @@ async function captureMediaCandidate(
   details: chrome.webRequest.WebRequestBodyDetails,
   recentRequestsByTab: Map<number, BufferedMediaCandidate[]>,
   requestRoute: XRouteEpoch | null,
+  routeEpochByTab: Map<number, XRouteEpoch>,
   rescheduleRecentRequestCleanup: () => void,
 ): Promise<void> {
   if (details.tabId < 0 || (details.type !== "media" && details.type !== "xmlhttprequest")) return;
@@ -403,20 +426,46 @@ async function captureMediaCandidate(
   if (!candidate) return;
 
   const state = await loadMediaCaptureState(chromeApi);
+  const settled = settleExpiredBufferedRequests(
+    recentRequestsByTab,
+    routeEpochByTab,
+    state,
+    Date.now(),
+  );
+  if (settled) {
+    enforceAggregateCandidateLimits(state);
+    await chromeApi.storage.session.set({ [MEDIA_STORAGE_KEY]: state });
+    await scheduleMediaCleanupForState(chromeApi, state);
+  }
   const tabState = state[String(details.tabId)];
   const now = Date.now();
+  if (
+    tabState?.active
+    && requestRoute?.statusId === tabState.active.contentRef.sourceContentId
+    && requestRoute.mediaIndex === null
+  ) {
+    if (!candidateIsWithinCaptureWindow(candidate, tabState.active)) return;
+    bufferRecentRequest(recentRequestsByTab, details.tabId, {
+      ...candidate,
+      routeEpoch: requestRoute.epoch,
+      statusId: requestRoute.statusId,
+      fallbackContentRef: tabState.active.contentRef,
+    });
+    rescheduleRecentRequestCleanup();
+    return;
+  }
   if (!tabState?.active || !routeMatchesContentRef(requestRoute, tabState.active.contentRef)) {
     if (!requestRoute?.statusId) return;
     bufferRecentRequest(recentRequestsByTab, details.tabId, {
       ...candidate,
       routeEpoch: requestRoute.epoch,
       statusId: requestRoute.statusId,
-    }, now);
+      fallbackContentRef: null,
+    });
     rescheduleRecentRequestCleanup();
     return;
   }
-  const windowOpenedAt = tabState.active.expiresAt - CAPTURE_WINDOW_MS;
-  if (candidate.capturedAt < windowOpenedAt || candidate.capturedAt > tabState.active.expiresAt) return;
+  if (!candidateIsWithinCaptureWindow(candidate, tabState.active)) return;
   const key = contentKey(tabState.active.contentRef);
   tabState.candidates[key] = mergeCandidates(tabState.candidates[key] ?? [], [candidate], now);
   enforceAggregateCandidateLimits(state);
@@ -438,10 +487,8 @@ function bufferRecentRequest(
   recentRequestsByTab: Map<number, BufferedMediaCandidate[]>,
   tabId: number,
   candidate: BufferedMediaCandidate,
-  now: number,
 ): void {
   const recent = (recentRequestsByTab.get(tabId) ?? [])
-    .filter((item) => now - item.capturedAt <= RECENT_REQUEST_MAX_AGE_MS)
     .filter((item) => item.url !== candidate.url);
   recent.push(candidate);
   while (
@@ -452,7 +499,6 @@ function bufferRecentRequest(
   }
   if (recent.length) recentRequestsByTab.set(tabId, recent);
   else recentRequestsByTab.delete(tabId);
-  pruneRecentRequestMap(recentRequestsByTab, now);
   enforceAggregateRecentRequestLimits(recentRequestsByTab);
 }
 
@@ -463,29 +509,83 @@ function claimRecentRequests(
   activeRoute: XRouteEpoch,
   contentRef: ContentRef,
 ): MediaCandidate[] {
-  pruneRecentRequestMap(recentRequestsByTab, signalAt);
-  const claimed = (recentRequestsByTab.get(tabId) ?? []).filter((candidate) => (
-    candidate.capturedAt <= signalAt
-    && signalAt - candidate.capturedAt <= RECENT_REQUEST_MAX_AGE_MS
-    && candidate.routeEpoch === activeRoute.epoch
-    && candidate.statusId === activeRoute.statusId
-    && candidate.statusId === contentRef.sourceContentId
-  ));
-  recentRequestsByTab.delete(tabId);
-  return claimed.map(({ routeEpoch: _routeEpoch, statusId: _statusId, ...candidate }) => candidate);
+  const claimed: MediaCandidate[] = [];
+  const remaining: BufferedMediaCandidate[] = [];
+  for (const candidate of recentRequestsByTab.get(tabId) ?? []) {
+    const matchesRoute = candidate.routeEpoch === activeRoute.epoch
+      && candidate.statusId === activeRoute.statusId
+      && candidate.statusId === contentRef.sourceContentId;
+    const withinClaimWindow = candidate.capturedAt <= signalAt
+      && signalAt - candidate.capturedAt <= RECENT_REQUEST_MAX_AGE_MS;
+    const switchedPlayer = candidate.fallbackContentRef === null
+      || !sameContentRef(candidate.fallbackContentRef, contentRef);
+    if (matchesRoute && withinClaimWindow && switchedPlayer) {
+      claimed.push(mediaCandidateFromBuffered(candidate));
+    } else if (matchesRoute && withinClaimWindow) {
+      remaining.push(candidate);
+    }
+  }
+  if (remaining.length) recentRequestsByTab.set(tabId, remaining);
+  else recentRequestsByTab.delete(tabId);
+  return claimed;
 }
 
-function pruneRecentRequestMap(
+function settleExpiredBufferedRequests(
   recentRequestsByTab: Map<number, BufferedMediaCandidate[]>,
+  routeEpochByTab: Map<number, XRouteEpoch>,
+  mediaState: MediaCaptureState,
   now: number,
-): void {
+): boolean {
+  let settled = false;
   for (const [tabId, candidates] of recentRequestsByTab) {
-    const recent = candidates.filter((candidate) => (
-      now - candidate.capturedAt <= RECENT_REQUEST_MAX_AGE_MS
-    ));
-    if (recent.length) recentRequestsByTab.set(tabId, recent);
+    const remaining: BufferedMediaCandidate[] = [];
+    const currentRoute = routeEpochByTab.get(tabId);
+    for (const candidate of candidates) {
+      if (now - candidate.capturedAt <= RECENT_REQUEST_MAX_AGE_MS) {
+        remaining.push(candidate);
+        continue;
+      }
+      if (
+        candidate.fallbackContentRef === null
+        || currentRoute?.epoch !== candidate.routeEpoch
+        || currentRoute.statusId !== candidate.statusId
+        || candidate.fallbackContentRef.sourceContentId !== candidate.statusId
+      ) {
+        continue;
+      }
+      const tabKey = String(tabId);
+      const tabState = mediaState[tabKey] ?? { active: null, candidates: {} };
+      const key = contentKey(candidate.fallbackContentRef);
+      tabState.candidates[key] = mergeCandidates(
+        tabState.candidates[key] ?? [],
+        [mediaCandidateFromBuffered(candidate)],
+        now,
+      );
+      mediaState[tabKey] = tabState;
+      settled = true;
+    }
+    if (remaining.length) recentRequestsByTab.set(tabId, remaining);
     else recentRequestsByTab.delete(tabId);
   }
+  return settled;
+}
+
+function mediaCandidateFromBuffered(candidate: BufferedMediaCandidate): MediaCandidate {
+  const {
+    routeEpoch: _routeEpoch,
+    statusId: _statusId,
+    fallbackContentRef: _fallbackContentRef,
+    ...mediaCandidate
+  } = candidate;
+  return mediaCandidate;
+}
+
+function candidateIsWithinCaptureWindow(
+  candidate: MediaCandidate,
+  active: NonNullable<CaptureTabState["active"]>,
+): boolean {
+  const windowOpenedAt = active.expiresAt - CAPTURE_WINDOW_MS;
+  return candidate.capturedAt >= windowOpenedAt && candidate.capturedAt <= active.expiresAt;
 }
 
 function nextRecentRequestExpiry(
@@ -633,23 +733,12 @@ function senderIsXPage(sender: chrome.runtime.MessageSender): boolean {
 }
 
 function xUrlMatchesRef(candidate: string | undefined, contentRef: ContentRef): boolean {
-  if (!candidate) return false;
-  let url: URL;
-  try {
-    url = new URL(candidate);
-  } catch {
-    return false;
-  }
-  if (
-    url.protocol !== "https:"
-    || (url.hostname !== "x.com" && url.hostname !== "www.x.com")
-    || url.username
-    || url.password
-    || url.port
-  ) return false;
-  const match = X_STATUS_PATH.exec(url.pathname);
-  if (!match || match[1] !== contentRef.sourceContentId) return false;
-  return !match[2] || Number(match[2]) === contentRef.mediaIndex;
+  const route = parseXStatusRoute(candidate);
+  return Boolean(
+    route
+    && route.sourceContentId === contentRef.sourceContentId
+    && (route.mediaIndex === null || route.mediaIndex === contentRef.mediaIndex),
+  );
 }
 
 function activeContentMatchesUrl(contentRef: ContentRef | undefined, url: string | undefined): boolean {
@@ -682,32 +771,6 @@ function routeMatchesContentRef(route: XRouteEpoch | null, contentRef: ContentRe
     route?.statusId === contentRef.sourceContentId
     && (route.mediaIndex === null || route.mediaIndex === contentRef.mediaIndex),
   );
-}
-
-function parseXStatusRoute(candidate: string | undefined): {
-  sourceContentId: string;
-  mediaIndex: number | null;
-} | null {
-  if (!candidate) return null;
-  let url: URL;
-  try {
-    url = new URL(candidate);
-  } catch {
-    return null;
-  }
-  if (
-    url.protocol !== "https:"
-    || (url.hostname !== "x.com" && url.hostname !== "www.x.com")
-    || url.username
-    || url.password
-    || url.port
-  ) return null;
-  const match = X_STATUS_PATH.exec(url.pathname);
-  if (!match) return null;
-  return {
-    sourceContentId: match[1],
-    mediaIndex: match[2] ? Number(match[2]) : null,
-  };
 }
 
 function isSupportedPanelUrl(candidate: string | undefined): boolean {
