@@ -1,5 +1,14 @@
 FROM libretranslate/libretranslate:v1.6.5
 
+USER root
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && install -d -o 1032 -g 65534 /models/whisper /var/lib/veeky/media
+
+USER libretranslate
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \

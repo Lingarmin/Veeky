@@ -10,6 +10,10 @@ services:
       DATABASE_URL: postgresql+asyncpg://youtube_preview:${POSTGRES_PASSWORD:-youtube_preview}@postgresql:5432/youtube_preview
       REDIS_URL: redis://redis:6379/0
       LIBRETRANSLATE_URL: http://libretranslate:5000
+      ASR_MODEL_SIZE: ${ASR_MODEL_SIZE:-small}
+      ASR_DEVICE: ${ASR_DEVICE:-cpu}
+      ASR_COMPUTE_TYPE: ${ASR_COMPUTE_TYPE:-int8}
+      ASR_MODEL_DIR: ${ASR_MODEL_DIR:-/models/whisper}
     command: ["/bin/sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"]
     ports:
       - "127.0.0.1:8000:8000"
@@ -24,6 +28,9 @@ services:
       timeout: 5s
       retries: 6
       start_period: 15s
+    volumes:
+      - whisper_models:/models/whisper:ro
+      - media_temp:/var/lib/veeky/media
     restart: unless-stopped
 
   worker:
@@ -37,6 +44,10 @@ services:
       DATABASE_URL: postgresql+asyncpg://youtube_preview:${POSTGRES_PASSWORD:-youtube_preview}@postgresql:5432/youtube_preview
       REDIS_URL: redis://redis:6379/0
       LIBRETRANSLATE_URL: http://libretranslate:5000
+      ASR_MODEL_SIZE: ${ASR_MODEL_SIZE:-small}
+      ASR_DEVICE: ${ASR_DEVICE:-cpu}
+      ASR_COMPUTE_TYPE: ${ASR_COMPUTE_TYPE:-int8}
+      ASR_MODEL_DIR: ${ASR_MODEL_DIR:-/models/whisper}
     hostname: worker
     command: ["celery", "-A", "app.workers.tasks.celery_app", "worker", "--loglevel=INFO", "--concurrency=1"]
     depends_on:
@@ -48,6 +59,9 @@ services:
       timeout: 10s
       retries: 4
       start_period: 25s
+    volumes:
+      - whisper_models:/models/whisper
+      - media_temp:/var/lib/veeky/media
     restart: unless-stopped
 
   scheduler:
@@ -106,5 +120,7 @@ services:
     restart: unless-stopped
 
 volumes:
+  media_temp:
   postgresql_data:
   redis_data:
+  whisper_models:
