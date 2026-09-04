@@ -19,7 +19,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.settings import Settings
-from app.db.models import Installation, MediaUploadPart, MediaUploadSession, Video
+from app.db.models import (
+    AnalysisJob,
+    Installation,
+    MediaUploadPart,
+    MediaUploadSession,
+    Video,
+)
 
 
 MEDIA_SESSION_STATES = {
@@ -439,6 +445,43 @@ async def delete_upload(
     if locked is None:
         raise _error(404, "media_session_not_found", "media session was not found")
     await _expire_locked(database, settings, locked)
+
+
+async def expire_complete_upload_if_unreferenced(
+    database: AsyncSession,
+    settings: Settings,
+    *,
+    session_id: str,
+    installation_id: str,
+    content_id: str,
+    excluding_job_id: str,
+) -> bool:
+    await _restart_write_transaction(database)
+    upload = await database.scalar(
+        select(MediaUploadSession)
+        .options(selectinload(MediaUploadSession.parts))
+        .where(
+            MediaUploadSession.id == session_id,
+            MediaUploadSession.installation_id == installation_id,
+            MediaUploadSession.content_id == content_id,
+            MediaUploadSession.status == "complete",
+        )
+        .with_for_update()
+    )
+    if upload is None:
+        await database.rollback()
+        return False
+    other_job_id = await database.scalar(
+        select(AnalysisJob.id).where(
+            AnalysisJob.id != excluding_job_id,
+            AnalysisJob.media_session_id == session_id,
+        )
+    )
+    if other_job_id is not None:
+        await database.rollback()
+        return False
+    await _expire_locked(database, settings, upload)
+    return True
 
 
 async def cleanup_expired_uploads(

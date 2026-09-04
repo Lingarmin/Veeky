@@ -211,6 +211,7 @@ async def complete_media_session(
                 )
                 if job is not None:
                     job.status = "waiting_for_media"
+                    job.media_session_id = None
                     await database.commit()
     except MediaUploadError as error:
         raise _http_error(error) from error

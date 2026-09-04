@@ -17,8 +17,10 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import BigInteger, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+import app.workers.tasks as worker_tasks
 from app.core.settings import Settings
 from app.db.models import (
+    AnalysisJob,
     Base,
     Installation,
     MediaUploadPart,
@@ -336,6 +338,64 @@ async def test_mp4_upload_lifecycle_is_resumable_and_completes_in_order(media_co
         artifact = media_root / upload.directory_key / "media.mp4"
         assert artifact.read_bytes() == first + second
         assert list(artifact.parent.glob("part-*.bin")) == []
+
+
+@pytest.mark.asyncio
+async def test_complete_upload_retries_dispatch_after_the_first_attempt_fails(
+    media_context, monkeypatch
+):
+    client, _, factory, _ = media_context
+    created = await create_session(client, expected_bytes=5, part_count=1)
+    session_id = created.json()["sessionId"]
+    await upload_part(client, session_id, 0, b"media")
+    async with factory() as session:
+        video = await session.scalar(select(Video).where(Video.content_id == CONTENT_ID))
+        job = AnalysisJob(
+            id="waiting-job",
+            installation_id=INSTALLATION_ID,
+            video_id=video.video_id,
+            content_id=video.content_id,
+            source_language="auto",
+            target_language="zh-Hans",
+            transcript_version="pending:waiting-job",
+            cache_key=f"pending:{INSTALLATION_ID}:waiting-job",
+            status="waiting_for_media",
+        )
+        session.add(job)
+        await session.commit()
+
+    attempts = []
+    successful_dispatches = []
+
+    def dispatch(job_id, *, resume):
+        attempts.append((job_id, resume))
+        if len(attempts) == 1:
+            raise ConnectionError("redis unavailable")
+        successful_dispatches.append(job_id)
+
+    monkeypatch.setattr(worker_tasks.analyze_video, "delay", dispatch)
+    payload = {"partCount": 1, "totalBytes": 5}
+
+    first = await client.post(f"/v1/media-sessions/{session_id}/complete", json=payload)
+    assert first.status_code == 200
+    async with factory() as session:
+        job = await session.get(AnalysisJob, "waiting-job")
+        upload = await session.get(MediaUploadSession, session_id)
+        assert job.status == "waiting_for_media"
+        assert job.media_session_id is None
+        assert upload.status == "complete"
+
+    second = await client.post(f"/v1/media-sessions/{session_id}/complete", json=payload)
+
+    assert second.status_code == 200
+    assert attempts == [("waiting-job", True), ("waiting-job", True)]
+    assert successful_dispatches == ["waiting-job"]
+    async with factory() as session:
+        job = await session.get(AnalysisJob, "waiting-job")
+        upload = await session.get(MediaUploadSession, session_id)
+        assert job.status == "queued"
+        assert job.media_session_id == session_id
+        assert upload.status == "complete"
 
 
 @pytest.mark.asyncio

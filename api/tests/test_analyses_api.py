@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.api.analyses import (
+    LlmConfigRequest,
     WorkerUnavailableError,
     dispatch_analysis_job,
     get_job_dispatcher,
@@ -23,6 +24,7 @@ from app.api.analyses import (
     get_source_registry,
     get_transcript_service,
     get_video_metadata_service,
+    _llm_snapshot,
 )
 from app.core.settings import Settings
 from app.db.models import (
@@ -165,6 +167,40 @@ OTHER_AUTH_HEADERS = {
     "Authorization": f"Bearer {OTHER_INSTALLATION_TOKEN}",
     "X-Veeky-Installation-Id": OTHER_INSTALLATION_ID,
 }
+
+
+def test_llm_snapshot_normalizes_cache_identity_without_storing_the_key():
+    first = _llm_snapshot(
+        LlmConfigRequest.model_validate(
+            {
+                "provider": " KIMI ",
+                "apiUrl": "https://api.example.com/v1/",
+                "apiKey": "first-secret",
+            }
+        ),
+        "analysis-schema-v1|prompt-v1|pipeline-v1",
+    )
+    same = _llm_snapshot(
+        LlmConfigRequest.model_validate(
+            {
+                "provider": "kimi",
+                "apiUrl": "https://api.example.com/v1/chat/completions",
+                "apiKey": "second-secret",
+                "model": "kimi-k2.5",
+            }
+        ),
+        "analysis-schema-v1|prompt-v1|pipeline-v1",
+    )
+
+    assert first == same
+    assert first == {
+        "provider": "kimi",
+        "api_url": "https://api.example.com/v1/chat/completions",
+        "model": "kimi-k2.5",
+        "pipeline_revision": "analysis-schema-v1|prompt-v1|pipeline-v1",
+    }
+    assert "api_key" not in first
+    assert "first-secret" not in repr(first)
 
 
 @pytest.fixture

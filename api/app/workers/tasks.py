@@ -39,7 +39,12 @@ from app.services.analysis import (
     StructuredAnalysisService,
     LlmAnalysisProvider,
 )
-from app.services.llm import build_llm_client
+from app.services.llm import (
+    build_llm_client,
+    normalize_chat_completions_url,
+    normalize_provider_config,
+)
+from app.services.media_upload import expire_complete_upload_if_unreferenced
 from app.services.transcripts import TranscriptService, transcript_version
 from app.services.video_metadata import VideoMetadataService
 from app.sources.base import ContentRef, SourceRegistry
@@ -78,7 +83,7 @@ class FFmpegAudioExtractor:
         self.max_bytes = max_bytes
         self.runner = runner or self._run_subprocess
 
-    async def probe_duration_ms(self, media_path: Path) -> int:
+    async def probe_duration_ms(self, media_path: Path) -> float:
         self._validate_path(media_path)
         process = await self.runner(
             "ffprobe",
@@ -100,7 +105,7 @@ class FFmpegAudioExtractor:
             ) from None
         if not math.isfinite(duration) or duration < 0:
             raise AudioExtractionError("media_probe_failed", "无法读取媒体时长")
-        return round(duration * 1000)
+        return duration * 1000
 
     async def extract(self, media_path: Path, audio_path: Path) -> Path:
         self._validate_path(media_path)
@@ -290,7 +295,12 @@ class AnalysisPipeline:
         try:
             if self._uses_default_providers:
                 if not self._credential_is_current(job):
-                    await self._fail(job_id, "llm_credentials_expired", None)
+                    await self._fail(
+                        job_id,
+                        "llm_credentials_expired",
+                        None,
+                        expire_complete_upload=True,
+                    )
                     return
                 assert self.credential_cipher is not None
                 try:
@@ -298,7 +308,12 @@ class AnalysisPipeline:
                         job.id, job.llm_credential_ciphertext
                     )
                 except (ValueError, binascii.Error, InvalidTag, UnicodeDecodeError):
-                    await self._fail(job_id, "llm_credentials_expired", None)
+                    await self._fail(
+                        job_id,
+                        "llm_credentials_expired",
+                        None,
+                        expire_complete_upload=True,
+                    )
                     return
                 provider_config = dict(job.llm_config or {})
                 provider_config["api_key"] = api_key
@@ -498,9 +513,10 @@ class AnalysisPipeline:
             timeout_seconds=self.settings.asr_job_timeout_seconds,
             max_bytes=max_audio_bytes,
         )
-        duration_ms = await extractor.probe_duration_ms(media_path)
-        if duration_ms > self.settings.max_video_duration_seconds * 1000:
+        exact_duration_ms = await extractor.probe_duration_ms(media_path)
+        if exact_duration_ms > self.settings.max_video_duration_seconds * 1000:
             raise AudioExtractionError("video_too_long", "视频时长不能超过 4 小时")
+        duration_ms = round(exact_duration_ms)
         job.video.duration_ms = duration_ms
         await self._set_status(job.id, "extracting_audio")
         audio_path = await extractor.extract(media_path, job_dir / "audio.wav")
@@ -520,6 +536,7 @@ class AnalysisPipeline:
         )
         async with self.session_factory() as session:
             current = await session.get(AnalysisJob, job.id)
+            llm_cache_fingerprint = self._x_llm_cache_fingerprint(current.llm_config)
             final_cache_key = ":".join(
                 (
                     current.installation_id,
@@ -527,22 +544,35 @@ class AnalysisPipeline:
                     language,
                     current.target_language,
                     version,
+                    llm_cache_fingerprint or f"uncacheable-{current.id}",
                 )
             )
             cached = None
-            if not current.force_run:
-                cached = await session.scalar(
-                    select(AnalysisJob)
-                    .options(selectinload(AnalysisJob.result))
-                    .where(
-                        AnalysisJob.id != current.id,
-                        AnalysisJob.installation_id == current.installation_id,
-                        AnalysisJob.content_id == current.content_id,
-                        AnalysisJob.source_language == language,
-                        AnalysisJob.target_language == current.target_language,
-                        AnalysisJob.transcript_version == version,
-                        AnalysisJob.status == "completed",
+            if not current.force_run and llm_cache_fingerprint is not None:
+                candidates = list(
+                    await session.scalars(
+                        select(AnalysisJob)
+                        .options(selectinload(AnalysisJob.result))
+                        .where(
+                            AnalysisJob.id != current.id,
+                            AnalysisJob.installation_id == current.installation_id,
+                            AnalysisJob.content_id == current.content_id,
+                            AnalysisJob.source_language == language,
+                            AnalysisJob.target_language == current.target_language,
+                            AnalysisJob.transcript_version == version,
+                            AnalysisJob.status == "completed",
+                        )
                     )
+                )
+                cached = next(
+                    (
+                        candidate
+                        for candidate in candidates
+                        if candidate.result is not None
+                        and self._x_llm_cache_fingerprint(candidate.llm_config)
+                        == llm_cache_fingerprint
+                    ),
+                    None,
                 )
             if cached is not None and cached.result is not None:
                 current.source_language = language
@@ -714,6 +744,33 @@ class AnalysisPipeline:
             + hashlib.sha256(body.encode()).hexdigest()[:16]
         )
 
+    @staticmethod
+    def _x_llm_cache_fingerprint(config: dict[str, str] | None) -> str | None:
+        if not config or not config.get("pipeline_revision"):
+            return None
+        try:
+            normalized = normalize_provider_config(
+                config.get("provider"),
+                config["api_url"],
+                "unused",
+                config.get("model"),
+            )
+            endpoint = normalize_chat_completions_url(normalized.api_url)
+        except (KeyError, ValueError):
+            return None
+        endpoint_fingerprint = hashlib.sha256(endpoint.encode()).hexdigest()
+        identity = json.dumps(
+            {
+                "provider": normalized.provider,
+                "model": normalized.model,
+                "api_endpoint_fingerprint": endpoint_fingerprint,
+                "pipeline_revision": config["pipeline_revision"],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(identity.encode()).hexdigest()
+
     async def _claim(self, job_id: str, *, resume: bool) -> AnalysisJob | None:
         async with self.session_factory() as session:
             job = await session.scalar(
@@ -779,7 +836,12 @@ class AnalysisPipeline:
         return track
 
     async def _fail(
-        self, job_id: str, failure_code: str, failure_detail: str | None
+        self,
+        job_id: str,
+        failure_code: str,
+        failure_detail: str | None,
+        *,
+        expire_complete_upload: bool = False,
     ) -> None:
         async with self.session_factory() as session:
             job = await session.get(AnalysisJob, job_id)
@@ -791,7 +853,23 @@ class AnalysisPipeline:
             job.completed_at = datetime.now(timezone.utc)
             self._clear_credential(job)
             await session.commit()
+        if expire_complete_upload:
+            await self._expire_complete_upload(job_id)
         await self._cleanup_consumed_upload(job_id)
+
+    async def _expire_complete_upload(self, job_id: str) -> None:
+        async with self.session_factory() as session:
+            job = await session.get(AnalysisJob, job_id)
+            if job is None or not job.media_session_id:
+                return
+            await expire_complete_upload_if_unreferenced(
+                session,
+                self.settings,
+                session_id=job.media_session_id,
+                installation_id=job.installation_id,
+                content_id=job.content_id,
+                excluding_job_id=job.id,
+            )
 
     def _credential_is_current(self, job: AnalysisJob) -> bool:
         if (

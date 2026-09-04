@@ -639,7 +639,7 @@ async def create_analysis(
             target_language=request.target_language,
             transcript_version=version,
             cache_key=cache_key,
-            llm_config=_llm_snapshot(request.llm_config),
+            llm_config=_llm_snapshot(request.llm_config, pipeline_revision),
             force_run=request.force,
         )
         if ref.platform == "x" and request.media_url:
@@ -649,13 +649,15 @@ async def create_analysis(
             )
         if ref.platform == "x" and request.media_session_id:
             upload = await session.scalar(
-                select(MediaUploadSession).where(
+                select(MediaUploadSession)
+                .where(
                     MediaUploadSession.id == request.media_session_id,
                     MediaUploadSession.installation_id == installation_id,
                     MediaUploadSession.content_id == video.content_id,
                     MediaUploadSession.status == "complete",
                     MediaUploadSession.expires_at > datetime.now(timezone.utc),
                 )
+                .with_for_update()
             )
             if upload is None:
                 raise _api_error(
@@ -676,7 +678,7 @@ async def create_analysis(
         job.failure_detail = None
         job.completed_at = None
         job.transcript_version = version
-        job.llm_config = _llm_snapshot(request.llm_config)
+        job.llm_config = _llm_snapshot(request.llm_config, pipeline_revision)
         _store_llm_credential(
             job,
             request.llm_config,
@@ -1129,14 +1131,17 @@ def _validate_llm_config(config: LlmConfigRequest | None) -> None:
         raise _api_error(422, "llm_config_invalid", str(error)) from error
 
 
-def _llm_snapshot(config: LlmConfigRequest) -> dict[str, str]:
+def _llm_snapshot(
+    config: LlmConfigRequest, pipeline_revision: str
+) -> dict[str, str]:
     normalized = normalize_provider_config(
         config.provider, config.api_url, config.api_key, config.model
     )
     return {
         "provider": normalized.provider,
-        "api_url": normalized.api_url,
+        "api_url": normalize_chat_completions_url(normalized.api_url),
         "model": normalized.model,
+        "pipeline_revision": pipeline_revision,
     }
 
 

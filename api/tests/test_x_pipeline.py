@@ -34,6 +34,7 @@ import app.api.analyses as analyses_api
 
 KEY = base64.b64encode(b"x" * 32).decode("ascii")
 INSTALLATION_ID = "11111111-1111-4111-8111-111111111111"
+OTHER_INSTALLATION_ID = "44444444-4444-4444-8444-444444444444"
 
 
 class FakeDownloader:
@@ -48,7 +49,7 @@ class FakeDownloader:
 
 
 class FakeAudioExtractor:
-    def __init__(self, *, duration_ms: int = 2000, error: Exception | None = None):
+    def __init__(self, *, duration_ms: float = 2000, error: Exception | None = None):
         self.duration_ms = duration_ms
         self.error = error
 
@@ -148,7 +149,12 @@ async def x_context(tmp_path):
             target_language="zh-Hans",
             transcript_version="pending:job-x",
             cache_key=f"pending:{INSTALLATION_ID}:job-x",
-            llm_config={"provider": "kimi"},
+            llm_config={
+                "provider": "kimi",
+                "api_url": "https://api.example.com/v1/chat/completions",
+                "model": "kimi-k2.5",
+                "pipeline_revision": "pipeline-v1|prompt-v1|schema-v1",
+            },
             llm_credential_ciphertext=cipher.encrypt("job-x", "llm-secret"),
             llm_credential_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
             media_url_ciphertext=cipher.encrypt(
@@ -239,7 +245,11 @@ async def test_x_direct_media_runs_all_stages_and_persists_asr_identity(x_contex
         assert job.status == "completed"
         assert job.source_language == "en"
         assert job.transcript_version == track.transcript_version
-        assert job.cache_key.endswith(track.transcript_version)
+        assert job.cache_key.startswith(
+            f"{INSTALLATION_ID}:{job.content_id}:en:zh-Hans:{track.transcript_version}:"
+        )
+        assert "api.example.com" not in job.cache_key
+        assert "pipeline-v1" not in job.cache_key
         assert track.transcript_source == "faster_whisper"
         assert track.asr_model == "small"
         assert [s.text for s in track.segments] == ["Hello", "world"]
@@ -386,7 +396,7 @@ async def test_matching_final_x_transcript_reuses_result_without_llm_calls(x_con
             target_language=first.target_language,
             transcript_version="pending:job-x-2",
             cache_key=f"pending:{INSTALLATION_ID}:job-x-2",
-            llm_config={"provider": "kimi"},
+            llm_config=dict(first.llm_config),
             llm_credential_ciphertext=cipher.encrypt("job-x-2", "secret"),
             llm_credential_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
             media_url_ciphertext=cipher.encrypt(
@@ -425,6 +435,62 @@ async def test_matching_final_x_transcript_reuses_result_without_llm_calls(x_con
         )
         assert second.status == "completed"
         assert second.result.one_line_summary == "Summary"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [
+        ("provider", "deepseek"),
+        ("model", "kimi-k2.5-next"),
+        ("api_url", "https://gateway.example.com/v1/chat/completions"),
+        ("pipeline_revision", "pipeline-v1|prompt-v2|schema-v1"),
+    ],
+)
+async def test_x_final_cache_does_not_reuse_changed_llm_or_pipeline_configuration(
+    x_context, changed_field, changed_value
+):
+    factory, cipher, _, _ = x_context
+    await make_pipeline(x_context).run("job-x")
+    async with factory() as session:
+        first = await session.get(AnalysisJob, "job-x")
+        changed_config = dict(first.llm_config)
+        changed_config[changed_field] = changed_value
+        second = AnalysisJob(
+            id="job-x-2",
+            installation_id=first.installation_id,
+            video_id=first.video_id,
+            content_id=first.content_id,
+            source_language="auto",
+            target_language=first.target_language,
+            transcript_version="pending:job-x-2",
+            cache_key=f"pending:{INSTALLATION_ID}:job-x-2",
+            llm_config=changed_config,
+            llm_credential_ciphertext=cipher.encrypt("job-x-2", "secret"),
+            llm_credential_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            media_url_ciphertext=cipher.encrypt(
+                "job-x-2", "https://video.twimg.com/file.mp4?token=new"
+            ),
+        )
+        session.add(second)
+        await session.commit()
+
+    analysis = FakeAnalysis()
+    analysis.calls = 0
+    original_analyze = analysis.analyze
+
+    async def count_analysis(*args, **kwargs):
+        analysis.calls += 1
+        return await original_analyze(*args, **kwargs)
+
+    analysis.analyze = count_analysis
+    await make_pipeline(x_context, analysis=analysis).run("job-x-2")
+
+    async with factory() as session:
+        second = await session.get(AnalysisJob, "job-x-2")
+        assert second.status == "completed"
+        assert second.cache_key != first.cache_key
+    assert analysis.calls == 1
 
 
 async def _status(factory) -> str:
@@ -514,6 +580,33 @@ async def test_ffmpeg_extractor_probes_exact_four_hours_and_extracts_pcm(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_ffmpeg_extractor_preserves_sub_millisecond_duration_precision(tmp_path):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    media_path = media_root / "input.mp4"
+    media_path.write_bytes(b"media")
+
+    async def runner(*arguments):
+        return type(
+            "Result",
+            (),
+            {
+                "returncode": 0,
+                "stdout": '{"format":{"duration":"14400.0004"}}',
+                "stderr": "",
+            },
+        )()
+
+    extractor = FFmpegAudioExtractor(
+        str(media_root), timeout_seconds=10, max_bytes=100, runner=runner
+    )
+
+    assert await extractor.probe_duration_ms(media_path) == pytest.approx(
+        14_400_000.4, rel=0, abs=1e-6
+    )
+
+
+@pytest.mark.asyncio
 async def test_ffmpeg_extractor_maps_missing_audio_without_leaking_paths(tmp_path):
     media_root = tmp_path / "media"
     media_root.mkdir()
@@ -546,7 +639,7 @@ async def test_ffmpeg_extractor_maps_missing_audio_without_leaking_paths(tmp_pat
     ("duration_ms", "expected_status", "expected_code"),
     [
         (14_400_000, "completed", None),
-        (14_400_001, "failed", "video_too_long"),
+        (14_400_000.4, "failed", "video_too_long"),
     ],
 )
 async def test_x_pipeline_uses_authoritative_four_hour_boundary(
@@ -561,6 +654,180 @@ async def test_x_pipeline_uses_authoritative_four_hour_boundary(
         job = await session.get(AnalysisJob, "job-x")
         assert job.status == expected_status
         assert job.failure_code == expected_code
+
+
+@pytest.mark.asyncio
+async def test_expired_credentials_expire_only_the_attached_complete_upload(x_context):
+    factory, _, _, media_root = x_context
+    owned_key = "22222222-2222-4222-8222-222222222222"
+    unrelated_key = "33333333-3333-4333-8333-333333333333"
+    other_owner_key = "44444444-4444-4444-8444-444444444444"
+    other_content_key = "55555555-5555-4555-8555-555555555555"
+    for directory_key in (
+        owned_key,
+        unrelated_key,
+        other_owner_key,
+        other_content_key,
+    ):
+        directory = media_root / directory_key
+        directory.mkdir()
+        (directory / "media.mp4").write_bytes(b"media")
+
+    async with factory() as session:
+        job = await session.get(AnalysisJob, "job-x")
+        job.media_url_ciphertext = None
+        job.llm_credential_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        owned = MediaUploadSession(
+            id="owned-upload",
+            installation_id=job.installation_id,
+            content_id=job.content_id,
+            status="complete",
+            expected_bytes=5,
+            received_bytes=5,
+            media_kind="mp4",
+            part_count=1,
+            part_size_bytes=5,
+            directory_key=owned_key,
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        unrelated = MediaUploadSession(
+            id="unrelated-upload",
+            installation_id=job.installation_id,
+            content_id=job.content_id,
+            status="complete",
+            expected_bytes=5,
+            received_bytes=5,
+            media_kind="mp4",
+            part_count=1,
+            part_size_bytes=5,
+            directory_key=unrelated_key,
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        other_owner = MediaUploadSession(
+            id="other-owner-upload",
+            installation_id=OTHER_INSTALLATION_ID,
+            content_id=job.content_id,
+            status="complete",
+            expected_bytes=5,
+            received_bytes=5,
+            media_kind="mp4",
+            part_count=1,
+            part_size_bytes=5,
+            directory_key=other_owner_key,
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        other_video = Video(
+            video_id="x:2075545587093807111:2",
+            content_id="66666666-6666-4666-8666-666666666666",
+            platform="x",
+            source_content_id="2075545587093807111",
+            media_index=2,
+            title="Other X fixture",
+            duration_ms=1,
+            source_url="https://x.com/i/status/2075545587093807111/video/2",
+        )
+        other_content = MediaUploadSession(
+            id="other-content-upload",
+            installation_id=job.installation_id,
+            content_id=other_video.content_id,
+            status="complete",
+            expected_bytes=5,
+            received_bytes=5,
+            media_kind="mp4",
+            part_count=1,
+            part_size_bytes=5,
+            directory_key=other_content_key,
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        job.media_session_id = owned.id
+        session.add_all(
+            [
+                Installation(id=OTHER_INSTALLATION_ID, token_hash="b" * 64),
+                other_video,
+                owned,
+                unrelated,
+                other_owner,
+                other_content,
+            ]
+        )
+        await session.commit()
+
+    pipeline = make_pipeline(x_context)
+    pipeline._uses_default_providers = True
+    await pipeline.run("job-x")
+
+    async with factory() as session:
+        job = await session.get(AnalysisJob, "job-x")
+        owned = await session.get(MediaUploadSession, "owned-upload")
+        unrelated = await session.get(MediaUploadSession, "unrelated-upload")
+        other_owner = await session.get(MediaUploadSession, "other-owner-upload")
+        other_content = await session.get(MediaUploadSession, "other-content-upload")
+        assert job.status == "failed"
+        assert job.failure_code == "llm_credentials_expired"
+        assert owned.status == "expired"
+        assert owned.received_bytes == 0
+        assert unrelated.status == "complete"
+        assert other_owner.status == "complete"
+        assert other_content.status == "complete"
+    assert not (media_root / owned_key).exists()
+    assert (media_root / unrelated_key / "media.mp4").is_file()
+    assert (media_root / other_owner_key / "media.mp4").is_file()
+    assert (media_root / other_content_key / "media.mp4").is_file()
+
+
+@pytest.mark.asyncio
+async def test_expired_credentials_preserve_an_upload_referenced_by_another_job(
+    x_context,
+):
+    factory, _, _, media_root = x_context
+    directory_key = "77777777-7777-4777-8777-777777777777"
+    upload_dir = media_root / directory_key
+    upload_dir.mkdir()
+    (upload_dir / "media.mp4").write_bytes(b"media")
+
+    async with factory() as session:
+        job = await session.get(AnalysisJob, "job-x")
+        job.media_url_ciphertext = None
+        job.llm_credential_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        upload = MediaUploadSession(
+            id="shared-upload",
+            installation_id=job.installation_id,
+            content_id=job.content_id,
+            status="complete",
+            expected_bytes=5,
+            received_bytes=5,
+            media_kind="mp4",
+            part_count=1,
+            part_size_bytes=5,
+            directory_key=directory_key,
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        job.media_session_id = upload.id
+        shared_job = AnalysisJob(
+            id="shared-job",
+            installation_id=job.installation_id,
+            video_id=job.video_id,
+            content_id=job.content_id,
+            source_language="auto",
+            target_language="zh-Hans",
+            transcript_version="pending:shared-job",
+            cache_key=f"pending:{INSTALLATION_ID}:shared-job",
+            media_session_id=upload.id,
+            status="completed",
+            completed_at=datetime.now(timezone.utc),
+        )
+        session.add_all([upload, shared_job])
+        await session.commit()
+
+    pipeline = make_pipeline(x_context)
+    pipeline._uses_default_providers = True
+    await pipeline.run("job-x")
+
+    async with factory() as session:
+        upload = await session.get(MediaUploadSession, "shared-upload")
+        assert upload.status == "complete"
+        assert upload.received_bytes == 5
+    assert (upload_dir / "media.mp4").is_file()
 
 
 @pytest.mark.asyncio
