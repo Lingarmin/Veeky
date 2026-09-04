@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import binascii
+import functools
 import hashlib
 import json
 import math
@@ -49,13 +50,17 @@ from app.services.llm import (
     normalize_provider_config,
 )
 from app.services.job_lease import (
+    ACTIVE_JOB_STATUSES,
     JobLeaseClaim,
     claim_job_lease,
     finish_owned_job,
     timeout_job_delivery,
     update_owned_job,
 )
-from app.services.media_upload import expire_complete_upload_if_unreferenced
+from app.services.media_upload import (
+    expire_complete_upload_if_unreferenced,
+    expire_consumed_upload_for_terminal_job,
+)
 from app.services.transcripts import TranscriptService, transcript_version
 from app.services.video_metadata import VideoMetadataService
 from app.sources.base import ContentRef, SourceRegistry
@@ -95,9 +100,19 @@ CELERY_HARD_LIMIT_GRACE_SECONDS = 60
 WORKER_TERMINATION_REQUIRED = "worker_termination_required"
 
 
+class RetryableMediaCopyError(Exception):
+    pass
+
+
 @dataclass
 class TaskLeaseState:
     token: str | None = None
+
+
+@dataclass(frozen=True)
+class TaskRetry:
+    retry_at: datetime
+    terminate_worker: bool = False
 
 
 class FFmpegAudioExtractor:
@@ -136,6 +151,46 @@ class FFmpegAudioExtractor:
             ) from None
         if not math.isfinite(duration) or duration < 0:
             raise AudioExtractionError("media_probe_failed", "无法读取媒体时长")
+        return duration * 1000
+
+    async def probe_audio_duration_ms(self, media_path: Path) -> float | None:
+        self._validate_path(media_path)
+        process = await self.runner(
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=duration",
+            "-of",
+            "json",
+            str(media_path),
+        )
+        if process.returncode:
+            raise AudioExtractionError("media_probe_failed", "无法读取音轨时长")
+        try:
+            streams = json.loads(process.stdout)["streams"]
+        except (KeyError, TypeError, json.JSONDecodeError):
+            raise AudioExtractionError(
+                "media_probe_failed", "无法读取音轨时长"
+            ) from None
+        if not isinstance(streams, list) or not streams:
+            raise AudioExtractionError("audio_track_missing", "媒体没有可用音轨")
+        stream = streams[0]
+        if not isinstance(stream, dict):
+            return None
+        raw_duration = stream.get("duration")
+        if raw_duration in (None, "N/A"):
+            return None
+        try:
+            duration = float(raw_duration)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(duration):
+            return None
+        if duration < 0:
+            raise AudioExtractionError("media_probe_failed", "无法读取音轨时长")
         return duration * 1000
 
     async def extract(
@@ -387,10 +442,11 @@ class AnalysisPipeline:
         self._uses_default_providers = False
         self.lease_state: TaskLeaseState | None = None
         self._lease_released: asyncio.Event | None = None
+        self._orphaned_asr_thread = False
 
     async def run(
         self, job_id: str, *, resume: bool = False
-    ) -> datetime | str | None:
+    ) -> datetime | str | TaskRetry | None:
         loop = asyncio.get_running_loop()
         claim_started_at = loop.time()
         claim = await self._claim(job_id, resume=resume)
@@ -408,6 +464,7 @@ class AnalysisPipeline:
         assert owner_task is not None
         lease_lost = asyncio.Event()
         self._lease_released = asyncio.Event()
+        self._orphaned_asr_thread = False
         lease_deadline = claim_started_at + self._lease_seconds
         heartbeat_task = asyncio.create_task(
             self._heartbeat_lease(
@@ -556,10 +613,18 @@ class AnalysisPipeline:
             await self._complete(job_id, lease_token)
         except asyncio.CancelledError:
             if lease_lost.is_set():
-                return None
+                return await self._lease_retry(
+                    job_id,
+                    terminate_worker=self._orphaned_asr_thread,
+                )
             raise
         except JobLeaseLost:
-            return None
+            return await self._lease_retry(
+                job_id,
+                terminate_worker=self._orphaned_asr_thread,
+            )
+        except RetryableMediaCopyError:
+            return await self._lease_retry(job_id, terminate_worker=False)
         except (TimeoutError, SoftTimeLimitExceeded):
             await self._fail(job_id, lease_token, "analysis_timeout", None)
             return WORKER_TERMINATION_REQUIRED
@@ -681,6 +746,7 @@ class AnalysisPipeline:
                     raise JobLeaseLost()
                 upload = await session.scalar(
                     select(MediaUploadSession)
+                    .options(selectinload(MediaUploadSession.parts))
                     .where(
                         MediaUploadSession.id == current.media_session_id,
                         MediaUploadSession.installation_id
@@ -695,20 +761,16 @@ class AnalysisPipeline:
                     and self._as_utc(upload.expires_at) <= datetime.now(timezone.utc)
                 ):
                     raise MediaDownloadError("media upload required")
-                uploaded_dir = root / upload.directory_key
-                try:
-                    await anyio.to_thread.run_sync(
-                        self._copy_upload_artifact,
-                        uploaded_dir,
-                        upload.media_kind,
-                        media_path,
-                        self.settings.max_media_bytes,
-                        abandon_on_cancel=True,
-                    )
-                except AudioExtractionError as error:
-                    if error.code != "media_artifact_missing":
-                        raise
-                    raise MediaDownloadError("media upload required") from None
+                uploaded_dir = (root / upload.directory_key).resolve()
+                if uploaded_dir != root and root not in uploaded_dir.parents:
+                    raise MediaDownloadError("media upload required")
+                upload_kind = upload.media_kind
+                upload_expected_bytes = upload.expected_bytes
+                upload_parts = tuple(
+                    (part.part_number, part.byte_size, part.sha256)
+                    for part in upload.parts
+                )
+                manifest_parts = tuple((upload.hls_manifest or {}).get("parts", ()))
                 upload.status = "consumed"
                 now = datetime.now(timezone.utc)
                 retention_seconds = max(
@@ -728,6 +790,25 @@ class AnalysisPipeline:
                     values={},
                 ):
                     raise JobLeaseLost()
+            try:
+                await anyio.to_thread.run_sync(
+                    functools.partial(
+                        self._copy_upload_artifact,
+                        uploaded_dir,
+                        upload_kind,
+                        media_path,
+                        self.settings.max_media_bytes,
+                        expected_bytes=upload_expected_bytes,
+                        parts=upload_parts,
+                        manifest_parts=manifest_parts,
+                    )
+                )
+            except AudioExtractionError as error:
+                if error.code != "media_artifact_missing":
+                    raise
+                raise MediaDownloadError("media upload required") from None
+            except OSError:
+                raise RetryableMediaCopyError() from None
         media_size = media_path.stat().st_size
         if media_size > min(
             self.settings.max_media_bytes, self.settings.max_temp_bytes_per_job
@@ -751,11 +832,12 @@ class AnalysisPipeline:
             )
         duration_ms = round(exact_duration_ms)
         job.video.duration_ms = duration_ms
+        audio_duration_ms = await extractor.probe_audio_duration_ms(media_path)
         await self._set_status(job.id, lease_token, "extracting_audio")
         audio_path = await extractor.extract(
             media_path,
             job_dir / "audio.wav",
-            expected_duration_ms=exact_duration_ms,
+            expected_duration_ms=audio_duration_ms,
         )
         if (
             media_size + audio_path.stat().st_size
@@ -766,11 +848,15 @@ class AnalysisPipeline:
         transcriber = self.transcriber or get_default_transcriber(
             settings=self.settings
         )
-        segments, language = await anyio.to_thread.run_sync(
-            transcriber.transcribe,
-            audio_path,
-            abandon_on_cancel=True,
-        )
+        try:
+            segments, language = await anyio.to_thread.run_sync(
+                transcriber.transcribe,
+                audio_path,
+                abandon_on_cancel=True,
+            )
+        except asyncio.CancelledError:
+            self._orphaned_asr_thread = True
+            raise
         artifact_hash = await anyio.to_thread.run_sync(
             self._sha256_file,
             media_path,
@@ -1006,16 +1092,11 @@ class AnalysisPipeline:
 
     async def _cleanup_consumed_upload(self, job_id: str) -> None:
         async with self.session_factory() as session:
-            job = await session.get(AnalysisJob, job_id)
-            if job is None or not job.media_session_id:
-                return
-            upload = await session.get(MediaUploadSession, job.media_session_id)
-            if upload is None or upload.status != "consumed":
-                return
-            directory = (
-                Path(self.settings.media_temp_root).resolve() / upload.directory_key
+            await expire_consumed_upload_for_terminal_job(
+                session,
+                self.settings,
+                job_id=job_id,
             )
-        await asyncio.to_thread(shutil.rmtree, directory, True)
 
     @staticmethod
     def _sha256_file(path: Path) -> str:
@@ -1027,43 +1108,135 @@ class AnalysisPipeline:
 
     @staticmethod
     def _copy_upload_artifact(
-        directory: Path, kind: str, destination: Path, max_bytes: int
+        directory: Path,
+        kind: str,
+        destination: Path,
+        max_bytes: int,
+        *,
+        expected_bytes: int | None = None,
+        parts: tuple[tuple[int, int, str], ...] = (),
+        manifest_parts: tuple[int, ...] = (),
     ) -> None:
-        if kind == "mp4":
-            source = directory / "media.mp4"
-            if not source.is_file():
-                raise AudioExtractionError("media_artifact_missing", "媒体文件不存在")
-            shutil.copyfile(source, destination)
-            return
+        temporary = destination.with_name(f".{destination.name}.copying")
+        temporary.unlink(missing_ok=True)
+        part_metadata = {
+            part_number: (byte_size, sha256)
+            for part_number, byte_size, sha256 in parts
+        }
         try:
-            part_numbers = json.loads((directory / "manifest.json").read_text())[
-                "parts"
-            ]
-        except (OSError, KeyError, TypeError, json.JSONDecodeError):
+            with temporary.open("xb") as output:
+                if kind == "mp4":
+                    source_path = directory / "media.mp4"
+                    before = source_path.stat()
+                    if expected_bytes is not None and before.st_size != expected_bytes:
+                        raise AudioExtractionError(
+                            "media_artifact_invalid", "媒体文件校验失败"
+                        )
+                    with source_path.open("rb") as source:
+                        total = AnalysisPipeline._copy_verified_stream(
+                            source,
+                            output,
+                            max_bytes,
+                            tuple(sorted(parts)),
+                        )
+                    after = source_path.stat()
+                    if (
+                        before.st_dev,
+                        before.st_ino,
+                        before.st_size,
+                        before.st_mtime_ns,
+                    ) != (
+                        after.st_dev,
+                        after.st_ino,
+                        after.st_size,
+                        after.st_mtime_ns,
+                    ):
+                        raise AudioExtractionError(
+                            "media_artifact_invalid", "媒体文件校验失败"
+                        )
+                else:
+                    if not manifest_parts:
+                        raise AudioExtractionError(
+                            "media_artifact_invalid", "媒体文件校验失败"
+                        )
+                    total = 0
+                    for part_number in manifest_parts:
+                        metadata = part_metadata.get(part_number)
+                        if type(part_number) is not int or part_number < 0 or not metadata:
+                            raise AudioExtractionError(
+                                "media_artifact_invalid", "媒体文件校验失败"
+                            )
+                        part_path = directory / f"part-{part_number:08d}.bin"
+                        before = part_path.stat()
+                        with part_path.open("rb") as source:
+                            copied = AnalysisPipeline._copy_verified_stream(
+                                source,
+                                output,
+                                max_bytes - total,
+                                ((part_number, metadata[0], metadata[1]),),
+                            )
+                        after = part_path.stat()
+                        if (
+                            before.st_dev,
+                            before.st_ino,
+                            before.st_size,
+                            before.st_mtime_ns,
+                        ) != (
+                            after.st_dev,
+                            after.st_ino,
+                            after.st_size,
+                            after.st_mtime_ns,
+                        ):
+                            raise AudioExtractionError(
+                                "media_artifact_invalid", "媒体文件校验失败"
+                            )
+                        total += copied
+                if expected_bytes is not None and total != expected_bytes:
+                    raise AudioExtractionError(
+                        "media_artifact_invalid", "媒体文件校验失败"
+                    )
+            temporary.replace(destination)
+        except FileNotFoundError:
+            temporary.unlink(missing_ok=True)
             raise AudioExtractionError(
                 "media_artifact_missing", "媒体文件不存在"
             ) from None
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+
+    @staticmethod
+    def _copy_verified_stream(source, output, max_bytes, parts) -> int:
         total = 0
-        with destination.open("xb") as output:
-            for part_number in part_numbers:
-                if type(part_number) is not int or part_number < 0:
+        if not parts:
+            while chunk := source.read(1024 * 1024):
+                total += len(chunk)
+                if total > max_bytes:
+                    raise AudioExtractionError("media_too_large", "媒体文件过大")
+                output.write(chunk)
+            return total
+        for _, byte_size, expected_sha256 in parts:
+            remaining = byte_size
+            digest = hashlib.sha256()
+            while remaining:
+                chunk = source.read(min(1024 * 1024, remaining))
+                if not chunk:
                     raise AudioExtractionError(
-                        "media_artifact_missing", "媒体文件不存在"
+                        "media_artifact_invalid", "媒体文件校验失败"
                     )
-                part = directory / f"part-{part_number:08d}.bin"
-                try:
-                    with part.open("rb") as source:
-                        while chunk := source.read(1024 * 1024):
-                            total += len(chunk)
-                            if total > max_bytes:
-                                raise AudioExtractionError(
-                                    "media_too_large", "媒体文件过大"
-                                )
-                            output.write(chunk)
-                except FileNotFoundError:
-                    raise AudioExtractionError(
-                        "media_artifact_missing", "媒体文件不存在"
-                    ) from None
+                remaining -= len(chunk)
+                total += len(chunk)
+                if total > max_bytes:
+                    raise AudioExtractionError("media_too_large", "媒体文件过大")
+                digest.update(chunk)
+                output.write(chunk)
+            if digest.hexdigest() != expected_sha256:
+                raise AudioExtractionError(
+                    "media_artifact_invalid", "媒体文件校验失败"
+                )
+        if source.read(1):
+            raise AudioExtractionError("media_artifact_invalid", "媒体文件校验失败")
+        return total
 
     def _upload_is_recoverable(
         self, job: AnalysisJob, upload: MediaUploadSession | None
@@ -1197,6 +1370,33 @@ class AnalysisPipeline:
                 resume=resume,
                 lease_seconds=self._lease_seconds,
             )
+
+    async def _lease_retry(
+        self,
+        job_id: str,
+        *,
+        terminate_worker: bool,
+    ) -> TaskRetry:
+        now = datetime.now(timezone.utc)
+        retry_at = now + timedelta(seconds=self._lease_seconds)
+        try:
+            async with self.session_factory() as session:
+                row = (
+                    await session.execute(
+                        select(
+                            AnalysisJob.status,
+                            AnalysisJob.lease_expires_at,
+                        ).where(AnalysisJob.id == job_id)
+                    )
+                ).one_or_none()
+        except Exception:
+            return TaskRetry(retry_at, terminate_worker)
+        if row is not None and row.status in ACTIVE_JOB_STATUSES:
+            if row.lease_expires_at is not None:
+                retry_at = self._as_utc(row.lease_expires_at)
+        if retry_at <= now:
+            retry_at = now + timedelta(seconds=1)
+        return TaskRetry(retry_at, terminate_worker)
 
     async def _load_claimed_job(
         self, job_id: str, lease_token: str
@@ -1479,7 +1679,7 @@ async def run_analysis_task(
     *,
     resume: bool = False,
     lease_state: TaskLeaseState | None = None,
-) -> datetime | str | None:
+) -> datetime | str | TaskRetry | None:
     current = get_settings()
     engine = create_async_engine(current.database_url, pool_pre_ping=True)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -1527,10 +1727,13 @@ async def _cleanup_terminal_job_media(
         if job is None or upload is None:
             return
         if upload.status == "consumed":
-            root = Path(current.media_temp_root).resolve()
-            directory = (root / upload.directory_key).resolve()
-            if directory != root and root not in directory.parents:
-                return
+            await expire_consumed_upload_for_terminal_job(
+                session,
+                current,
+                job_id=job.id,
+                media_session_id=upload.id,
+            )
+            return
         elif upload.status == "complete":
             await expire_complete_upload_if_unreferenced(
                 session,
@@ -1543,9 +1746,6 @@ async def _cleanup_terminal_job_media(
             return
         else:
             return
-    await anyio.to_thread.run_sync(shutil.rmtree, directory, True)
-
-
 async def clear_expired_llm_credentials_async(
     session_factory: async_sessionmaker[AsyncSession],
     *,
@@ -1580,6 +1780,17 @@ async def run_expired_credential_cleanup() -> int:
         await engine.dispose()
 
 
+def terminate_worker_child() -> None:
+    raise WorkerTerminate()
+
+
+def _retry_countdown(retry_at: datetime) -> int:
+    return max(
+        1,
+        math.ceil((retry_at - datetime.now(timezone.utc)).total_seconds()),
+    )
+
+
 @celery_app.task(
     bind=True,
     name="analysis.analyze_video",
@@ -1602,24 +1813,32 @@ def analyze_video(task, job_id: str, *, resume: bool = False) -> None:
             recover_analysis_soft_timeout(job_id, lease_state.token)
         )
         if retry_at is not None:
-            countdown = max(
-                1,
-                math.ceil(
-                    (retry_at - datetime.now(timezone.utc)).total_seconds()
-                ),
+            retry_signal = task.retry(
+                countdown=_retry_countdown(retry_at),
+                kwargs={"resume": True},
+                throw=False,
             )
-            task.retry(countdown=countdown, kwargs={"resume": True})
-        raise WorkerTerminate() from None
+            terminate_worker_child()
+            raise retry_signal
+        terminate_worker_child()
+        return
     if retry_at == WORKER_TERMINATION_REQUIRED:
-        raise WorkerTerminate()
-    if retry_at is not None:
-        countdown = max(
-            1,
-            math.ceil(
-                (retry_at - datetime.now(timezone.utc)).total_seconds()
-            ),
+        terminate_worker_child()
+        return
+    if isinstance(retry_at, TaskRetry):
+        retry_signal = task.retry(
+            countdown=_retry_countdown(retry_at.retry_at),
+            kwargs={"resume": True},
+            throw=False,
         )
-        task.retry(countdown=countdown, kwargs={"resume": True})
+        if retry_at.terminate_worker:
+            terminate_worker_child()
+        raise retry_signal
+    if retry_at is not None:
+        task.retry(
+            countdown=_retry_countdown(retry_at),
+            kwargs={"resume": True},
+        )
 
 
 @celery_app.task(name="maintenance.clear_expired_llm_credentials")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -282,7 +283,9 @@ async def test_heartbeat_lease_loss_cancels_the_running_pipeline(x_context):
         job.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
         await session.commit()
 
-    assert await asyncio.wait_for(running, timeout=2) is None
+    retry = await asyncio.wait_for(running, timeout=2)
+    assert retry is not None
+    assert retry.terminate_worker is False
     assert cancelled.is_set()
 
 
@@ -314,8 +317,51 @@ async def test_heartbeat_database_failures_cancel_at_the_lease_deadline(
 
     monkeypatch.setattr("app.workers.tasks.update_owned_job", fail_renewal)
 
-    assert await asyncio.wait_for(running, timeout=2) is None
+    retry = await asyncio.wait_for(running, timeout=2)
+    assert retry is not None
+    assert retry.terminate_worker is False
     assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lease_failure", ["stolen", "database"])
+async def test_lease_loss_during_asr_requires_retry_and_worker_exit(
+    x_context,
+    monkeypatch,
+    lease_failure,
+):
+    factory, _, settings, _ = x_context
+    settings.analysis_job_lease_seconds = 1
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingTranscriber(FakeTranscriber):
+        def transcribe(self, audio_path):
+            entered.set()
+            release.wait(timeout=5)
+            return super().transcribe(audio_path)
+
+    running = asyncio.create_task(
+        make_pipeline(x_context, transcriber=BlockingTranscriber()).run("job-x")
+    )
+    assert await asyncio.to_thread(entered.wait, 2)
+    if lease_failure == "stolen":
+        async with factory() as session:
+            job = await session.get(AnalysisJob, "job-x")
+            job.lease_token = "replacement-worker-token"
+            job.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
+            await session.commit()
+    else:
+        async def fail_renewal(*args, **kwargs):
+            raise ConnectionError("database unavailable")
+
+        monkeypatch.setattr("app.workers.tasks.update_owned_job", fail_renewal)
+
+    retry = await asyncio.wait_for(running, timeout=2)
+    release.set()
+
+    assert retry is not None
+    assert retry.terminate_worker is True
 
 
 @pytest.mark.asyncio
@@ -482,6 +528,82 @@ async def test_expired_lease_reuses_consumed_upload_after_extraction_loss(
     assert transcriber.calls == 1
     assert analysis.calls == 1
     assert not upload_dir.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("copy_error", "worker_crashed"),
+    [(WorkerStopped(), True), (OSError("temporary copy failure"), False)],
+)
+async def test_redelivery_retries_copy_after_consumption_commit(
+    x_context,
+    copy_error,
+    worker_crashed,
+):
+    factory, _, _, media_root = x_context
+    upload_dir = media_root / "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    upload_dir.mkdir()
+    (upload_dir / "media.mp4").write_bytes(b"uploaded-media")
+    async with factory() as session:
+        job = await session.get(AnalysisJob, "job-x")
+        job.media_url_ciphertext = None
+        upload = MediaUploadSession(
+            id="copy-retry-upload",
+            installation_id=INSTALLATION_ID,
+            content_id=job.content_id,
+            status="complete",
+            expected_bytes=14,
+            received_bytes=14,
+            media_kind="mp4",
+            part_count=1,
+            part_size_bytes=14,
+            directory_key=upload_dir.name,
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+        )
+        job.media_session_id = upload.id
+        session.add(upload)
+        await session.commit()
+
+    original = make_pipeline(x_context)
+
+    class CrashDuringCopy(AnalysisPipeline):
+        @staticmethod
+        def _copy_upload_artifact(*args, **kwargs):
+            raise copy_error
+
+    crashing = CrashDuringCopy(
+        original.session_factory,
+        original.source_registry,
+        original.translation_provider,
+        original.analysis_service,
+        credential_cipher=original.credential_cipher,
+        media_downloader=original.media_downloader,
+        audio_extractor=original.audio_extractor,
+        transcriber=original.transcriber,
+        settings=original.settings,
+    )
+
+    if worker_crashed:
+        with pytest.raises(WorkerStopped):
+            await crashing.run("job-x")
+    else:
+        retry = await crashing.run("job-x")
+        assert retry is not None
+        assert retry.terminate_worker is False
+
+    async with factory() as session:
+        job = await session.get(AnalysisJob, "job-x")
+        upload = await session.get(MediaUploadSession, "copy-retry-upload")
+        assert job.status == "downloading_media"
+        assert upload.status == "consumed"
+        assert upload_dir.is_dir()
+
+    await expire_lease(factory)
+    assert await make_pipeline(x_context).run("job-x", resume=True) is None
+
+    async with factory() as session:
+        job = await session.get(AnalysisJob, "job-x")
+        assert job.status == "completed"
 
 
 @pytest.mark.asyncio

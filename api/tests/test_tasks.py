@@ -449,6 +449,54 @@ def test_analyze_video_terminates_worker_after_pipeline_timeout(monkeypatch):
         analyze_video.run("job-id")
 
 
+@pytest.mark.parametrize("terminate_worker", [False, True])
+def test_analyze_video_publishes_one_lease_retry_before_optional_worker_exit(
+    monkeypatch,
+    terminate_worker,
+):
+    retry_at = datetime.now(timezone.utc) + timedelta(seconds=30)
+    retry_outcome = worker_tasks.TaskRetry(
+        retry_at=retry_at,
+        terminate_worker=terminate_worker,
+    )
+    retry_calls = []
+    terminations = []
+
+    async def fake_run(job_id, *, resume=False, lease_state=None):
+        return retry_outcome
+
+    class RetryRequested(RuntimeError):
+        pass
+
+    retry_requested = RetryRequested()
+
+    def fake_retry(*, countdown, kwargs, throw):
+        retry_calls.append((countdown, kwargs, throw))
+        return retry_requested
+
+    def fake_terminate():
+        terminations.append(True)
+
+    monkeypatch.setattr(worker_tasks, "run_analysis_task", fake_run)
+    monkeypatch.setattr(analyze_video, "retry", fake_retry)
+    monkeypatch.setattr(
+        worker_tasks,
+        "terminate_worker_child",
+        fake_terminate,
+        raising=False,
+    )
+
+    with pytest.raises(RetryRequested):
+        analyze_video.run("job-id")
+
+    assert len(retry_calls) == 1
+    countdown, kwargs, throw = retry_calls[0]
+    assert 1 <= countdown <= 30
+    assert kwargs == {"resume": True}
+    assert throw is False
+    assert terminations == ([True] if terminate_worker else [])
+
+
 def test_analyze_video_recovers_when_soft_limit_escapes_asyncio_run(
     tmp_path, monkeypatch
 ):
@@ -537,10 +585,11 @@ def test_analyze_video_recovers_when_soft_limit_escapes_asyncio_run(
         factory = async_sessionmaker(engine, expire_on_commit=False)
         async with factory() as session:
             job = await session.get(AnalysisJob, job_id)
+            upload = await session.get(MediaUploadSession, "soft-timeout-upload")
         await engine.dispose()
-        return job
+        return job, upload
 
-    job = asyncio.run(load_job())
+    job, upload = asyncio.run(load_job())
     assert job.status == "failed"
     assert job.failure_code == "analysis_timeout"
     assert job.lease_token is None
@@ -548,6 +597,8 @@ def test_analyze_video_recovers_when_soft_limit_escapes_asyncio_run(
     assert job.llm_credential_ciphertext is None
     assert job.llm_credential_expires_at is None
     assert job.media_url_ciphertext is None
+    assert upload.status == "expired"
+    assert upload.received_bytes == 0
     assert not upload_dir.exists()
 
 

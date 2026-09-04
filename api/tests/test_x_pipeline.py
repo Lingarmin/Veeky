@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import asyncio
+import hashlib
 import sys
 import wave
 from datetime import datetime, timedelta, timezone
@@ -25,6 +26,7 @@ from app.security.credentials import JobCredentialCipher
 from app.services.analysis import AnalysisResult, Highlight, TimedSummary
 from app.services.asr import AsrError
 from app.services.media_download import MediaDownloadError
+from app.services.media_upload import create_upload_session
 from app.services.transcripts import TranscriptSegment
 from app.services.translation import TranslatedSegment, TranslationProviderError
 from app.workers.tasks import (
@@ -52,12 +54,22 @@ class FakeDownloader:
 
 
 class FakeAudioExtractor:
-    def __init__(self, *, duration_ms: float = 2000, error: Exception | None = None):
+    def __init__(
+        self,
+        *,
+        duration_ms: float = 2000,
+        audio_duration_ms: float | None = 2000,
+        error: Exception | None = None,
+    ):
         self.duration_ms = duration_ms
+        self.audio_duration_ms = audio_duration_ms
         self.error = error
 
     async def probe_duration_ms(self, media_path: Path) -> int:
         return self.duration_ms
+
+    async def probe_audio_duration_ms(self, media_path: Path) -> float | None:
+        return self.audio_duration_ms
 
     async def extract(
         self, media_path: Path, audio_path: Path, *, expected_duration_ms: float | None = None
@@ -344,8 +356,19 @@ async def test_completed_owned_upload_resumes_waiting_job_once(x_context):
         job = await session.get(AnalysisJob, "job-x")
         upload = await session.get(MediaUploadSession, "upload-x")
         assert job.status == "completed"
-        assert upload.status == "consumed"
+        assert upload.status == "expired"
+        assert upload.received_bytes == 0
         assert job.llm_credential_ciphertext is None
+        replacement = await create_upload_session(
+            session,
+            settings,
+            INSTALLATION_ID,
+            job.content_id,
+            "mp4",
+            settings.max_media_bytes,
+            1,
+        )
+        assert replacement.status == "created"
     assert not upload_dir.exists()
 
 
@@ -385,6 +408,48 @@ async def test_x_media_or_asr_failure_is_terminal_and_cleans_temp(
         assert job.llm_credential_ciphertext is None
         assert job.media_url_ciphertext is None
     assert not any(media_root.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_terminal_media_failure_releases_consumed_upload(x_context):
+    factory, _, _, media_root = x_context
+    upload_dir = media_root / "99999999-9999-4999-8999-999999999999"
+    upload_dir.mkdir()
+    (upload_dir / "media.mp4").write_bytes(b"uploaded-media")
+    async with factory() as session:
+        job = await session.get(AnalysisJob, "job-x")
+        job.media_url_ciphertext = None
+        upload = MediaUploadSession(
+            id="failed-job-upload",
+            installation_id=INSTALLATION_ID,
+            content_id=job.content_id,
+            status="complete",
+            expected_bytes=14,
+            received_bytes=14,
+            media_kind="mp4",
+            part_count=1,
+            part_size_bytes=14,
+            directory_key=upload_dir.name,
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        job.media_session_id = upload.id
+        session.add(upload)
+        await session.commit()
+
+    await make_pipeline(
+        x_context,
+        extractor=FakeAudioExtractor(
+            error=AudioExtractionError("audio_track_missing", "no audio")
+        ),
+    ).run("job-x")
+
+    async with factory() as session:
+        job = await session.get(AnalysisJob, "job-x")
+        upload = await session.get(MediaUploadSession, "failed-job-upload")
+        assert job.status == "failed"
+        assert upload.status == "expired"
+        assert upload.received_bytes == 0
+    assert not upload_dir.exists()
 
 
 @pytest.mark.asyncio
@@ -630,6 +695,158 @@ async def test_ffmpeg_extractor_preserves_sub_millisecond_duration_precision(tmp
     assert await extractor.probe_duration_ms(media_path) == pytest.approx(
         14_400_000.4, rel=0, abs=1e-6
     )
+
+
+@pytest.mark.asyncio
+async def test_x_pipeline_validates_wav_against_selected_audio_stream_duration(
+    x_context,
+):
+    expected_durations = []
+
+    class ShortAudioExtractor(FakeAudioExtractor):
+        async def extract(self, media_path, audio_path, *, expected_duration_ms=None):
+            expected_durations.append(expected_duration_ms)
+            return await super().extract(
+                media_path,
+                audio_path,
+                expected_duration_ms=expected_duration_ms,
+            )
+
+    await make_pipeline(
+        x_context,
+        extractor=ShortAudioExtractor(
+            duration_ms=2000,
+            audio_duration_ms=1800,
+        ),
+    ).run("job-x")
+
+    assert expected_durations == [1800]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stream_payload", "expected_duration_ms"),
+    [
+        ('{"streams":[{"duration":"1.800"}]}', 1800),
+        ('{"streams":[{"duration":"N/A"}]}', None),
+        ('{"streams":[{}]}', None),
+        ('{"streams":[null]}', None),
+    ],
+)
+async def test_ffmpeg_extractor_probes_selected_audio_stream_duration(
+    tmp_path,
+    stream_payload,
+    expected_duration_ms,
+):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    media_path = media_root / "input.mp4"
+    media_path.write_bytes(b"media")
+
+    async def runner(*arguments):
+        assert ("-select_streams", "a:0") == arguments[
+            arguments.index("-select_streams") : arguments.index("-select_streams")
+            + 2
+        ]
+        return type(
+            "Result",
+            (),
+            {"returncode": 0, "stdout": stream_payload, "stderr": ""},
+        )()
+
+    extractor = FFmpegAudioExtractor(
+        str(media_root), timeout_seconds=10, max_bytes=100, runner=runner
+    )
+
+    assert await extractor.probe_audio_duration_ms(media_path) == expected_duration_ms
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_extractor_rejects_media_without_an_audio_stream(tmp_path):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    media_path = media_root / "input.mp4"
+    media_path.write_bytes(b"media")
+
+    async def runner(*arguments):
+        return type(
+            "Result",
+            (),
+            {"returncode": 0, "stdout": '{"streams":[]}', "stderr": ""},
+        )()
+
+    extractor = FFmpegAudioExtractor(
+        str(media_root), timeout_seconds=10, max_bytes=100, runner=runner
+    )
+
+    with pytest.raises(AudioExtractionError) as raised:
+        await extractor.probe_audio_duration_ms(media_path)
+
+    assert raised.value.code == "audio_track_missing"
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_accepts_audio_shorter_than_container_by_over_100ms(tmp_path):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    media_path = media_root / "input.mp4"
+    audio_path = media_root / "output.wav"
+    media_path.write_bytes(b"media")
+
+    async def runner(*arguments):
+        if arguments[0] == "ffmpeg":
+            with wave.open(str(audio_path), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(16_000)
+                output.writeframes(b"\0" * (2 * 16_000 * 18 // 10))
+            return type(
+                "Result", (), {"returncode": 0, "stdout": "", "stderr": ""}
+            )()
+        payload = (
+            '{"streams":[{"duration":"1.800"}]}'
+            if "-select_streams" in arguments
+            else '{"format":{"duration":"2.000"}}'
+        )
+        return type(
+            "Result", (), {"returncode": 0, "stdout": payload, "stderr": ""}
+        )()
+
+    extractor = FFmpegAudioExtractor(
+        str(media_root), timeout_seconds=10, max_bytes=70_000, runner=runner
+    )
+    assert await extractor.probe_duration_ms(media_path) == 2000
+    audio_duration_ms = await extractor.probe_audio_duration_ms(media_path)
+
+    assert audio_duration_ms == 1800
+    assert await extractor.extract(
+        media_path,
+        audio_path,
+        expected_duration_ms=audio_duration_ms,
+    ) == audio_path
+
+
+def test_upload_copy_revalidates_persisted_part_hashes(tmp_path):
+    upload_dir = tmp_path / "upload"
+    upload_dir.mkdir()
+    source = upload_dir / "media.mp4"
+    source.write_bytes(b"tampered")
+    destination = tmp_path / "job-media.bin"
+    expected = b"expected"
+
+    with pytest.raises(AudioExtractionError) as raised:
+        AnalysisPipeline._copy_upload_artifact(
+            upload_dir,
+            "mp4",
+            destination,
+            1024,
+            expected_bytes=len(expected),
+            parts=((0, len(expected), hashlib.sha256(expected).hexdigest()),),
+            manifest_parts=(),
+        )
+
+    assert raised.value.code == "media_artifact_invalid"
+    assert not destination.exists()
 
 
 @pytest.mark.asyncio

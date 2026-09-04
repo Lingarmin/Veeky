@@ -46,6 +46,13 @@ from app.services.media_upload import (
     get_owned_upload,
     store_part,
 )
+from tests.test_x_pipeline import (
+    AnalysisPipeline,
+    FakeAnalysis,
+    FakeAudioExtractor,
+    FakeTranscriber,
+    FakeTranslation,
+)
 
 
 INSTALLATION_ID = "11111111-1111-4111-8111-111111111111"
@@ -1313,6 +1320,31 @@ async def test_delete_is_idempotent_and_does_not_touch_other_session(media_conte
 
 
 @pytest.mark.asyncio
+async def test_consumed_upload_cannot_be_deleted_while_worker_copies(media_context):
+    client, _, factory, media_root = media_context
+    session_id = (
+        await create_session(client, expected_bytes=16, part_count=1)
+    ).json()["sessionId"]
+    await upload_part(client, session_id, 0, b"0123456789abcdef")
+    completed = await client.post(
+        f"/v1/media-sessions/{session_id}/complete",
+        json={"partCount": 1, "totalBytes": 16},
+    )
+    assert completed.status_code == 200
+    async with factory() as session:
+        upload = await session.get(MediaUploadSession, session_id)
+        upload.status = "consumed"
+        directory = media_root / upload.directory_key
+        await session.commit()
+
+    response = await client.delete(f"/v1/media-sessions/{session_id}")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "upload_consumed"
+    assert directory.is_dir()
+
+
+@pytest.mark.asyncio
 async def test_all_existing_session_routes_hide_cross_installation_access(media_context):
     client, _, _, _ = media_context
     session_id = (await create_session(client)).json()["sessionId"]
@@ -1915,6 +1947,84 @@ async def test_postgres_expired_soft_timeout_loses_concurrent_takeover_race(
         assert job.lease_token == replacement.token
         assert job.llm_credential_ciphertext == "encrypted-secret"
         assert job.media_url_ciphertext == "encrypted-media-url"
+
+
+@pytest.mark.asyncio
+async def test_postgres_slow_upload_copy_does_not_block_lease_heartbeat(
+    postgres_media_context,
+    monkeypatch,
+):
+    factory, settings = postgres_media_context
+    settings.analysis_job_lease_seconds = 1
+    settings.asr_job_timeout_seconds = 10
+    settings.max_temp_bytes_per_job = 1024
+    job_id = "pg-slow-upload-copy"
+    upload_id = "77777777-7777-4777-8777-777777777777"
+    upload_dir = Path(settings.media_temp_root) / upload_id
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "media.mp4").write_bytes(b"media")
+    async with factory() as session:
+        upload = MediaUploadSession(
+            id=upload_id,
+            installation_id=INSTALLATION_ID,
+            content_id=CONTENT_ID,
+            status="complete",
+            expected_bytes=5,
+            received_bytes=5,
+            media_kind="mp4",
+            part_count=1,
+            part_size_bytes=5,
+            directory_key=upload_id,
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+        )
+        session.add(upload)
+        await session.flush()
+        session.add(
+            AnalysisJob(
+                id=job_id,
+                installation_id=INSTALLATION_ID,
+                video_id="x:2075545587093807111:1",
+                content_id=CONTENT_ID,
+                source_language="auto",
+                target_language="zh-Hans",
+                transcript_version=f"pending:{job_id}",
+                cache_key=f"pending:{job_id}",
+                status="queued",
+                media_session_id=upload_id,
+            )
+        )
+        await session.commit()
+
+    original_copy = AnalysisPipeline._copy_upload_artifact
+    copy_calls = 0
+
+    def slow_copy(*args, **kwargs):
+        nonlocal copy_calls
+        copy_calls += 1
+        time.sleep(1.2)
+        return original_copy(*args, **kwargs)
+
+    monkeypatch.setattr(
+        AnalysisPipeline,
+        "_copy_upload_artifact",
+        staticmethod(slow_copy),
+    )
+    pipeline = AnalysisPipeline(
+        factory,
+        None,
+        FakeTranslation(),
+        FakeAnalysis(),
+        audio_extractor=FakeAudioExtractor(),
+        transcriber=FakeTranscriber(),
+        settings=settings,
+    )
+
+    assert await pipeline.run(job_id) is None
+
+    async with factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        assert job.status == "completed"
+    assert copy_calls == 1
 
 
 async def _complete_postgres_upload(factory, settings, session_id):

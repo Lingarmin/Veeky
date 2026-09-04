@@ -444,6 +444,9 @@ async def delete_upload(
     locked = await _lock_owned(database, upload_id, installation_id)
     if locked is None:
         raise _error(404, "media_session_not_found", "media session was not found")
+    if locked.status == "consumed":
+        await database.rollback()
+        raise _error(409, "upload_consumed", "media upload has already been consumed")
     await _expire_locked(database, settings, locked)
 
 
@@ -486,6 +489,89 @@ async def expire_complete_upload_if_unreferenced(
         retry_at = utc_now()
         upload.updated_at = retry_at
         upload.expires_at = retry_at
+        await database.commit()
+        return False
+    return True
+
+
+async def expire_consumed_upload_for_terminal_job(
+    database: AsyncSession,
+    settings: Settings,
+    *,
+    job_id: str,
+    media_session_id: str | None = None,
+) -> bool:
+    await _restart_write_transaction(database)
+    job_conditions = [
+        AnalysisJob.id == job_id,
+        AnalysisJob.status.in_(("completed", "failed")),
+        AnalysisJob.lease_token.is_(None),
+        AnalysisJob.media_session_id.is_not(None),
+    ]
+    if media_session_id is not None:
+        job_conditions.append(AnalysisJob.media_session_id == media_session_id)
+    job = await database.scalar(
+        select(AnalysisJob).where(*job_conditions).with_for_update()
+    )
+    if job is None:
+        await database.rollback()
+        return False
+    upload = await database.scalar(
+        select(MediaUploadSession)
+        .options(selectinload(MediaUploadSession.parts))
+        .where(
+            MediaUploadSession.id == job.media_session_id,
+            MediaUploadSession.installation_id == job.installation_id,
+            MediaUploadSession.content_id == job.content_id,
+            MediaUploadSession.status == "consumed",
+        )
+        .with_for_update()
+    )
+    if upload is None:
+        await database.rollback()
+        return False
+    active_reference = await database.scalar(
+        select(AnalysisJob.id).where(
+            AnalysisJob.id != job.id,
+            AnalysisJob.media_session_id == upload.id,
+            AnalysisJob.status.in_(
+                (
+                    "queued",
+                    "waiting_for_media",
+                    "downloading_media",
+                    "extracting_audio",
+                    "transcribing",
+                    "fetching_transcript",
+                    "translating",
+                    "analyzing",
+                )
+            ),
+        )
+    )
+    if active_reference is not None:
+        await database.rollback()
+        return False
+    upload_id = upload.id
+    try:
+        await _expire_locked(database, settings, upload)
+    except MediaUploadError as error:
+        if error.code != "storage_unavailable":
+            raise
+        await _restart_write_transaction(database)
+        retry_upload = await database.scalar(
+            select(MediaUploadSession)
+            .where(
+                MediaUploadSession.id == upload_id,
+                MediaUploadSession.status == "consumed",
+            )
+            .with_for_update()
+        )
+        if retry_upload is None:
+            await database.rollback()
+            return False
+        retry_at = utc_now()
+        retry_upload.updated_at = retry_at
+        retry_upload.expires_at = retry_at
         await database.commit()
         return False
     return True
