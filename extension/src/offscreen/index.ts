@@ -1,17 +1,24 @@
 import type {
   ContentRef,
-  MediaApiRequest,
-  MediaApiResponse,
+  MediaSessionCreatedMessage,
+  MediaUploadConfigMessage,
+  MediaUploadContextMessage,
   MediaUploadProgressMessage,
   StartMediaUploadMessage,
 } from "../shared/types";
 import { OFFSCREEN_MEDIA_PORT } from "../shared/types";
-import type { MediaSession, MediaUploadApi as VeekyMediaUploadApi } from "../sidepanel/api";
+import { createApi, type MediaSession, type MediaUploadApi as VeekyMediaUploadApi } from "../sidepanel/api";
+import type { InstallationIdentityStore } from "../sidepanel/identity";
 
 const MEDIA_PART_BYTES = 8 * 1024 * 1024;
 const MAX_PART_ATTEMPTS = 3;
+const MAX_COMPLETE_ATTEMPTS = 3;
 const DEFAULT_MAX_MEDIA_BYTES = 4 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_PLAYLIST_BYTES = 2 * 1024 * 1024;
+const DEFAULT_MEDIA_FETCH_TIMEOUT_MS = 30_000;
+const DEFAULT_STREAM_STALL_TIMEOUT_MS = 60_000;
+const DEFAULT_CONFIG_TIMEOUT_MS = 5_000;
+const DEFAULT_OVERALL_UPLOAD_TIMEOUT_MS = 5 * 60 * 60_000;
 
 export type MediaUploadApi = VeekyMediaUploadApi;
 
@@ -29,10 +36,27 @@ interface UploadDependencies {
   reportProgress: (message: MediaUploadProgressMessage) => Promise<void>;
   createPartSpool?: () => Promise<MediaPartSpool>;
   cleanupPartSpools?: () => Promise<void>;
+  reportSessionCreated?: (jobId: string, session: MediaSession) => Promise<void>;
+  signal?: AbortSignal;
+  timeouts?: UploadTimeouts;
   limits?: {
     maxMediaBytes: number;
     maxPlaylistBytes: number;
   };
+}
+
+interface UploadTimeouts {
+  mediaFetchMs: number;
+  streamStallMs: number;
+  configMs: number;
+  overallUploadMs: number;
+}
+
+interface MediaResponse {
+  response: Response;
+  url: URL;
+  controller: AbortController;
+  release: () => void;
 }
 
 interface MediaPort {
@@ -52,12 +76,15 @@ export async function uploadMediaCandidate(
   message: StartMediaUploadMessage,
   dependencies: UploadDependencies,
 ): Promise<string> {
-  const { fetchMedia, api, reportProgress } = dependencies;
+  const { fetchMedia, reportProgress } = dependencies;
+  const api = abortableMediaApi(dependencies.api, dependencies.signal);
+  const reportSessionCreated = dependencies.reportSessionCreated;
   const createPartSpool = dependencies.createPartSpool ?? createOpfsPartSpool;
   const limits = dependencies.limits ?? {
     maxMediaBytes: DEFAULT_MAX_MEDIA_BYTES,
     maxPlaylistBytes: DEFAULT_MAX_PLAYLIST_BYTES,
   };
+  const timeouts = dependencies.timeouts ?? defaultUploadTimeouts();
   const mediaUrl = safeMediaUrl(message.candidate.url);
   if (message.candidate.kind !== "mp4" && message.candidate.kind !== "hls") {
     throw new UploadError("unsupported_media_candidate", "The selected media is not an MP4 or HLS playlist");
@@ -79,8 +106,11 @@ export async function uploadMediaCandidate(
       fetchMedia,
       api,
       reportProgress,
+      reportSessionCreated,
       createPartSpool,
       limits.maxMediaBytes,
+      timeouts,
+      dependencies.signal,
     );
   }
   return uploadHls(
@@ -90,8 +120,11 @@ export async function uploadMediaCandidate(
     fetchMedia,
     api,
     reportProgress,
+    reportSessionCreated,
     createPartSpool,
     limits,
+    timeouts,
+    dependencies.signal,
   );
 }
 
@@ -102,68 +135,80 @@ async function uploadMp4(
   fetchMedia: FetchMedia,
   api: MediaUploadApi,
   reportProgress: UploadDependencies["reportProgress"],
+  reportSessionCreated: UploadDependencies["reportSessionCreated"],
   createPartSpool: () => Promise<MediaPartSpool>,
   maxMediaBytes: number,
+  timeouts: UploadTimeouts,
+  signal?: AbortSignal,
 ): Promise<string> {
-  const { response } = await fetchWithBrowserCredentials(fetchMedia, mediaUrl);
-  const declaredBytes = contentLength(response.headers.get("Content-Length"));
-  if (declaredBytes !== null && declaredBytes > maxMediaBytes) {
-    throw new UploadError("media_too_large", "The selected media exceeds the 4 GiB upload limit");
-  }
-  await reportProgress({
-    type: "MEDIA_UPLOAD_PROGRESS",
-    jobId,
-    uploadedBytes: 0,
-    totalBytes: declaredBytes,
-  });
-
-  if (declaredBytes === null) {
-    return spoolAndUpload(
-      jobId,
-      contentId,
-      "mp4",
-      responseChunks(response),
-      api,
-      reportProgress,
-      createPartSpool,
-      maxMediaBytes,
-    );
-  }
-
-  const partCount = Math.ceil(declaredBytes / MEDIA_PART_BYTES);
-  const session = await createSession(api, contentId, "mp4", declaredBytes, partCount);
+  const fetched = await fetchWithBrowserCredentials(fetchMedia, mediaUrl, timeouts.mediaFetchMs, signal);
   try {
-    let uploadedBytes = 0;
-    let uploadedParts = 0;
-    for await (const part of fixedSizeParts(response, MEDIA_PART_BYTES)) {
-      if (uploadedBytes + part.byteLength > maxMediaBytes) {
-        throw new UploadError("media_too_large", "The selected media exceeds the 4 GiB upload limit");
-      }
-      if (uploadedBytes + part.byteLength > declaredBytes || uploadedParts >= partCount) {
-        throw new UploadError("media_size_mismatch", "The MP4 exceeded its declared Content-Length");
-      }
-      await uploadPartWithResume(api, session.sessionId, uploadedParts, part);
-      uploadedParts += 1;
-      uploadedBytes += part.byteLength;
-      await reportProgress({
-        type: "MEDIA_UPLOAD_PROGRESS",
-        jobId,
-        uploadedBytes,
-        totalBytes: declaredBytes,
-      });
+    const { response } = fetched;
+    const declaredBytes = contentLength(response.headers.get("Content-Length"));
+    if (declaredBytes !== null && declaredBytes > maxMediaBytes) {
+      throw new UploadError("media_too_large", "The selected media exceeds the 4 GiB upload limit");
     }
-    if (uploadedBytes !== declaredBytes || uploadedParts !== partCount) {
-      throw new UploadError("media_size_mismatch", "The MP4 did not match its declared Content-Length");
-    }
-    await api.completeMediaSession(session.sessionId, {
-      kind: "mp4",
-      partCount,
-      totalBytes: uploadedBytes,
+    await reportProgress({
+      type: "MEDIA_UPLOAD_PROGRESS",
+      jobId,
+      uploadedBytes: 0,
+      totalBytes: declaredBytes,
     });
-    return session.sessionId;
-  } catch (error) {
-    await api.cancelMediaSession(session.sessionId).catch(() => undefined);
-    throw error;
+
+    if (declaredBytes === null) {
+      return await spoolAndUpload(
+        jobId,
+        contentId,
+        "mp4",
+        responseChunks(fetched, timeouts.streamStallMs),
+        api,
+        reportProgress,
+        reportSessionCreated,
+        createPartSpool,
+        maxMediaBytes,
+        signal,
+      );
+    }
+
+    const partCount = Math.ceil(declaredBytes / MEDIA_PART_BYTES);
+    const session = await createSession(api, contentId, "mp4", declaredBytes, partCount);
+    await reportSessionCreated?.(jobId, session).catch(() => undefined);
+    try {
+      let uploadedBytes = 0;
+      let uploadedParts = 0;
+      for await (const part of fixedSizeParts(fetched, MEDIA_PART_BYTES, timeouts.streamStallMs)) {
+        if (uploadedBytes + part.byteLength > maxMediaBytes) {
+          throw new UploadError("media_too_large", "The selected media exceeds the 4 GiB upload limit");
+        }
+        if (uploadedBytes + part.byteLength > declaredBytes || uploadedParts >= partCount) {
+          throw new UploadError("media_size_mismatch", "The MP4 exceeded its declared Content-Length");
+        }
+        await uploadPartWithResume(api, session.sessionId, uploadedParts, part);
+        uploadedParts += 1;
+        uploadedBytes += part.byteLength;
+        await reportProgress({
+          type: "MEDIA_UPLOAD_PROGRESS",
+          jobId,
+          uploadedBytes,
+          totalBytes: declaredBytes,
+        });
+      }
+      if (uploadedBytes !== declaredBytes || uploadedParts !== partCount) {
+        throw new UploadError("media_size_mismatch", "The MP4 did not match its declared Content-Length");
+      }
+      await completeSessionWithRecovery(api, session.sessionId, {
+        kind: "mp4",
+        partCount,
+        totalBytes: uploadedBytes,
+      });
+      return session.sessionId;
+    } catch (error) {
+      await api.cancelMediaSession(session.sessionId).catch(() => undefined);
+      throw error;
+    }
+  } finally {
+    if (!fetched.controller.signal.aborted) fetched.controller.abort();
+    fetched.release();
   }
 }
 
@@ -174,10 +219,13 @@ async function uploadHls(
   fetchMedia: FetchMedia,
   api: MediaUploadApi,
   reportProgress: UploadDependencies["reportProgress"],
+  reportSessionCreated: UploadDependencies["reportSessionCreated"],
   createPartSpool: () => Promise<MediaPartSpool>,
   limits: NonNullable<UploadDependencies["limits"]>,
+  timeouts: UploadTimeouts,
+  signal?: AbortSignal,
 ): Promise<string> {
-  const master = await fetchText(fetchMedia, playlistUrl, limits.maxPlaylistBytes);
+  const master = await fetchText(fetchMedia, playlistUrl, limits.maxPlaylistBytes, timeouts, signal);
   validatePlaylistReferences(master.body, master.url);
   validateSupportedPlaylist(master.body);
   const variants = parseVariants(master.body, master.url);
@@ -191,7 +239,7 @@ async function uploadHls(
       throw new UploadError("unsupported_hls_variant", "The playlist has no variant at or below 1080p");
     }
     mediaPlaylistUrl = selected.url;
-    const selectedPlaylist = await fetchText(fetchMedia, mediaPlaylistUrl, limits.maxPlaylistBytes);
+    const selectedPlaylist = await fetchText(fetchMedia, mediaPlaylistUrl, limits.maxPlaylistBytes, timeouts, signal);
     mediaPlaylistUrl = selectedPlaylist.url;
     mediaPlaylist = selectedPlaylist.body;
     validatePlaylistReferences(mediaPlaylist, mediaPlaylistUrl);
@@ -206,11 +254,13 @@ async function uploadHls(
     jobId,
     contentId,
     "hls",
-    hlsChunks(resourceUrls, fetchMedia),
+    hlsChunks(resourceUrls, fetchMedia, timeouts, signal),
     api,
     reportProgress,
+    reportSessionCreated,
     createPartSpool,
     limits.maxMediaBytes,
+    signal,
   );
 }
 
@@ -221,17 +271,20 @@ async function spoolAndUpload(
   chunks: AsyncIterable<Uint8Array>,
   api: MediaUploadApi,
   reportProgress: UploadDependencies["reportProgress"],
+  reportSessionCreated: UploadDependencies["reportSessionCreated"],
   createPartSpool: () => Promise<MediaPartSpool>,
   maxMediaBytes: number,
+  signal?: AbortSignal,
 ): Promise<string> {
-  const spool = await createPartSpool();
+  const spool = await waitForAbort(createPartSpool(), signal);
   let sessionId: string | null = null;
   let partCount = 0;
   let totalBytes = 0;
+  let completed = false;
   try {
     try {
       for await (const part of toFixedChunks(limitMediaChunks(chunks, maxMediaBytes), MEDIA_PART_BYTES)) {
-        await spool.write(partCount, part);
+        await waitForAbort(spool.write(partCount, part), signal);
         partCount += 1;
         totalBytes += part.byteLength;
       }
@@ -246,9 +299,10 @@ async function spoolAndUpload(
       });
       const session = await createSession(api, contentId, kind, totalBytes, partCount);
       sessionId = session.sessionId;
+      await reportSessionCreated?.(jobId, session).catch(() => undefined);
       let uploadedBytes = 0;
       for (let partNumber = 0; partNumber < partCount; partNumber += 1) {
-        const part = await spool.read(partNumber);
+        const part = await waitForAbort(spool.read(partNumber), signal);
         await uploadPartWithResume(api, sessionId, partNumber, part);
         uploadedBytes += part.byteLength;
         await reportProgress({
@@ -258,7 +312,7 @@ async function spoolAndUpload(
           totalBytes,
         });
       }
-      await api.completeMediaSession(sessionId, {
+      await completeSessionWithRecovery(api, sessionId, {
         kind,
         partCount,
         totalBytes,
@@ -266,14 +320,39 @@ async function spoolAndUpload(
           manifest: { parts: Array.from({ length: partCount }, (_, index) => index) },
         } : {}),
       });
+      completed = true;
       return sessionId;
     } finally {
-      await spool.dispose();
+      if (completed) await spool.dispose().catch(() => undefined);
+      else await spool.dispose();
     }
   } catch (error) {
     if (sessionId) await api.cancelMediaSession(sessionId).catch(() => undefined);
     throw error;
   }
+}
+
+async function completeSessionWithRecovery(
+  api: MediaUploadApi,
+  sessionId: string,
+  input: Parameters<MediaUploadApi["completeMediaSession"]>[1],
+): Promise<void> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < MAX_COMPLETE_ATTEMPTS; attempt += 1) {
+    try {
+      await api.completeMediaSession(sessionId, input);
+      return;
+    } catch (error) {
+      lastError = error;
+      try {
+        const session = await api.getMediaSession(sessionId);
+        if (session.status === "complete" || session.status === "consumed") return;
+      } catch {
+        // A failed status check is still ambiguous, so the bounded completion retry continues.
+      }
+    }
+  }
+  throw lastError;
 }
 
 async function createSession(
@@ -320,33 +399,130 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+function defaultUploadTimeouts(): UploadTimeouts {
+  return {
+    mediaFetchMs: DEFAULT_MEDIA_FETCH_TIMEOUT_MS,
+    streamStallMs: DEFAULT_STREAM_STALL_TIMEOUT_MS,
+    configMs: DEFAULT_CONFIG_TIMEOUT_MS,
+    overallUploadMs: DEFAULT_OVERALL_UPLOAD_TIMEOUT_MS,
+  };
+}
+
+function abortableMediaApi(api: MediaUploadApi, signal?: AbortSignal): MediaUploadApi {
+  if (!signal) return api;
+  return {
+    inspect: (input) => waitForAbort(api.inspect(input), signal),
+    createMediaSession: (input) => waitForAbort(api.createMediaSession(input), signal),
+    getMediaSession: (sessionId) => waitForAbort(api.getMediaSession(sessionId), signal),
+    uploadPart: (sessionId, partNumber, bytes, sha256) => waitForAbort(
+      api.uploadPart(sessionId, partNumber, bytes, sha256),
+      signal,
+    ),
+    completeMediaSession: (sessionId, input) => waitForAbort(api.completeMediaSession(sessionId, input), signal),
+    // Cancellation must still reach the server after the overall signal has fired.
+    cancelMediaSession: (sessionId) => api.cancelMediaSession(sessionId),
+  };
+}
+
+function waitForAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortReason(signal));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      cleanup();
+      reject(abortReason(signal));
+    };
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => { cleanup(); resolve(value); },
+      (error) => { cleanup(); reject(error); },
+    );
+  });
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, error: UploadError): Promise<T> {
+  let timer: ReturnType<typeof globalThis.setTimeout> | null = null;
+  return new Promise<T>((resolve, reject) => {
+    timer = globalThis.setTimeout(() => reject(error), timeoutMs);
+    promise.then(resolve, reject);
+  }).finally(() => {
+    if (timer !== null) globalThis.clearTimeout(timer);
+  });
+}
+
+function linkedAbortController(signal?: AbortSignal): {
+  controller: AbortController;
+  release: () => void;
+} {
+  const controller = new AbortController();
+  const forwardAbort = () => controller.abort(signal?.reason);
+  if (signal) {
+    if (signal.aborted) forwardAbort();
+    else signal.addEventListener("abort", forwardAbort, { once: true });
+  }
+  return {
+    controller,
+    release: () => signal?.removeEventListener("abort", forwardAbort),
+  };
+}
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new UploadError("media_upload_aborted", "The media upload was aborted");
+}
+
 async function fetchWithBrowserCredentials(
   fetchMedia: FetchMedia,
   url: URL,
-): Promise<{ response: Response; url: URL }> {
-  const response = await fetchMedia(url.href, { credentials: "include", redirect: "error" });
-  const finalUrl = response.url ? safeMediaUrl(response.url) : url;
-  if (!response.ok) {
-    throw new UploadError("media_fetch_failed", `Media request failed with status ${response.status}`);
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<MediaResponse> {
+  const linked = linkedAbortController(signal);
+  const timeoutError = new UploadError("media_fetch_timeout", "The media request timed out");
+  const timer = globalThis.setTimeout(() => linked.controller.abort(timeoutError), timeoutMs);
+  try {
+    const response = await waitForAbort(fetchMedia(url.href, {
+      credentials: "include",
+      redirect: "error",
+      signal: linked.controller.signal,
+    }), linked.controller.signal);
+    const finalUrl = response.url ? safeMediaUrl(response.url) : url;
+    if (!response.ok) {
+      linked.release();
+      throw new UploadError("media_fetch_failed", `Media request failed with status ${response.status}`);
+    }
+    return { response, url: finalUrl, controller: linked.controller, release: linked.release };
+  } catch (error) {
+    if (!linked.controller.signal.aborted) linked.controller.abort(error);
+    linked.release();
+    if (linked.controller.signal.aborted) throw abortReason(linked.controller.signal);
+    throw error;
+  } finally {
+    globalThis.clearTimeout(timer);
   }
-  return { response, url: finalUrl };
 }
 
 async function fetchText(
   fetchMedia: FetchMedia,
   url: URL,
   maxBytes: number,
+  timeouts: UploadTimeouts,
+  signal?: AbortSignal,
 ): Promise<{ body: string; url: URL }> {
-  const fetched = await fetchWithBrowserCredentials(fetchMedia, url);
+  const fetched = await fetchWithBrowserCredentials(fetchMedia, url, timeouts.mediaFetchMs, signal);
   const { response } = fetched;
   const declaredBytes = contentLength(response.headers.get("Content-Length"));
   if (declaredBytes !== null && declaredBytes > maxBytes) {
+    fetched.controller.abort();
+    fetched.release();
     throw new UploadError("hls_playlist_too_large", "The HLS playlist exceeds the 2 MiB limit");
   }
   const decoder = new TextDecoder();
   let body = "";
   let bytesRead = 0;
-  for await (const chunk of responseChunks(response)) {
+  for await (const chunk of responseChunks(fetched, timeouts.streamStallMs)) {
     bytesRead += chunk.byteLength;
     if (bytesRead > maxBytes) {
       throw new UploadError("hls_playlist_too_large", "The HLS playlist exceeds the 2 MiB limit");
@@ -360,15 +536,24 @@ async function fetchText(
   return { body, url: fetched.url };
 }
 
-async function* hlsChunks(urls: URL[], fetchMedia: FetchMedia): AsyncGenerator<Uint8Array> {
+async function* hlsChunks(
+  urls: URL[],
+  fetchMedia: FetchMedia,
+  timeouts: UploadTimeouts,
+  signal?: AbortSignal,
+): AsyncGenerator<Uint8Array> {
   for (const url of urls) {
-    const { response } = await fetchWithBrowserCredentials(fetchMedia, url);
-    for await (const chunk of responseChunks(response)) yield chunk;
+    const fetched = await fetchWithBrowserCredentials(fetchMedia, url, timeouts.mediaFetchMs, signal);
+    for await (const chunk of responseChunks(fetched, timeouts.streamStallMs)) yield chunk;
   }
 }
 
-async function* fixedSizeParts(response: Response, partSize: number): AsyncGenerator<Uint8Array> {
-  yield* toFixedChunks(responseChunks(response), partSize);
+async function* fixedSizeParts(
+  response: MediaResponse,
+  partSize: number,
+  streamStallMs: number,
+): AsyncGenerator<Uint8Array> {
+  yield* toFixedChunks(responseChunks(response, streamStallMs), partSize);
 }
 
 async function* toFixedChunks(
@@ -394,15 +579,24 @@ async function* toFixedChunks(
   if (used > 0) yield part.slice(0, used);
 }
 
-async function* responseChunks(response: Response): AsyncGenerator<Uint8Array> {
-  if (!response.body) {
+async function* responseChunks(fetched: MediaResponse, stallTimeoutMs: number): AsyncGenerator<Uint8Array> {
+  if (!fetched.response.body) {
+    fetched.release();
     throw new UploadError("media_stream_unavailable", "The media response has no readable stream");
   }
-  const reader = response.body.getReader();
+  const reader = fetched.response.body.getReader();
   let finished = false;
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const timeoutError = new UploadError("media_stream_timeout", "The media stream stopped responding");
+      const timer = globalThis.setTimeout(() => fetched.controller.abort(timeoutError), stallTimeoutMs);
+      let chunk: ReadableStreamReadResult<Uint8Array>;
+      try {
+        chunk = await waitForAbort(reader.read(), fetched.controller.signal);
+      } finally {
+        globalThis.clearTimeout(timer);
+      }
+      const { done, value } = chunk;
       if (done) {
         finished = true;
         return;
@@ -412,6 +606,7 @@ async function* responseChunks(response: Response): AsyncGenerator<Uint8Array> {
   } finally {
     if (!finished) await reader.cancel().catch(() => undefined);
     reader.releaseLock();
+    fetched.release();
   }
 }
 
@@ -721,65 +916,12 @@ export function createReconnectingMediaPort(
   };
 }
 
-function createPortMediaApi(port: MediaPort): MediaUploadApi {
-  const pending = new Map<string, {
-    resolve: (value: unknown) => void;
-    reject: (error: Error) => void;
-  }>();
-  port.onMessage.addListener((message: unknown) => {
-    if (!isMediaApiResponse(message)) return;
-    const request = pending.get(message.requestId);
-    if (!request) return;
-    pending.delete(message.requestId);
-    if (message.ok) {
-      request.resolve(message.result);
-      return;
-    }
-    const error = new Error(message.error?.message ?? "Media API request failed") as Error & { code?: string };
-    error.code = message.error?.code ?? "media_api_failed";
-    request.reject(error);
-  });
-  port.onDisconnect.addListener(() => {
-    for (const request of pending.values()) request.reject(new Error("Media API port disconnected"));
-    pending.clear();
-  });
-
-  const request = <T>(operation: MediaApiRequest["operation"], args: unknown[]): Promise<T> => {
-    const requestId = crypto.randomUUID();
-    return new Promise<T>((resolve, reject) => {
-      pending.set(requestId, {
-        resolve: (value) => resolve(value as T),
-        reject,
-      });
-      try {
-        port.postMessage({ type: "MEDIA_API_REQUEST", requestId, operation, args } satisfies MediaApiRequest);
-      } catch (error) {
-        pending.delete(requestId);
-        reject(error);
-      }
-    });
-  };
-
-  return {
-    inspect: (input) => request("inspect", [input]),
-    createMediaSession: (input) => request("createMediaSession", [input]),
-    getMediaSession: (sessionId) => request("getMediaSession", [sessionId]),
-    uploadPart: (sessionId, partNumber, bytes, sha256) => request(
-      "uploadPart",
-      [sessionId, partNumber, bytes, sha256],
-    ),
-    completeMediaSession: (sessionId, input) => request("completeMediaSession", [sessionId, input]),
-    cancelMediaSession: (sessionId) => request("cancelMediaSession", [sessionId]),
-  };
-}
-
 export function installOffscreenHandlers(
   port: MediaPort,
   provided: Partial<UploadDependencies> = {},
 ): () => string | null {
-  const dependencies: UploadDependencies = {
+  const dependencies = {
     fetchMedia: provided.fetchMedia ?? globalThis.fetch.bind(globalThis),
-    api: provided.api ?? createPortMediaApi(port),
     reportProgress: provided.reportProgress ?? (async (message) => { port.postMessage(message); }),
     createPartSpool: provided.createPartSpool ?? createOpfsPartSpool,
     cleanupPartSpools: provided.cleanupPartSpools ?? cleanupOpfsPartSpools,
@@ -787,10 +929,35 @@ export function installOffscreenHandlers(
       maxMediaBytes: DEFAULT_MAX_MEDIA_BYTES,
       maxPlaylistBytes: DEFAULT_MAX_PLAYLIST_BYTES,
     },
-  };
+    timeouts: provided.timeouts ?? defaultUploadTimeouts(),
+  } satisfies Omit<UploadDependencies, "api">;
+  let resolveApi: ((api: MediaUploadApi) => void) | null = null;
+  const apiReady = provided.api
+    ? Promise.resolve(provided.api)
+    : new Promise<MediaUploadApi>((resolve) => { resolveApi = resolve; });
   let activeJobId: string | null = null;
+  let activeSession: MediaSessionCreatedMessage | null = null;
   const cleanup = dependencies.cleanupPartSpools?.().catch(() => undefined) ?? Promise.resolve();
   port.onMessage.addListener((message: unknown) => {
+    if (isMediaUploadConfigMessage(message)) {
+      if (resolveApi) {
+        const identityStore: InstallationIdentityStore = {
+          loadOrCreate: async () => ({
+            installationId: message.installationId,
+            installationToken: message.installationToken,
+          }),
+        };
+        resolveApi(createApi(message.apiBaseUrl, identityStore));
+        resolveApi = null;
+      }
+      port.postMessage({
+        type: "MEDIA_UPLOAD_CONTEXT",
+        jobId: activeJobId,
+        mediaSessionId: activeSession?.mediaSessionId ?? null,
+      } satisfies MediaUploadContextMessage);
+      if (activeSession) port.postMessage(activeSession);
+      return;
+    }
     if (!isStartMediaUploadMessage(message)) return;
     if (activeJobId === message.jobId) return;
     if (activeJobId !== null) {
@@ -802,7 +969,36 @@ export function installOffscreenHandlers(
       return;
     }
     activeJobId = message.jobId;
-    void cleanup.then(() => uploadMediaCandidate(message, dependencies))
+    const controller = new AbortController();
+    const overallError = new UploadError("media_upload_timeout", "The media upload exceeded its time limit");
+    const overallTimer = globalThis.setTimeout(
+      () => controller.abort(overallError),
+      dependencies.timeouts.overallUploadMs,
+    );
+    const configuredApi = withTimeout(
+      apiReady,
+      dependencies.timeouts.configMs,
+      new UploadError("media_api_config_timeout", "The media API configuration did not arrive"),
+    );
+    void waitForAbort(Promise.all([cleanup, configuredApi]), controller.signal).then(([, api]) => uploadMediaCandidate(message, {
+      ...dependencies,
+      api,
+      signal: controller.signal,
+      reportSessionCreated: async (jobId, session) => {
+        activeSession = {
+          type: "MEDIA_SESSION_CREATED",
+          jobId,
+          mediaSessionId: session.sessionId,
+          contentId: session.contentId,
+          contentRef: message.contentRef,
+        };
+        try {
+          port.postMessage(activeSession);
+        } catch {
+          // A reconnecting background learns this session from MEDIA_UPLOAD_CONTEXT.
+        }
+      },
+    }))
       .then((mediaSessionId) => port.postMessage({
         type: "MEDIA_UPLOAD_COMPLETE",
         jobId: message.jobId,
@@ -814,7 +1010,11 @@ export function installOffscreenHandlers(
         code: errorCode(error),
       }))
       .finally(() => {
-        if (activeJobId === message.jobId) activeJobId = null;
+        globalThis.clearTimeout(overallTimer);
+        if (activeJobId === message.jobId) {
+          activeJobId = null;
+          activeSession = null;
+        }
       });
   });
   return () => activeJobId;
@@ -832,12 +1032,13 @@ function isStartMediaUploadMessage(message: unknown): message is StartMediaUploa
     && candidate.candidate !== null;
 }
 
-function isMediaApiResponse(message: unknown): message is MediaApiResponse {
+function isMediaUploadConfigMessage(message: unknown): message is MediaUploadConfigMessage {
   if (typeof message !== "object" || message === null) return false;
-  const response = message as Partial<MediaApiResponse>;
-  return response.type === "MEDIA_API_RESPONSE"
-    && typeof response.requestId === "string"
-    && typeof response.ok === "boolean";
+  const config = message as Partial<MediaUploadConfigMessage>;
+  return config.type === "MEDIA_UPLOAD_CONFIG"
+    && typeof config.apiBaseUrl === "string"
+    && typeof config.installationId === "string"
+    && typeof config.installationToken === "string";
 }
 
 function errorCode(error: unknown): string {

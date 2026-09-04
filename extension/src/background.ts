@@ -3,18 +3,24 @@ import type {
   AnalyzedTab,
   ContentRef,
   ExtensionMessage,
-  MediaApiRequest,
-  MediaApiResponse,
+  MediaSessionCreatedMessage,
   MediaCandidate,
+  MediaUploadConfigMessage,
+  MediaUploadContextMessage,
   MediaUploadMessage,
 } from "./shared/types";
 import { OFFSCREEN_MEDIA_PORT } from "./shared/types";
 import { contentKey, parseContentRef, parseXStatusRoute } from "./shared/content";
-import { createApi, type MediaUploadApi } from "./sidepanel/api";
+import { createApi, DEFAULT_API_BASE_URL, type MediaUploadApi } from "./sidepanel/api";
+import {
+  browserInstallationIdentityStore,
+  type InstallationIdentityStore,
+} from "./sidepanel/identity";
 
 const STORAGE_KEY = "analyzedTabs";
 const MEDIA_STORAGE_KEY = "xMediaCapture";
 const MEDIA_UPLOAD_JOBS_KEY = "mediaUploadJobs";
+const ACTIVE_MEDIA_SESSION_KEY = "activeMediaUploadSession";
 const LAST_DETECTED_STORAGE_KEY = "xLastDetectedContent";
 const MEDIA_CLEANUP_ALARM = "xMediaCandidateCleanup";
 const CAPTURE_WINDOW_MS = 15_000;
@@ -67,15 +73,28 @@ interface BackgroundState {
   offscreenPortWaiters: Array<(port: chrome.runtime.Port) => void>;
   activeUploadJobId: string | null;
   completedUploadJobIds: Set<string>;
+  activeMediaSession: ActiveMediaSession | null;
+  offscreenContext: MediaUploadContextMessage | null;
+  orphanCheckTimer: ReturnType<typeof globalThis.setTimeout> | null;
 }
 
 interface BackgroundDependencies {
   mediaApi?: MediaUploadApi;
+  apiBaseUrl?: string;
+  identityStore?: InstallationIdentityStore;
 }
 
 interface MediaUploadJobsState {
   activeJobId: string | null;
   completedJobIds: string[];
+}
+
+interface ActiveMediaSession {
+  jobId: string;
+  sessionId: string;
+  contentId: string;
+  contentRef: ContentRef;
+  updatedAt: number;
 }
 
 type ChromeApi = Pick<
@@ -101,7 +120,9 @@ export function installBackgroundHandlers(
   chromeApi: ChromeApi,
   dependencies: BackgroundDependencies = {},
 ): void {
-  const mediaApi = dependencies.mediaApi ?? createApi();
+  const apiBaseUrl = dependencies.apiBaseUrl ?? DEFAULT_API_BASE_URL;
+  const identityStore = dependencies.identityStore ?? browserInstallationIdentityStore;
+  const mediaApi = dependencies.mediaApi ?? createApi(apiBaseUrl, identityStore);
   const lastDetectedContentByTab = new Map<number, ContentRef>();
   const recentRequestsByTab = new Map<number, BufferedMediaCandidate[]>();
   const routeEpochByTab = new Map<number, XRouteEpoch>();
@@ -151,14 +172,29 @@ export function installBackgroundHandlers(
     offscreenPortWaiters: [],
     activeUploadJobId: null,
     completedUploadJobIds: new Set(),
+    activeMediaSession: null,
+    offscreenContext: null,
+    orphanCheckTimer: null,
   };
   void chromeApi.sidePanel
     .setPanelBehavior({ openPanelOnActionClick: false })
     .catch(reportBackgroundError);
   const initialization = runCaptureTask(async () => {
-    const uploadJobs = await loadMediaUploadJobsState(chromeApi);
+    const [uploadJobs, activeMediaSession] = await Promise.all([
+      loadMediaUploadJobsState(chromeApi),
+      loadActiveMediaSession(chromeApi),
+    ]);
     state.activeUploadJobId = uploadJobs.activeJobId;
     state.completedUploadJobIds = new Set(uploadJobs.completedJobIds);
+    state.activeMediaSession = activeMediaSession;
+    if (activeMediaSession && state.activeUploadJobId === null) {
+      state.activeUploadJobId = activeMediaSession.jobId;
+      await saveMediaUploadJobsState(chromeApi, state);
+    }
+    if (activeMediaSession) {
+      if (await chromeApi.offscreen.hasDocument()) scheduleOrphanCheck(chromeApi, mediaApi, state);
+      else await cancelPersistedMediaSession(chromeApi, mediaApi, state, activeMediaSession);
+    }
     await initializeMediaCapture(chromeApi);
     await configureActiveTab(chromeApi, lastDetectedContentByTab, routeEpochByTab);
   });
@@ -256,21 +292,26 @@ export function installBackgroundHandlers(
       return;
     }
     state.offscreenPort = port;
+    state.offscreenContext = null;
     for (const resolve of state.offscreenPortWaiters.splice(0)) resolve(port);
+    void identityStore.loadOrCreate().then((identity) => {
+      if (state.offscreenPort !== port) return;
+      port.postMessage({
+        type: "MEDIA_UPLOAD_CONFIG",
+        apiBaseUrl,
+        installationId: identity.installationId,
+        installationToken: identity.installationToken,
+      } satisfies MediaUploadConfigMessage);
+    }).catch(reportBackgroundError);
     port.onMessage.addListener((message: unknown) => {
-      void handleOffscreenPortMessage(chromeApi, mediaApi, port, message, state)
+      void handleOffscreenPortMessage(chromeApi, mediaApi, message, state)
         .catch(reportBackgroundError);
     });
     port.onDisconnect.addListener(() => {
       if (state.offscreenPort !== port) return;
       state.offscreenPort = null;
-      globalThis.setTimeout(() => {
-        if (state.offscreenPort !== null) return;
-        void state.runCaptureTask(async () => {
-          state.activeUploadJobId = null;
-          await saveMediaUploadJobsState(chromeApi, state);
-        }).catch(reportBackgroundError);
-      }, 1_000);
+      state.offscreenContext = null;
+      scheduleOrphanCheck(chromeApi, mediaApi, state);
     });
   });
 
@@ -571,6 +612,54 @@ function waitForOffscreenPort(state: BackgroundState): Promise<chrome.runtime.Po
   });
 }
 
+function clearOrphanCheck(state: BackgroundState): void {
+  if (state.orphanCheckTimer !== null) globalThis.clearTimeout(state.orphanCheckTimer);
+  state.orphanCheckTimer = null;
+}
+
+function scheduleOrphanCheck(
+  chromeApi: ChromeApi,
+  mediaApi: MediaUploadApi,
+  state: BackgroundState,
+): void {
+  if (state.activeUploadJobId === null) return;
+  clearOrphanCheck(state);
+  state.orphanCheckTimer = globalThis.setTimeout(() => {
+    state.orphanCheckTimer = null;
+    const active = state.activeMediaSession;
+    const contextMatches = active !== null
+      && state.offscreenContext?.jobId === active.jobId
+      && state.offscreenContext.mediaSessionId === active.sessionId;
+    if (contextMatches) return;
+    void state.runCaptureTask(async () => {
+      if (state.activeMediaSession) {
+        await cancelPersistedMediaSession(chromeApi, mediaApi, state, state.activeMediaSession);
+        return;
+      }
+      if (state.offscreenPort !== null) return;
+      state.activeUploadJobId = null;
+      await saveMediaUploadJobsState(chromeApi, state);
+    }).catch(reportBackgroundError);
+  }, 5_000);
+}
+
+async function cancelPersistedMediaSession(
+  chromeApi: ChromeApi,
+  mediaApi: MediaUploadApi,
+  state: BackgroundState,
+  active: ActiveMediaSession,
+): Promise<void> {
+  await mediaApi.cancelMediaSession(active.sessionId).catch(() => undefined);
+  if (state.activeMediaSession?.sessionId !== active.sessionId) return;
+  state.activeMediaSession = null;
+  await chromeApi.storage.local.remove(ACTIVE_MEDIA_SESSION_KEY);
+  if (state.activeUploadJobId === active.jobId) {
+    state.activeUploadJobId = null;
+    await saveMediaUploadJobsState(chromeApi, state);
+  }
+  clearOrphanCheck(state);
+}
+
 function isTrustedSidePanelSender(chromeApi: ChromeApi, sender: chrome.runtime.MessageSender): boolean {
   return sender.id === chromeApi.runtime.id
     && sender.url === chromeApi.runtime.getURL("sidepanel.html");
@@ -590,30 +679,44 @@ function sameMediaCandidate(left: MediaCandidate, right: MediaCandidate): boolea
 async function handleOffscreenPortMessage(
   chromeApi: ChromeApi,
   mediaApi: MediaUploadApi,
-  port: chrome.runtime.Port,
   message: unknown,
   state: BackgroundState,
 ): Promise<void> {
-  if (isMediaApiRequest(message)) {
-    try {
-      const result = await invokeMediaApi(mediaApi, message);
-      port.postMessage({
-        type: "MEDIA_API_RESPONSE",
-        requestId: message.requestId,
-        ok: true,
-        result,
-      } satisfies MediaApiResponse);
-    } catch (error) {
-      port.postMessage({
-        type: "MEDIA_API_RESPONSE",
-        requestId: message.requestId,
-        ok: false,
-        error: {
-          code: errorCodeFromApi(error),
-          message: error instanceof Error ? error.message : "Media API request failed",
-        },
-      } satisfies MediaApiResponse);
-    }
+  if (isMediaUploadContextMessage(message)) {
+    state.offscreenContext = message;
+    await state.runCaptureTask(async () => {
+      const active = state.activeMediaSession;
+      if (!active) {
+        if (state.activeUploadJobId === null || message.jobId === state.activeUploadJobId) {
+          clearOrphanCheck(state);
+          return;
+        }
+        state.activeUploadJobId = null;
+        await saveMediaUploadJobsState(chromeApi, state);
+        clearOrphanCheck(state);
+        return;
+      }
+      if (message.jobId === active.jobId && message.mediaSessionId === active.sessionId) {
+        clearOrphanCheck(state);
+        return;
+      }
+      await cancelPersistedMediaSession(chromeApi, mediaApi, state, active);
+    });
+    return;
+  }
+  if (isMediaSessionCreatedMessage(message)) {
+    await state.runCaptureTask(async () => {
+      if (message.jobId !== state.activeUploadJobId) return;
+      const active: ActiveMediaSession = {
+        jobId: message.jobId,
+        sessionId: message.mediaSessionId,
+        contentId: message.contentId,
+        contentRef: message.contentRef,
+        updatedAt: Date.now(),
+      };
+      state.activeMediaSession = active;
+      await chromeApi.storage.local.set({ [ACTIVE_MEDIA_SESSION_KEY]: active });
+    });
     return;
   }
   if (!isMediaUploadNotification(message)) return;
@@ -627,27 +730,32 @@ async function handleOffscreenPortMessage(
       state.activeUploadJobId = null;
       await saveMediaUploadJobsState(chromeApi, state);
     }
+    if (message.type !== "MEDIA_UPLOAD_PROGRESS") {
+      state.activeMediaSession = null;
+      await chromeApi.storage.local.remove(ACTIVE_MEDIA_SESSION_KEY);
+    }
     return true;
   });
   if (!accepted) return;
   await chromeApi.runtime.sendMessage(message).catch(reportBackgroundError);
 }
 
-function isMediaApiRequest(message: unknown): message is MediaApiRequest {
+function isMediaSessionCreatedMessage(message: unknown): message is MediaSessionCreatedMessage {
   if (typeof message !== "object" || message === null) return false;
-  const request = message as Partial<MediaApiRequest>;
-  return request.type === "MEDIA_API_REQUEST"
-    && typeof request.requestId === "string"
-    && request.requestId.length > 0
-    && Array.isArray(request.args)
-    && [
-      "inspect",
-      "createMediaSession",
-      "getMediaSession",
-      "uploadPart",
-      "completeMediaSession",
-      "cancelMediaSession",
-    ].includes(request.operation ?? "");
+  const created = message as Partial<MediaSessionCreatedMessage>;
+  return created.type === "MEDIA_SESSION_CREATED"
+    && typeof created.jobId === "string"
+    && typeof created.mediaSessionId === "string"
+    && typeof created.contentId === "string"
+    && isValidXContentRef(created.contentRef);
+}
+
+function isMediaUploadContextMessage(message: unknown): message is MediaUploadContextMessage {
+  if (typeof message !== "object" || message === null) return false;
+  const context = message as Partial<MediaUploadContextMessage>;
+  return context.type === "MEDIA_UPLOAD_CONTEXT"
+    && (context.jobId === null || typeof context.jobId === "string")
+    && (context.mediaSessionId === null || typeof context.mediaSessionId === "string");
 }
 
 function isMediaUploadNotification(
@@ -660,79 +768,6 @@ function isMediaUploadNotification(
     || notification.type === "MEDIA_UPLOAD_COMPLETE"
     || notification.type === "MEDIA_UPLOAD_FAILED"
   );
-}
-
-async function invokeMediaApi(api: MediaUploadApi, request: MediaApiRequest): Promise<unknown> {
-  const args = request.args;
-  switch (request.operation) {
-    case "inspect":
-      if (args.length !== 1 || (typeof args[0] !== "string" && !isRecord(args[0]))) break;
-      return api.inspect(args[0] as Parameters<MediaUploadApi["inspect"]>[0]);
-    case "createMediaSession":
-      if (args.length !== 1 || !isCreateMediaSessionInput(args[0])) break;
-      return api.createMediaSession(args[0]);
-    case "getMediaSession":
-      if (args.length !== 1 || typeof args[0] !== "string") break;
-      return api.getMediaSession(args[0]);
-    case "uploadPart":
-      if (
-        args.length !== 4
-        || typeof args[0] !== "string"
-        || !Number.isInteger(args[1])
-        || !(args[2] instanceof Uint8Array)
-        || typeof args[3] !== "string"
-      ) break;
-      return api.uploadPart(args[0], args[1] as number, args[2], args[3]);
-    case "completeMediaSession":
-      if (args.length !== 2 || typeof args[0] !== "string" || !isMediaSessionCompleteInput(args[1])) break;
-      return api.completeMediaSession(args[0], args[1]);
-    case "cancelMediaSession":
-      if (args.length !== 1 || typeof args[0] !== "string") break;
-      return api.cancelMediaSession(args[0]);
-  }
-  throw new Error("Invalid media API request");
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isCreateMediaSessionInput(
-  value: unknown,
-): value is Parameters<MediaUploadApi["createMediaSession"]>[0] {
-  if (!isRecord(value)) return false;
-  return typeof value.contentId === "string"
-    && (value.kind === "mp4" || value.kind === "hls")
-    && Number.isSafeInteger(value.expectedBytes)
-    && (value.expectedBytes as number) > 0
-    && Number.isSafeInteger(value.partCount)
-    && (value.partCount as number) > 0;
-}
-
-function isMediaSessionCompleteInput(
-  value: unknown,
-): value is Parameters<MediaUploadApi["completeMediaSession"]>[1] {
-  if (!isRecord(value)) return false;
-  if (
-    (value.kind !== "mp4" && value.kind !== "hls")
-    || !Number.isSafeInteger(value.partCount)
-    || (value.partCount as number) <= 0
-    || !Number.isSafeInteger(value.totalBytes)
-    || (value.totalBytes as number) <= 0
-  ) return false;
-  if (value.manifest === undefined) return true;
-  return isRecord(value.manifest)
-    && Array.isArray(value.manifest.parts)
-    && value.manifest.parts.every((part) => Number.isSafeInteger(part) && part >= 0);
-}
-
-function errorCodeFromApi(error: unknown): string {
-  return typeof error === "object"
-    && error !== null
-    && "code" in error
-    && typeof error.code === "string"
-    ? error.code
-    : "media_api_failed";
 }
 
 async function captureMediaCandidate(
@@ -1100,12 +1135,15 @@ function isSupportedPanelUrl(candidate: string | undefined): boolean {
   return parseXStatusRoute(candidate) !== null;
 }
 
-function isValidXContentRef(contentRef: ContentRef): boolean {
-  if (contentRef?.platform !== "x") return false;
+function isValidXContentRef(contentRef: unknown): contentRef is ContentRef {
+  if (typeof contentRef !== "object" || contentRef === null) return false;
+  const candidate = contentRef as Partial<ContentRef>;
+  if (candidate.platform !== "x") return false;
+  if (typeof candidate.sourceContentId !== "string" || typeof candidate.mediaIndex !== "number") return false;
   const parsed = parseContentRef(
-    `https://x.com/i/status/${contentRef.sourceContentId}/video/${contentRef.mediaIndex}`,
+    `https://x.com/i/status/${candidate.sourceContentId}/video/${candidate.mediaIndex}`,
   );
-  return Boolean(parsed && sameContentRef(parsed, contentRef));
+  return Boolean(parsed && sameContentRef(parsed, candidate as ContentRef));
 }
 
 function sameContentRef(left: ContentRef, right: ContentRef): boolean {
@@ -1165,6 +1203,25 @@ async function loadMediaUploadJobsState(chromeApi: ChromeApi): Promise<MediaUplo
     completedJobIds: Array.isArray(stored?.completedJobIds)
       ? stored.completedJobIds.filter((jobId): jobId is string => typeof jobId === "string")
       : [],
+  };
+}
+
+async function loadActiveMediaSession(chromeApi: ChromeApi): Promise<ActiveMediaSession | null> {
+  const value = await chromeApi.storage.local.get(ACTIVE_MEDIA_SESSION_KEY);
+  const stored = value[ACTIVE_MEDIA_SESSION_KEY] as Partial<ActiveMediaSession> | undefined;
+  if (
+    typeof stored?.jobId !== "string"
+    || typeof stored.sessionId !== "string"
+    || typeof stored.contentId !== "string"
+    || !isValidXContentRef(stored.contentRef)
+    || typeof stored.updatedAt !== "number"
+  ) return null;
+  return {
+    jobId: stored.jobId,
+    sessionId: stored.sessionId,
+    contentId: stored.contentId,
+    contentRef: stored.contentRef,
+    updatedAt: stored.updatedAt,
   };
 }
 

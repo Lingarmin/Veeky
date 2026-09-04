@@ -67,6 +67,20 @@ export interface MediaUploadFailedMessage {
   code: string;
 }
 
+export interface MediaSessionCreatedMessage {
+  type: "MEDIA_SESSION_CREATED";
+  jobId: string;
+  mediaSessionId: string;
+  contentId: string;
+  contentRef: ContentRef;
+}
+
+export interface MediaUploadContextMessage {
+  type: "MEDIA_UPLOAD_CONTEXT";
+  jobId: string | null;
+  mediaSessionId: string | null;
+}
+
 export type MediaUploadMessage =
   | StartMediaUploadMessage
   | MediaUploadProgressMessage
@@ -75,27 +89,11 @@ export type MediaUploadMessage =
 
 export const OFFSCREEN_MEDIA_PORT = "veeky-offscreen-media";
 
-export type MediaApiOperation =
-  | "inspect"
-  | "createMediaSession"
-  | "getMediaSession"
-  | "uploadPart"
-  | "completeMediaSession"
-  | "cancelMediaSession";
-
-export interface MediaApiRequest {
-  type: "MEDIA_API_REQUEST";
-  requestId: string;
-  operation: MediaApiOperation;
-  args: unknown[];
-}
-
-export interface MediaApiResponse {
-  type: "MEDIA_API_RESPONSE";
-  requestId: string;
-  ok: boolean;
-  result?: unknown;
-  error?: { code: string; message: string };
+export interface MediaUploadConfigMessage {
+  type: "MEDIA_UPLOAD_CONFIG";
+  apiBaseUrl: string;
+  installationId: string;
+  installationToken: string;
 }
 
 export interface LlmConfig {

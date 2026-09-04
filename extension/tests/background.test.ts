@@ -28,7 +28,10 @@ function createPort(name: string, sender: object) {
   };
 }
 
-function createChrome(initialStored: Record<string, unknown> = {}) {
+function createChrome(
+  initialStored: Record<string, unknown> = {},
+  initialLocalStored: Record<string, unknown> = {},
+) {
   const actionClicked = new FakeEvent();
   const tabActivated = new FakeEvent();
   const tabUpdated = new FakeEvent();
@@ -40,6 +43,7 @@ function createChrome(initialStored: Record<string, unknown> = {}) {
   const historyStateUpdated = new FakeEvent();
   const navigationCommitted = new FakeEvent();
   let stored: Record<string, unknown> = structuredClone(initialStored);
+  let localStored: Record<string, unknown> = structuredClone(initialLocalStored);
   let hasOffscreenDocument = false;
 
   return {
@@ -86,6 +90,11 @@ function createChrome(initialStored: Record<string, unknown> = {}) {
         get: vi.fn(async () => structuredClone(stored)),
         set: vi.fn(async (value: Record<string, unknown>) => { stored = { ...stored, ...value }; }),
       },
+      local: {
+        get: vi.fn(async () => structuredClone(localStored)),
+        set: vi.fn(async (value: Record<string, unknown>) => { localStored = { ...localStored, ...value }; }),
+        remove: vi.fn(async (key: string) => { delete localStored[key]; }),
+      },
     },
     events: {
       actionClicked,
@@ -100,6 +109,8 @@ function createChrome(initialStored: Record<string, unknown> = {}) {
       navigationCommitted,
     },
     getStored: () => stored,
+    getLocalStored: () => localStored,
+    setHasOffscreenDocument: (value: boolean) => { hasOffscreenDocument = value; },
   };
 }
 
@@ -111,6 +122,10 @@ function dispatchMessage(chrome: ReturnType<typeof createChrome>, message: objec
 
 async function flushMicrotasks() {
   for (let index = 0; index < 30; index += 1) await Promise.resolve();
+}
+
+function pendingIdentityStore() {
+  return { loadOrCreate: vi.fn(() => new Promise<never>(() => undefined)) };
 }
 
 describe("background tab isolation", () => {
@@ -151,7 +166,7 @@ describe("background tab isolation", () => {
 
   it("tracks SPA and full-document navigation", () => {
     const chrome = createChrome();
-    installBackgroundHandlers(chrome as never);
+    installBackgroundHandlers(chrome as never, { identityStore: pendingIdentityStore() });
 
     expect(chrome.events.historyStateUpdated.listeners).toHaveLength(1);
     expect(chrome.events.navigationCommitted.listeners).toHaveLength(1);
@@ -177,7 +192,7 @@ describe("background tab isolation", () => {
       id: "extension-id",
       url: "chrome-extension://extension-id/offscreen.html",
     });
-    installBackgroundHandlers(chrome as never);
+    installBackgroundHandlers(chrome as never, { identityStore: pendingIdentityStore() });
     chrome.events.connect.listeners[0](port);
     const upload = {
       type: "START_MEDIA_UPLOAD" as const,
@@ -216,7 +231,7 @@ describe("background tab isolation", () => {
       id: "extension-id",
       url: "chrome-extension://extension-id/offscreen.html",
     });
-    installBackgroundHandlers(chrome as never);
+    installBackgroundHandlers(chrome as never, { identityStore: pendingIdentityStore() });
     chrome.events.connect.listeners[0](port);
     const upload = {
       type: "START_MEDIA_UPLOAD" as const,
@@ -246,7 +261,7 @@ describe("background tab isolation", () => {
       id: "extension-id",
       url: "chrome-extension://extension-id/offscreen.html",
     });
-    installBackgroundHandlers(restarted as never);
+    installBackgroundHandlers(restarted as never, { identityStore: pendingIdentityStore() });
     restarted.events.connect.listeners[0](restartedPort);
     expect(await dispatchMessage(restarted, upload, sender)).toEqual({ ok: false });
     expect(restartedPort.postMessage).not.toHaveBeenCalled();
@@ -258,7 +273,7 @@ describe("background tab isolation", () => {
       id: "extension-id",
       url: "chrome-extension://extension-id/offscreen.html",
     });
-    installBackgroundHandlers(chrome as never);
+    installBackgroundHandlers(chrome as never, { identityStore: pendingIdentityStore() });
     chrome.events.connect.listeners[0](port);
     const upload = {
       type: "START_MEDIA_UPLOAD" as const,
@@ -285,43 +300,221 @@ describe("background tab isolation", () => {
       id: "extension-id",
       url: "chrome-extension://extension-id/sidepanel.html",
     });
-    installBackgroundHandlers(chrome as never);
+    installBackgroundHandlers(chrome as never, { identityStore: pendingIdentityStore() });
 
     chrome.events.connect.listeners[0](port);
 
     expect(port.disconnect).toHaveBeenCalledOnce();
   });
 
-  it("proxies media API requests only for the authenticated offscreen port", async () => {
+  it("sends JSON-only API configuration to the authenticated offscreen port", async () => {
+    const identity = {
+      installationId: "11111111-1111-4111-8111-111111111111",
+      installationToken: "a".repeat(43),
+    };
     const chrome = createChrome();
-    const getMediaSession = vi.fn(async () => ({
-      sessionId: "session-1",
-      uploadedParts: [0],
-    }));
     const port = createPort("veeky-offscreen-media", {
       id: "extension-id",
       url: "chrome-extension://extension-id/offscreen.html",
     });
     installBackgroundHandlers(chrome as never, {
-      mediaApi: { getMediaSession } as never,
+      apiBaseUrl: "http://api.test",
+      identityStore: { loadOrCreate: vi.fn(async () => identity) },
     });
     chrome.events.connect.listeners[0](port);
+    await flushMicrotasks();
+
+    expect(port.postMessage).toHaveBeenCalledWith({
+      type: "MEDIA_UPLOAD_CONFIG",
+      apiBaseUrl: "http://api.test",
+      installationId: identity.installationId,
+      installationToken: identity.installationToken,
+    });
+    expect(() => JSON.stringify(port.postMessage.mock.calls)).not.toThrow();
+  });
+
+  it("persists a created media session in local storage and clears it on completion", async () => {
+    const contentRef = {
+      platform: "x" as const,
+      sourceContentId: "2075545587093807111",
+      mediaIndex: 1,
+    };
+    const chrome = createChrome({
+      mediaUploadJobs: { activeJobId: "job-1", completedJobIds: [] },
+    });
+    const port = createPort("veeky-offscreen-media", {
+      id: "extension-id",
+      url: "chrome-extension://extension-id/offscreen.html",
+    });
+    installBackgroundHandlers(chrome as never, { identityStore: pendingIdentityStore() });
+    chrome.events.connect.listeners[0](port);
+    await flushMicrotasks();
 
     port.events.message.listeners[0]({
-      type: "MEDIA_API_REQUEST",
-      requestId: "request-1",
-      operation: "getMediaSession",
-      args: ["session-1"],
+      type: "MEDIA_SESSION_CREATED",
+      jobId: "job-1",
+      mediaSessionId: "session-1",
+      contentId: "33333333-3333-4333-8333-333333333333",
+      contentRef,
     });
     await flushMicrotasks();
 
-    expect(getMediaSession).toHaveBeenCalledWith("session-1");
-    expect(port.postMessage).toHaveBeenCalledWith({
-      type: "MEDIA_API_RESPONSE",
-      requestId: "request-1",
-      ok: true,
-      result: { sessionId: "session-1", uploadedParts: [0] },
+    expect(chrome.getLocalStored().activeMediaUploadSession).toEqual({
+      jobId: "job-1",
+      sessionId: "session-1",
+      contentId: "33333333-3333-4333-8333-333333333333",
+      contentRef,
+      updatedAt: expect.any(Number),
     });
+
+    port.events.message.listeners[0]({
+      type: "MEDIA_UPLOAD_COMPLETE",
+      jobId: "job-1",
+      mediaSessionId: "session-1",
+    });
+    await flushMicrotasks();
+
+    expect(chrome.getLocalStored()).not.toHaveProperty("activeMediaUploadSession");
+  });
+
+  it("cancels a persisted orphan after restart when no offscreen context exists", async () => {
+    const cancelMediaSession = vi.fn(async () => undefined);
+    const contentRef = {
+      platform: "x" as const,
+      sourceContentId: "2075545587093807111",
+      mediaIndex: 1,
+    };
+    const chrome = createChrome({
+      mediaUploadJobs: { activeJobId: "job-orphan", completedJobIds: [] },
+    }, {
+      activeMediaUploadSession: {
+        jobId: "job-orphan",
+        sessionId: "session-orphan",
+        contentId: "33333333-3333-4333-8333-333333333333",
+        contentRef,
+        updatedAt: 1,
+      },
+    });
+
+    installBackgroundHandlers(chrome as never, {
+      mediaApi: { cancelMediaSession } as never,
+      identityStore: pendingIdentityStore(),
+    });
+    await flushMicrotasks();
+
+    expect(cancelMediaSession).toHaveBeenCalledWith("session-orphan");
+    expect(chrome.getLocalStored()).not.toHaveProperty("activeMediaUploadSession");
+    expect(chrome.getStored().mediaUploadJobs).toEqual({ activeJobId: null, completedJobIds: [] });
+  });
+
+  it("keeps a persisted session when the reconnected offscreen context matches", async () => {
+    vi.useFakeTimers();
+    try {
+      const cancelMediaSession = vi.fn(async () => undefined);
+      const contentRef = {
+        platform: "x" as const,
+        sourceContentId: "2075545587093807111",
+        mediaIndex: 1,
+      };
+      const activeSession = {
+        jobId: "job-active",
+        sessionId: "session-active",
+        contentId: "33333333-3333-4333-8333-333333333333",
+        contentRef,
+        updatedAt: 1,
+      };
+      const chrome = createChrome({
+        mediaUploadJobs: { activeJobId: "job-active", completedJobIds: [] },
+      }, { activeMediaUploadSession: activeSession });
+      chrome.setHasOffscreenDocument(true);
+      const port = createPort("veeky-offscreen-media", {
+        id: "extension-id",
+        url: "chrome-extension://extension-id/offscreen.html",
+      });
+
+      installBackgroundHandlers(chrome as never, {
+        mediaApi: { cancelMediaSession } as never,
+        identityStore: pendingIdentityStore(),
+      });
+      chrome.events.connect.listeners[0](port);
+      await flushMicrotasks();
+      port.events.message.listeners[0]({
+        type: "MEDIA_UPLOAD_CONTEXT",
+        jobId: "job-active",
+        mediaSessionId: "session-active",
+      });
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(6_000);
+
+      expect(cancelMediaSession).not.toHaveBeenCalled();
+      expect(chrome.getLocalStored().activeMediaUploadSession).toEqual(activeSession);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels a persisted session when the offscreen context does not match", async () => {
+    const cancelMediaSession = vi.fn(async () => undefined);
+    const contentRef = {
+      platform: "x" as const,
+      sourceContentId: "2075545587093807111",
+      mediaIndex: 1,
+    };
+    const chrome = createChrome({
+      mediaUploadJobs: { activeJobId: "job-orphan", completedJobIds: [] },
+    }, {
+      activeMediaUploadSession: {
+        jobId: "job-orphan",
+        sessionId: "session-orphan",
+        contentId: "33333333-3333-4333-8333-333333333333",
+        contentRef,
+        updatedAt: 1,
+      },
+    });
+    chrome.setHasOffscreenDocument(true);
+    const port = createPort("veeky-offscreen-media", {
+      id: "extension-id",
+      url: "chrome-extension://extension-id/offscreen.html",
+    });
+
+    installBackgroundHandlers(chrome as never, {
+      mediaApi: { cancelMediaSession } as never,
+      identityStore: pendingIdentityStore(),
+    });
+    chrome.events.connect.listeners[0](port);
+    await flushMicrotasks();
+    port.events.message.listeners[0]({
+      type: "MEDIA_UPLOAD_CONTEXT",
+      jobId: null,
+      mediaSessionId: null,
+    });
+    await flushMicrotasks();
+
+    expect(cancelMediaSession).toHaveBeenCalledWith("session-orphan");
+    expect(chrome.getLocalStored()).not.toHaveProperty("activeMediaUploadSession");
+  });
+
+  it("releases a pre-session upload slot when the offscreen context is lost", async () => {
+    const chrome = createChrome({
+      mediaUploadJobs: { activeJobId: "job-before-session", completedJobIds: [] },
+    });
+    chrome.setHasOffscreenDocument(true);
+    const port = createPort("veeky-offscreen-media", {
+      id: "extension-id",
+      url: "chrome-extension://extension-id/offscreen.html",
+    });
+    installBackgroundHandlers(chrome as never, { identityStore: pendingIdentityStore() });
+    chrome.events.connect.listeners[0](port);
+    await flushMicrotasks();
+
+    port.events.message.listeners[0]({
+      type: "MEDIA_UPLOAD_CONTEXT",
+      jobId: null,
+      mediaSessionId: null,
+    });
+    await flushMicrotasks();
+
+    expect(chrome.getStored().mediaUploadJobs).toEqual({ activeJobId: null, completedJobIds: [] });
   });
 
   it("leaves offscreen upload notifications for the side panel", async () => {

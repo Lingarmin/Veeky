@@ -23,9 +23,10 @@ import type {
   VideoInspection,
 } from "../shared/types";
 import type { AnalysisApi } from "./api";
-import { createApi } from "./api";
+import { createApi, DEFAULT_API_BASE_URL } from "./api";
 import type { BrowserBridge } from "./browser";
 import { browserBridge } from "./browser";
+import { browserInstallationIdentityStore } from "./identity";
 import { errorMessageForCode, formatTime } from "./store";
 import { browserLlmConfigStore, defaultLlmConfig, isLlmConfigured, LLM_PROVIDER_OPTIONS } from "./llm";
 import type { LlmConfig, LlmConfigStore } from "./llm";
@@ -55,7 +56,7 @@ const TARGET_LANGUAGES = [
   ["ja", "日本語"],
 ];
 
-const defaultApi = createApi();
+const defaultApi = createApi(DEFAULT_API_BASE_URL, browserInstallationIdentityStore);
 const HISTORY_PAGE_SIZE = 20;
 
 function comparisonKey(value: string): string {

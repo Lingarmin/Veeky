@@ -131,4 +131,43 @@ describe("installation identity", () => {
       retryAfter: 37,
     });
   });
+
+  it("aborts an API request after the bounded request timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      let requestSignal: AbortSignal | null = null;
+      vi.stubGlobal("fetch", vi.fn((_url: RequestInfo | URL, init?: RequestInit) => {
+        requestSignal = init?.signal ?? null;
+        return new Promise<Response>(() => undefined);
+      }));
+
+      const request = createApi("http://api.test", createIdentityStore()).getHistory();
+      const rejection = expect(request).rejects.toMatchObject({ code: "api_timeout", status: 0 });
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      await rejection;
+      expect((requestSignal as AbortSignal | null)?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds an API response body that never finishes", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.stubGlobal("fetch", vi.fn(async () => new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("{"));
+        },
+      }), { headers: { "Content-Type": "application/json" } })));
+
+      const request = createApi("http://api.test", createIdentityStore()).getHistory();
+      const rejection = expect(request).rejects.toMatchObject({ code: "api_timeout", status: 0 });
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      await rejection;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

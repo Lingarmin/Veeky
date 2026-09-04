@@ -7,11 +7,10 @@ import type {
   JobStatus,
   VideoInspection,
 } from "../shared/types";
-import {
-  browserInstallationIdentityStore,
-  type InstallationIdentity,
-  type InstallationIdentityStore,
-} from "./identity";
+import type { InstallationIdentity, InstallationIdentityStore } from "./identity";
+
+export const DEFAULT_API_BASE_URL = "http://127.0.0.1:8000";
+const API_REQUEST_TIMEOUT_MS = 60_000;
 
 export interface AnalysisCreateResponse extends ContentContext {
   jobId: string;
@@ -120,8 +119,8 @@ export class ApiError extends Error {
 }
 
 export function createApi(
-  baseUrl = "http://127.0.0.1:8000",
-  identityStore: InstallationIdentityStore = browserInstallationIdentityStore,
+  baseUrl: string,
+  identityStore: InstallationIdentityStore,
 ): AnalysisApi & MediaUploadApi {
   return {
     testLlm: (config) => request(`${baseUrl}/v1/llm/test`, identityStore, {
@@ -202,21 +201,49 @@ async function authenticatedFetch(
   init: RequestInit,
   identity: InstallationIdentity,
 ): Promise<Response> {
-  let response: Response;
+  const controller = new AbortController();
+  const timeoutError = new ApiError("api_timeout", "分析服务请求超时", 0);
+  const timer = globalThis.setTimeout(() => controller.abort(timeoutError), API_REQUEST_TIMEOUT_MS);
+  const externalSignal = init.signal;
+  const forwardAbort = () => controller.abort(externalSignal?.reason);
+  if (externalSignal) {
+    if (externalSignal.aborted) forwardAbort();
+    else externalSignal.addEventListener("abort", forwardAbort, { once: true });
+  }
   try {
-    response = await fetch(url, {
+    return await waitForAbort(fetch(url, {
       ...init,
+      signal: controller.signal,
       headers: {
         "Content-Type": "application/json",
         ...init.headers,
         "Authorization": `Bearer ${identity.installationToken}`,
         "X-Veeky-Installation-Id": identity.installationId,
       },
-    });
+    }), controller.signal);
   } catch (error) {
+    if (controller.signal.reason === timeoutError) throw timeoutError;
     throw new ApiError("api_unavailable", "无法连接分析服务", 0, null, { cause: error });
+  } finally {
+    globalThis.clearTimeout(timer);
+    externalSignal?.removeEventListener("abort", forwardAbort);
   }
-  return response;
+}
+
+function waitForAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      cleanup();
+      reject(signal.reason);
+    };
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => { cleanup(); resolve(value); },
+      (error) => { cleanup(); reject(error); },
+    );
+  });
 }
 
 async function registerInstallation(url: string, identity: InstallationIdentity): Promise<void> {
@@ -229,7 +256,22 @@ async function registerInstallation(url: string, identity: InstallationIdentity)
 }
 
 async function parseResponse(response: Response): Promise<Record<string, any>> {
-  return response.json().catch(() => ({}));
+  const parsed = response.json().catch(() => ({}));
+  const timeoutError = new ApiError("api_timeout", "分析服务响应超时", 0);
+  let timer: ReturnType<typeof globalThis.setTimeout> | null = null;
+  return new Promise<Record<string, any>>((resolve, reject) => {
+    timer = globalThis.setTimeout(() => {
+      try {
+        void response.body?.cancel().catch(() => undefined);
+      } catch {
+        // The JSON reader may already hold the body lock.
+      }
+      reject(timeoutError);
+    }, API_REQUEST_TIMEOUT_MS);
+    parsed.then(resolve, reject);
+  }).finally(() => {
+    if (timer !== null) globalThis.clearTimeout(timer);
+  });
 }
 
 function parseApiResponse<T>(response: Response, body: Record<string, any>): T {

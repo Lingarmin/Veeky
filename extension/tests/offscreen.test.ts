@@ -39,6 +39,13 @@ function textResponse(body: string, finalUrl?: string): Response {
   return response;
 }
 
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
 function createPort(name: string, sender: object) {
   const messageListeners: Array<(message: unknown) => void> = [];
   const disconnectListeners: Array<() => void> = [];
@@ -70,6 +77,10 @@ function createSpool() {
     }),
     dispose: vi.fn<MediaPartSpool["dispose"]>(async () => { parts.clear(); }),
   } satisfies MediaPartSpool;
+}
+
+async function flushMicrotasks() {
+  for (let index = 0; index < 20; index += 1) await Promise.resolve();
 }
 
 function createApi(overrides: Partial<MediaUploadApi> = {}) {
@@ -148,7 +159,7 @@ describe("offscreen X media upload", () => {
     expect(sessionId).toBe("session-1");
     expect(fetchMedia).toHaveBeenCalledWith(
       "https://video.twimg.com/amplify_video/123/vid/avc1/file.mp4?token=opaque",
-      { credentials: "include", redirect: "error" },
+      { credentials: "include", redirect: "error", signal: expect.any(AbortSignal) },
     );
     expect(vi.mocked(api.uploadPart).mock.calls.map((call) => call[1])).toEqual([0, 1, 2]);
     expect(vi.mocked(api.uploadPart).mock.calls.map((call) => call[2].byteLength)).toEqual([8 * MIB, 8 * MIB, 2 * MIB]);
@@ -315,6 +326,121 @@ describe("offscreen X media upload", () => {
     expect(api.completeMediaSession).toHaveBeenCalledOnce();
   });
 
+  it.each(["complete", "consumed"])(
+    "treats a lost completion response as success when the session is %s",
+    async (status) => {
+      const api = createApi({
+        completeMediaSession: vi.fn(async () => { throw new Error("response lost"); }),
+        getMediaSession: vi.fn(async () => ({
+          sessionId: "session-1",
+          contentId: "33333333-3333-4333-8333-333333333333",
+          kind: "mp4" as const,
+          status,
+          expectedBytes: 1,
+          receivedBytes: 1,
+          partSizeBytes: 8 * MIB,
+          partCount: 1,
+          uploadedParts: [0],
+        })),
+      });
+
+      await expect(uploadMediaCandidate({
+        type: "START_MEDIA_UPLOAD",
+        tabId: 7,
+        jobId: `job-complete-${status}`,
+        contentRef,
+        candidate: { url: "https://video.twimg.com/file.mp4", kind: "mp4", capturedAt: 1 },
+      }, {
+        fetchMedia: vi.fn(async () => responseFromChunks([new Uint8Array([1])], {
+          "Content-Length": "1",
+        })),
+        api,
+        reportProgress: async () => undefined,
+      })).resolves.toBe("session-1");
+
+      expect(api.completeMediaSession).toHaveBeenCalledOnce();
+      expect(api.cancelMediaSession).not.toHaveBeenCalled();
+    },
+  );
+
+  it("retries completion after confirming the session is still uploading", async () => {
+    const completeMediaSession = vi.fn<MediaUploadApi["completeMediaSession"]>()
+      .mockRejectedValueOnce(new Error("response lost"))
+      .mockImplementationOnce(async (sessionId, input) => ({
+        sessionId,
+        contentId: "33333333-3333-4333-8333-333333333333",
+        kind: input.kind,
+        status: "complete",
+        totalBytes: input.totalBytes,
+        partCount: input.partCount,
+      }));
+    const api = createApi({ completeMediaSession });
+
+    await uploadMediaCandidate({
+      type: "START_MEDIA_UPLOAD",
+      tabId: 7,
+      jobId: "job-complete-retry",
+      contentRef,
+      candidate: { url: "https://video.twimg.com/file.mp4", kind: "mp4", capturedAt: 1 },
+    }, {
+      fetchMedia: vi.fn(async () => responseFromChunks([new Uint8Array([1])], {
+        "Content-Length": "1",
+      })),
+      api,
+      reportProgress: async () => undefined,
+    });
+
+    expect(api.getMediaSession).toHaveBeenCalledOnce();
+    expect(completeMediaSession).toHaveBeenCalledTimes(2);
+    expect(api.cancelMediaSession).not.toHaveBeenCalled();
+  });
+
+  it("cancels after bounded completion retries remain unresolved", async () => {
+    const api = createApi({
+      completeMediaSession: vi.fn(async () => { throw new Error("response lost"); }),
+    });
+
+    await expect(uploadMediaCandidate({
+      type: "START_MEDIA_UPLOAD",
+      tabId: 7,
+      jobId: "job-complete-exhausted",
+      contentRef,
+      candidate: { url: "https://video.twimg.com/file.mp4", kind: "mp4", capturedAt: 1 },
+    }, {
+      fetchMedia: vi.fn(async () => responseFromChunks([new Uint8Array([1])], {
+        "Content-Length": "1",
+      })),
+      api,
+      reportProgress: async () => undefined,
+    })).rejects.toThrow("response lost");
+
+    expect(api.completeMediaSession).toHaveBeenCalledTimes(3);
+    expect(api.getMediaSession).toHaveBeenCalledTimes(3);
+    expect(api.cancelMediaSession).toHaveBeenCalledWith("session-1");
+  });
+
+  it("does not turn a confirmed spooled upload into failure when disposal fails", async () => {
+    const spool = createSpool();
+    spool.dispose.mockRejectedValue(new Error("OPFS remove failed"));
+    const api = createApi();
+
+    await expect(uploadMediaCandidate({
+      type: "START_MEDIA_UPLOAD",
+      tabId: 7,
+      jobId: "job-dispose-after-complete",
+      contentRef,
+      candidate: { url: "https://video.twimg.com/file.mp4", kind: "mp4", capturedAt: 1 },
+    }, {
+      fetchMedia: vi.fn(async () => responseFromChunks([new Uint8Array([1])])),
+      api,
+      reportProgress: async () => undefined,
+      createPartSpool: async () => spool,
+    })).resolves.toBe("session-1");
+
+    expect(api.completeMediaSession).toHaveBeenCalledOnce();
+    expect(api.cancelMediaSession).not.toHaveBeenCalled();
+  });
+
   it("cancels a created media session when upload fails", async () => {
     const api = createApi({
       uploadPart: vi.fn(async () => { throw new Error("upload failed"); }),
@@ -336,6 +462,70 @@ describe("offscreen X media upload", () => {
     })).rejects.toThrow("status failed");
 
     expect(api.cancelMediaSession).toHaveBeenCalledWith("session-1");
+  });
+
+  it("aborts a media request whose response headers stall", async () => {
+    vi.useFakeTimers();
+    try {
+      let requestSignal: AbortSignal | null = null;
+      const api = createApi();
+      const upload = uploadMediaCandidate({
+        type: "START_MEDIA_UPLOAD",
+        tabId: 7,
+        jobId: "job-fetch-timeout",
+        contentRef,
+        candidate: { url: "https://video.twimg.com/file.mp4", kind: "mp4", capturedAt: 1 },
+      }, {
+        fetchMedia: vi.fn((_url, init) => {
+          requestSignal = init?.signal ?? null;
+          return new Promise<Response>(() => undefined);
+        }),
+        api,
+        reportProgress: async () => undefined,
+        timeouts: { mediaFetchMs: 100, streamStallMs: 1_000, configMs: 100, overallUploadMs: 10_000 },
+      });
+      const rejection = expect(upload).rejects.toMatchObject({ code: "media_fetch_timeout" });
+      await vi.advanceTimersByTimeAsync(100);
+
+      await rejection;
+      expect((requestSignal as AbortSignal | null)?.aborted).toBe(true);
+      expect(api.createMediaSession).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("aborts and cancels a media stream that stops producing bytes", async () => {
+    vi.useFakeTimers();
+    try {
+      const cancelStream = vi.fn();
+      const api = createApi();
+      const response = new Response(new ReadableStream<Uint8Array>({
+        start(controller) { controller.enqueue(new Uint8Array([1])); },
+        cancel: cancelStream,
+      }), { headers: { "Content-Length": "2" } });
+      const upload = uploadMediaCandidate({
+        type: "START_MEDIA_UPLOAD",
+        tabId: 7,
+        jobId: "job-stream-timeout",
+        contentRef,
+        candidate: { url: "https://video.twimg.com/file.mp4", kind: "mp4", capturedAt: 1 },
+      }, {
+        fetchMedia: vi.fn(async () => response),
+        api,
+        reportProgress: async () => undefined,
+        timeouts: { mediaFetchMs: 1_000, streamStallMs: 100, configMs: 100, overallUploadMs: 10_000 },
+      });
+      const rejection = expect(upload).rejects.toMatchObject({ code: "media_stream_timeout" });
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(100);
+
+      await rejection;
+      expect(cancelStream).toHaveBeenCalled();
+      expect(api.cancelMediaSession).toHaveBeenCalledWith("session-1");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps X cookies and authorization data out of API metadata", async () => {
@@ -680,6 +870,7 @@ describe("offscreen message handling", () => {
       onMessage: {
         addListener: vi.fn((listener: (message: unknown) => void) => { listeners.push(listener); }),
       },
+      onDisconnect: { addListener: vi.fn() },
       postMessage: vi.fn(),
       dispatch(message: unknown) {
         for (const listener of listeners) listener(message);
@@ -694,6 +885,71 @@ describe("offscreen message handling", () => {
     contentRef,
     candidate: { url: "https://video.twimg.com/file.mp4", kind: "mp4" as const, capturedAt: 1 },
   };
+
+  it("uploads through the direct HTTP client when Port messages are JSON serialized", async () => {
+    const port = createRuntimePort();
+    const apiFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/videos/inspect")) return jsonResponse({
+        contentId: "33333333-3333-4333-8333-333333333333",
+        contentRef,
+        videoId: null,
+        durationMs: 1000,
+        sourceStatus: "ready",
+        transcriptSource: "faster_whisper",
+        availableLanguages: [],
+        tracks: [],
+        selectedLanguage: "",
+      });
+      if (url.endsWith("/v1/media-sessions") && init?.method === "POST") return jsonResponse({
+        sessionId: "session-direct",
+        contentId: "33333333-3333-4333-8333-333333333333",
+        kind: "mp4",
+        status: "created",
+        expectedBytes: 1,
+        receivedBytes: 0,
+        partSizeBytes: 8 * MIB,
+        partCount: 1,
+        uploadedParts: [],
+      }, 201);
+      if (url.includes("/parts/0")) {
+        expect(init?.body).toBeInstanceOf(ArrayBuffer);
+        return new Response(null, { status: 204 });
+      }
+      if (url.endsWith("/complete")) return jsonResponse({
+        sessionId: "session-direct",
+        contentId: "33333333-3333-4333-8333-333333333333",
+        kind: "mp4",
+        status: "complete",
+        totalBytes: 1,
+        partCount: 1,
+      });
+      throw new Error(`unexpected API request ${url}`);
+    });
+    vi.stubGlobal("fetch", apiFetch);
+    installOffscreenHandlers(port as never, {
+      fetchMedia: vi.fn(async () => responseFromChunks([new Uint8Array([1])], { "Content-Length": "1" })),
+      cleanupPartSpools: async () => undefined,
+    });
+
+    port.dispatch(JSON.parse(JSON.stringify({
+      type: "MEDIA_UPLOAD_CONFIG",
+      apiBaseUrl: "http://api.test",
+      installationId: "11111111-1111-4111-8111-111111111111",
+      installationToken: "a".repeat(43),
+    })));
+    port.dispatch(JSON.parse(JSON.stringify(startMessage)));
+
+    await vi.waitFor(() => expect(port.postMessage).toHaveBeenCalledWith({
+      type: "MEDIA_UPLOAD_COMPLETE",
+      jobId: "job-handler",
+      mediaSessionId: "session-direct",
+    }));
+    for (const [message] of port.postMessage.mock.calls) {
+      expect(JSON.parse(JSON.stringify(message))).toEqual(message);
+      expect(message).not.toEqual(expect.objectContaining({ type: "MEDIA_API_REQUEST" }));
+    }
+  });
 
   it("sends MEDIA_UPLOAD_COMPLETE after a successful upload", async () => {
     const port = createRuntimePort();
@@ -712,6 +968,53 @@ describe("offscreen message handling", () => {
       jobId: "job-handler",
       mediaSessionId: "session-1",
     }));
+    expect(port.postMessage).toHaveBeenCalledWith({
+      type: "MEDIA_SESSION_CREATED",
+      jobId: "job-handler",
+      mediaSessionId: "session-1",
+      contentId: "33333333-3333-4333-8333-333333333333",
+      contentRef,
+    });
+  });
+
+  it("reports its active context when the background reconnects", async () => {
+    const port = createRuntimePort();
+    let releaseUpload: (() => void) | undefined;
+    const api = createApi({
+      uploadPart: vi.fn(() => new Promise<void>((resolve) => { releaseUpload = resolve; })),
+    });
+    installOffscreenHandlers(port as never, {
+      fetchMedia: vi.fn(async () => responseFromChunks([new Uint8Array([1])], { "Content-Length": "1" })),
+      api,
+      reportProgress: async () => undefined,
+    });
+    port.dispatch(startMessage);
+    await vi.waitFor(() => expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({
+      type: "MEDIA_SESSION_CREATED",
+      jobId: "job-handler",
+    })));
+    port.postMessage.mockClear();
+
+    port.dispatch({
+      type: "MEDIA_UPLOAD_CONFIG",
+      apiBaseUrl: "http://api.test",
+      installationId: "11111111-1111-4111-8111-111111111111",
+      installationToken: "a".repeat(43),
+    });
+
+    expect(port.postMessage).toHaveBeenCalledWith({
+      type: "MEDIA_UPLOAD_CONTEXT",
+      jobId: "job-handler",
+      mediaSessionId: "session-1",
+    });
+    expect(port.postMessage).toHaveBeenCalledWith({
+      type: "MEDIA_SESSION_CREATED",
+      jobId: "job-handler",
+      mediaSessionId: "session-1",
+      contentId: "33333333-3333-4333-8333-333333333333",
+      contentRef,
+    });
+    releaseUpload?.();
   });
 
   it("sends MEDIA_UPLOAD_FAILED with the upload error code", async () => {
@@ -729,6 +1032,79 @@ describe("offscreen message handling", () => {
       jobId: "job-handler",
       code: "media_fetch_failed",
     }));
+  });
+
+  it("fails a START message when API configuration never arrives", async () => {
+    vi.useFakeTimers();
+    try {
+      const port = createRuntimePort();
+      const activeJobId = installOffscreenHandlers(port as never, {
+        fetchMedia: vi.fn(),
+        reportProgress: async () => undefined,
+        cleanupPartSpools: async () => undefined,
+        timeouts: { mediaFetchMs: 1_000, streamStallMs: 1_000, configMs: 100, overallUploadMs: 10_000 },
+      });
+      port.dispatch(startMessage);
+      await vi.advanceTimersByTimeAsync(100);
+      await flushMicrotasks();
+
+      expect(port.postMessage).toHaveBeenCalledWith({
+        type: "MEDIA_UPLOAD_FAILED",
+        jobId: "job-handler",
+        code: "media_api_config_timeout",
+      });
+      expect(activeJobId()).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels, disposes, and releases the slot after the overall upload timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      let releaseFirstUpload: (() => void) | undefined;
+      const uploadPart = vi.fn<MediaUploadApi["uploadPart"]>()
+        .mockImplementationOnce(() => new Promise<void>((resolve) => { releaseFirstUpload = resolve; }))
+        .mockResolvedValue(undefined);
+      const api = createApi({ uploadPart });
+      const firstSpool = createSpool();
+      const port = createRuntimePort();
+      const activeJobId = installOffscreenHandlers(port as never, {
+        fetchMedia: vi.fn(async () => responseFromChunks([new Uint8Array([1])])),
+        api,
+        reportProgress: async () => undefined,
+        createPartSpool: vi.fn()
+          .mockResolvedValueOnce(firstSpool)
+          .mockResolvedValueOnce(createSpool()),
+        cleanupPartSpools: async () => undefined,
+        timeouts: { mediaFetchMs: 5_000, streamStallMs: 5_000, configMs: 100, overallUploadMs: 1_000 },
+      });
+      port.dispatch(startMessage);
+      await vi.waitFor(() => expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({
+        type: "MEDIA_SESSION_CREATED",
+        jobId: "job-handler",
+      })));
+      await vi.advanceTimersByTimeAsync(1_000);
+      await flushMicrotasks();
+
+      expect(port.postMessage).toHaveBeenCalledWith({
+        type: "MEDIA_UPLOAD_FAILED",
+        jobId: "job-handler",
+        code: "media_upload_timeout",
+      });
+      expect(api.cancelMediaSession).toHaveBeenCalledWith("session-1");
+      expect(firstSpool.dispose).toHaveBeenCalledOnce();
+      expect(activeJobId()).toBeNull();
+
+      port.dispatch({ ...startMessage, jobId: "job-after-timeout" });
+      await vi.waitFor(() => expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({
+        type: "MEDIA_UPLOAD_COMPLETE",
+        jobId: "job-after-timeout",
+      })));
+      releaseFirstUpload?.();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("runs only one upload for concurrent START messages for the same job", async () => {
