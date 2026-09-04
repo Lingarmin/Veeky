@@ -28,6 +28,7 @@ def test_media_settings_have_bounded_defaults():
     assert settings.media_chunk_bytes == 8 * 1024 * 1024
     assert settings.max_active_media_upload_sessions_per_installation == 1
     assert settings.asr_job_timeout_seconds == 21600
+    assert settings.analysis_job_lease_seconds == 60
     assert settings.media_temp_root == "/var/lib/veeky/media"
 
 
@@ -39,6 +40,7 @@ def test_media_settings_allow_environment_overrides(monkeypatch):
     monkeypatch.setenv("MEDIA_CHUNK_BYTES", "256")
     monkeypatch.setenv("MAX_ACTIVE_MEDIA_UPLOAD_SESSIONS_PER_INSTALLATION", "2")
     monkeypatch.setenv("ASR_JOB_TIMEOUT_SECONDS", "120")
+    monkeypatch.setenv("ANALYSIS_JOB_LEASE_SECONDS", "15")
     monkeypatch.setenv("MEDIA_TEMP_ROOT", "/tmp/veeky-test-media")
 
     settings = Settings(_env_file=None)
@@ -50,6 +52,7 @@ def test_media_settings_allow_environment_overrides(monkeypatch):
     assert settings.media_chunk_bytes == 256
     assert settings.max_active_media_upload_sessions_per_installation == 2
     assert settings.asr_job_timeout_seconds == 120
+    assert settings.analysis_job_lease_seconds == 15
     assert settings.media_temp_root == "/tmp/veeky-test-media"
 
 
@@ -63,6 +66,7 @@ def test_media_settings_allow_environment_overrides(monkeypatch):
         "media_chunk_bytes",
         "max_active_media_upload_sessions_per_installation",
         "asr_job_timeout_seconds",
+        "analysis_job_lease_seconds",
     ],
 )
 @pytest.mark.parametrize("invalid_value", [0, -1])

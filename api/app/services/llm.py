@@ -81,6 +81,8 @@ def normalize_chat_completions_url(url: str) -> str:
     parsed = urlparse(normalized)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("API URL must be an HTTP or HTTPS URL")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("API URL must not contain credentials, query, or fragment")
     if normalized.endswith("/chat/completions"):
         return normalized
     if normalized.endswith("/v1"):

@@ -25,12 +25,23 @@ from app.services.transcripts import (
 )
 from app.services.translation import TranslatedSegment, TranslationProviderError
 from app.sources.base import ContentRef, SourceRegistry
-from app.workers.tasks import AnalysisPipeline, build_llm_services
+from app.workers.tasks import (
+    WORKER_TERMINATION_REQUIRED,
+    AnalysisPipeline,
+    analyze_video,
+    build_llm_services,
+    settings,
+)
 from app.security.credentials import JobCredentialCipher
 from app.workers.tasks import clear_expired_llm_credentials_async
 
 
 VALID_TEST_KEY = base64.b64encode(b"v" * 32).decode("ascii")
+
+
+def test_analysis_task_time_limits_derive_from_asr_job_timeout():
+    assert analyze_video.soft_time_limit == settings.asr_job_timeout_seconds
+    assert analyze_video.time_limit == settings.asr_job_timeout_seconds + 60
 
 
 class FakeTranscriptService:
@@ -392,6 +403,45 @@ def test_analyze_video_accepts_explicit_resume_without_serializing_media(monkeyp
     analyze_video.run("job-id", resume=True)
 
     assert captured == {"job_id": "job-id", "resume": True}
+
+
+def test_analyze_video_retries_when_another_worker_owns_the_lease(monkeypatch):
+    retry_at = datetime.now(timezone.utc) + timedelta(seconds=30)
+    captured = {}
+
+    async def fake_run(job_id, *, resume=False):
+        return retry_at
+
+    class RetryRequested(RuntimeError):
+        pass
+
+    def fake_retry(*, countdown, kwargs):
+        captured["countdown"] = countdown
+        captured["kwargs"] = kwargs
+        raise RetryRequested()
+
+    monkeypatch.setattr("app.workers.tasks.run_analysis_task", fake_run)
+    monkeypatch.setattr(analyze_video, "retry", fake_retry)
+
+    with pytest.raises(RetryRequested):
+        analyze_video.run("job-id", resume=True)
+
+    assert 1 <= captured["countdown"] <= 30
+    assert captured["kwargs"] == {"resume": True}
+
+
+def test_analyze_video_terminates_worker_after_pipeline_timeout(monkeypatch):
+    async def fake_run(job_id, *, resume=False):
+        return WORKER_TERMINATION_REQUIRED
+
+    class WorkerTerminated(BaseException):
+        pass
+
+    monkeypatch.setattr("app.workers.tasks.run_analysis_task", fake_run)
+    monkeypatch.setattr("app.workers.tasks.WorkerTerminate", WorkerTerminated)
+
+    with pytest.raises(WorkerTerminated):
+        analyze_video.run("job-id")
 
 
 @pytest.mark.asyncio

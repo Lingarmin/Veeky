@@ -25,7 +25,7 @@ from app.services.transcripts import (
     TranscriptTrackInfo,
 )
 from app.security.quotas import get_quota_limiter
-from app.services.translation import TranslatedSegment
+from app.services.translation import TranslatedSegment, provider_translation_version
 from app.workers.tasks import AnalysisPipeline
 
 
@@ -59,8 +59,12 @@ class FixedVideoMetadataService:
 
 
 class FixedTranslationProvider:
-    name = "fixed-translation"
-    version = "test-1"
+    name = "kimi"
+    version = provider_translation_version(
+        "https://api.example.com/v1/chat/completions",
+        provider="kimi",
+        version="kimi-k2.5",
+    )
 
     def __init__(self):
         self.calls = 0

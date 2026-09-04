@@ -9,7 +9,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import ConfigDict, Field, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.api.analyses import ApiModel, enforce_read_quota, enforce_write_quota
 from app.core.settings import Settings, get_settings
@@ -201,18 +201,24 @@ async def complete_media_session(
             try:
                 analyze_video.delay(job_id, resume=True)
             except Exception:
-                job = await database.scalar(
-                    select(AnalysisJob).where(
+                await database.execute(
+                    update(AnalysisJob)
+                    .where(
                         AnalysisJob.id == job_id,
                         AnalysisJob.installation_id == installation_id,
                         AnalysisJob.media_session_id == artifact.session_id,
                         AnalysisJob.status == "queued",
+                        AnalysisJob.lease_token.is_(None),
                     )
+                    .values(
+                        status="waiting_for_media",
+                        media_session_id=None,
+                        lease_token=None,
+                        lease_expires_at=None,
+                    )
+                    .execution_options(synchronize_session=False)
                 )
-                if job is not None:
-                    job.status = "waiting_for_media"
-                    job.media_session_id = None
-                    await database.commit()
+                await database.commit()
     except MediaUploadError as error:
         raise _http_error(error) from error
     return _artifact_response(artifact)

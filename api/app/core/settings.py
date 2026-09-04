@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     media_chunk_bytes: PositiveInt = 8 * 1024 * 1024
     max_active_media_upload_sessions_per_installation: PositiveInt = 1
     asr_job_timeout_seconds: PositiveInt = 21600
+    analysis_job_lease_seconds: PositiveInt = 60
     asr_model_size: Literal["small"] = "small"
     asr_device: Literal["cpu"] = "cpu"
     asr_compute_type: Literal["int8"] = "int8"

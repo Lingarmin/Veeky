@@ -282,6 +282,10 @@ class AnalysisJob(Base):
     media_session_id: Mapped[str | None] = mapped_column(
         ForeignKey("media_upload_sessions.id", ondelete="SET NULL"), nullable=True
     )
+    lease_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     force_run: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(String(40), default="queued")
     failure_code: Mapped[str | None] = mapped_column(String(80), nullable=True)

@@ -52,6 +52,14 @@ def upgrade() -> None:
     )
     op.add_column(
         "analysis_jobs",
+        sa.Column("lease_token", sa.String(length=36), nullable=True),
+    )
+    op.add_column(
+        "analysis_jobs",
+        sa.Column("lease_expires_at", sa.DateTime(timezone=True), nullable=True),
+    )
+    op.add_column(
+        "analysis_jobs",
         sa.Column("force_run", sa.Boolean(), nullable=False, server_default=sa.false()),
     )
     op.create_foreign_key(
@@ -128,6 +136,8 @@ def downgrade() -> None:
         type_="foreignkey",
     )
     op.drop_column("analysis_jobs", "force_run")
+    op.drop_column("analysis_jobs", "lease_expires_at")
+    op.drop_column("analysis_jobs", "lease_token")
     op.drop_column("analysis_jobs", "media_session_id")
     op.drop_column("analysis_jobs", "media_url_ciphertext")
     op.drop_column("transcript_tracks", "asr_model")

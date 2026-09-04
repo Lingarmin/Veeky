@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import base64
+import asyncio
+import sys
+import wave
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -56,7 +59,9 @@ class FakeAudioExtractor:
     async def probe_duration_ms(self, media_path: Path) -> int:
         return self.duration_ms
 
-    async def extract(self, media_path: Path, audio_path: Path) -> Path:
+    async def extract(
+        self, media_path: Path, audio_path: Path, *, expected_duration_ms: float | None = None
+    ) -> Path:
         if self.error:
             raise self.error
         audio_path.write_bytes(b"audio")
@@ -209,9 +214,9 @@ async def test_x_direct_media_runs_all_stages_and_persists_asr_identity(x_contex
             return await super().download(url, destination)
 
     class ObservingExtractor(FakeAudioExtractor):
-        async def extract(self, media_path, audio_path):
+        async def extract(self, media_path, audio_path, **kwargs):
             observed.append(await _status(factory))
-            return await super().extract(media_path, audio_path)
+            return await super().extract(media_path, audio_path, **kwargs)
 
     class ObservingTranscriber(FakeTranscriber):
         def transcribe(self, audio_path):
@@ -266,6 +271,23 @@ async def test_x_direct_media_runs_all_stages_and_persists_asr_identity(x_contex
         "translating",
     ]
     assert not any(media_root.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_x_transcription_can_be_abandoned_when_the_task_times_out(
+    x_context, monkeypatch
+):
+    captured = {}
+
+    async def fake_run_sync(function, *args, **kwargs):
+        captured.update(kwargs)
+        return function(*args)
+
+    monkeypatch.setattr("app.workers.tasks.anyio.to_thread.run_sync", fake_run_sync)
+
+    await make_pipeline(x_context).run("job-x")
+
+    assert captured["abandon_on_cancel"] is True
 
 
 @pytest.mark.asyncio
@@ -376,6 +398,7 @@ async def test_translation_failure_preserves_x_transcript_and_cleans_temp(x_cont
         track = await session.scalar(select(TranscriptTrack))
         assert job.status == "failed"
         assert job.failure_code == "translation_failed"
+        assert job.failure_detail is None
         assert track is not None
         assert job.llm_credential_ciphertext is None
     assert not any(media_root.iterdir())
@@ -577,6 +600,9 @@ async def test_ffmpeg_extractor_probes_exact_four_hours_and_extracts_pcm(tmp_pat
     assert ("-ar", "16000") == calls[1][
         calls[1].index("-ar") : calls[1].index("-ar") + 2
     ]
+    assert ("-fs", "100") == calls[1][
+        calls[1].index("-fs") : calls[1].index("-fs") + 2
+    ]
 
 
 @pytest.mark.asyncio
@@ -604,6 +630,77 @@ async def test_ffmpeg_extractor_preserves_sub_millisecond_duration_precision(tmp
     assert await extractor.probe_duration_ms(media_path) == pytest.approx(
         14_400_000.4, rel=0, abs=1e-6
     )
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_extractor_rejects_pcm_that_would_exceed_temp_budget(tmp_path):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    media_path = media_root / "input.mp4"
+    media_path.write_bytes(b"media")
+    calls = []
+
+    async def runner(*arguments):
+        calls.append(arguments)
+        raise AssertionError("ffmpeg must not run when complete PCM cannot fit")
+
+    extractor = FFmpegAudioExtractor(
+        str(media_root), timeout_seconds=10, max_bytes=32_043, runner=runner
+    )
+
+    with pytest.raises(AudioExtractionError) as raised:
+        await extractor.extract(
+            media_path, media_root / "output.wav", expected_duration_ms=1000
+        )
+
+    assert raised.value.code == "media_too_large"
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_extractor_rejects_truncated_successful_pcm_output(tmp_path):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    media_path = media_root / "input.mp4"
+    audio_path = media_root / "output.wav"
+    media_path.write_bytes(b"media")
+
+    async def runner(*arguments):
+        with wave.open(str(audio_path), "wb") as output:
+            output.setnchannels(1)
+            output.setsampwidth(2)
+            output.setframerate(16_000)
+            output.writeframes(b"\0" * 2 * 16_000)
+        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    extractor = FFmpegAudioExtractor(
+        str(media_root), timeout_seconds=10, max_bytes=70_000, runner=runner
+    )
+
+    with pytest.raises(AudioExtractionError) as raised:
+        await extractor.extract(
+            media_path, audio_path, expected_duration_ms=2000
+        )
+
+    assert raised.value.code == "audio_extraction_failed"
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_extractor_bounds_subprocess_stderr_capture(tmp_path):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    extractor = FFmpegAudioExtractor(
+        str(media_root), timeout_seconds=10, max_bytes=100
+    )
+
+    result = await extractor._run_subprocess(
+        sys.executable,
+        "-c",
+        "import sys; sys.stderr.write('x' * 1000000)",
+    )
+
+    assert result.returncode == 0
+    assert len(result.stderr.encode()) <= 64 * 1024
 
 
 @pytest.mark.asyncio
@@ -654,6 +751,41 @@ async def test_x_pipeline_uses_authoritative_four_hour_boundary(
         job = await session.get(AnalysisJob, "job-x")
         assert job.status == expected_status
         assert job.failure_code == expected_code
+        if expected_code == "video_too_long":
+            assert job.failure_detail == "视频时长不能超过 4 小时"
+
+
+@pytest.mark.asyncio
+async def test_x_pipeline_uses_configured_duration_limit_in_failure_message(x_context):
+    factory, _, settings, _ = x_context
+    settings.max_video_duration_seconds = 7200
+
+    await make_pipeline(
+        x_context, extractor=FakeAudioExtractor(duration_ms=7_200_001)
+    ).run("job-x")
+
+    async with factory() as session:
+        job = await session.get(AnalysisJob, "job-x")
+        assert job.failure_code == "video_too_long"
+        assert job.failure_detail == "视频时长不能超过 2 小时"
+
+
+@pytest.mark.asyncio
+async def test_x_pipeline_maps_job_deadline_to_timeout_failure(x_context):
+    factory, _, settings, _ = x_context
+    settings.asr_job_timeout_seconds = 0.01
+
+    class SlowDownloader(FakeDownloader):
+        async def download(self, url, destination):
+            await asyncio.sleep(0.05)
+            return await super().download(url, destination)
+
+    await make_pipeline(x_context, downloader=SlowDownloader()).run("job-x")
+
+    async with factory() as session:
+        job = await session.get(AnalysisJob, "job-x")
+        assert job.status == "failed"
+        assert job.failure_code == "analysis_timeout"
 
 
 @pytest.mark.asyncio

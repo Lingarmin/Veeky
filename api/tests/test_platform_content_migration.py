@@ -336,9 +336,15 @@ async def test_platform_content_migration_preserves_youtube_history_on_round_tri
             """
             UPDATE analysis_jobs
             SET status = 'waiting_for_media', media_url_ciphertext = 'encrypted',
-                force_run = TRUE
+                force_run = TRUE,
+                lease_token = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+                lease_expires_at = NOW()
             WHERE id = $1
             """,
+            X_JOB_ID,
+        )
+        lease_row = await connection.fetchrow(
+            "SELECT lease_token, lease_expires_at FROM analysis_jobs WHERE id = $1",
             X_JOB_ID,
         )
     finally:
@@ -364,6 +370,8 @@ async def test_platform_content_migration_preserves_youtube_history_on_round_tri
     ]
     assert x_translation_count == 1
     assert tuple(x_worker_columns) == ("youtube_caption", None)
+    assert lease_row["lease_token"] == "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+    assert lease_row["lease_expires_at"] is not None
 
     _alembic(migration_database_url, "downgrade", "0005_one_active_job")
 
@@ -387,8 +395,16 @@ async def test_platform_content_migration_preserves_youtube_history_on_round_tri
             X_JOB_ID,
             X_RESULT_ID,
         )
+        lease_columns = await connection.fetchval(
+            """
+            SELECT COUNT(*) FROM information_schema.columns
+            WHERE table_name = 'analysis_jobs'
+              AND column_name IN ('lease_token', 'lease_expires_at')
+            """
+        )
     finally:
         await connection.close()
 
     assert downgraded_history == expected_history
     assert tuple(x_row_counts) == (0, 0, 0, 0, 0, 0)
+    assert lease_columns == 0

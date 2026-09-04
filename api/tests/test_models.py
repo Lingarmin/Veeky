@@ -204,6 +204,8 @@ async def test_x_worker_statuses_and_media_handoff_fields_are_persisted(session)
         status="waiting_for_media",
         media_url_ciphertext="encrypted",
         force_run=True,
+        lease_token="77777777-7777-4777-8777-777777777777",
+        lease_expires_at=datetime.now(timezone.utc),
     )
     session.add(job)
     await session.commit()
@@ -211,13 +213,20 @@ async def test_x_worker_statuses_and_media_handoff_fields_are_persisted(session)
     row = (
         await session.execute(
             text(
-                "SELECT status, media_url_ciphertext, force_run "
+                "SELECT status, media_url_ciphertext, force_run, lease_token, "
+                "lease_expires_at "
                 "FROM analysis_jobs WHERE id = :id"
             ),
             {"id": job.id},
         )
     ).one()
-    assert tuple(row) == ("waiting_for_media", "encrypted", 1)
+    assert tuple(row[:4]) == (
+        "waiting_for_media",
+        "encrypted",
+        1,
+        "77777777-7777-4777-8777-777777777777",
+    )
+    assert row.lease_expires_at is not None
 
 
 @pytest.mark.asyncio

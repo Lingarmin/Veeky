@@ -32,6 +32,7 @@ from app.main import create_app
 from app.security.installations import hash_installation_token
 from app.security.quotas import get_quota_limiter
 from app.services import media_upload
+from app.services.job_lease import claim_job_lease, update_owned_job
 from app.services.media_upload import (
     MediaUploadError,
     cleanup_expired_uploads,
@@ -1693,6 +1694,97 @@ async def test_postgres_complete_serializes_delete_and_expiration(
         upload = await session.get(MediaUploadSession, expiring_id)
         assert upload.status == "expired"
     assert not expiring_directory.exists()
+
+
+@pytest.mark.asyncio
+async def test_postgres_job_lease_claim_and_expiry_takeover_are_atomic(
+    postgres_media_context,
+):
+    factory, _ = postgres_media_context
+    async with factory() as session:
+        session.add(
+            AnalysisJob(
+                id="postgres-lease-job",
+                installation_id=INSTALLATION_ID,
+                video_id="x:2075545587093807111:1",
+                content_id=CONTENT_ID,
+                source_language="auto",
+                target_language="zh-Hans",
+                transcript_version="pending:postgres-lease-job",
+                cache_key="pending:postgres-lease-job",
+                status="queued",
+            )
+        )
+        await session.commit()
+
+    async def claim():
+        async with factory() as session:
+            return await claim_job_lease(
+                session,
+                "postgres-lease-job",
+                resume=True,
+                lease_seconds=60,
+            )
+
+    first, second = await asyncio.gather(claim(), claim())
+    owner = first if first.token is not None else second
+    duplicate = second if first.token is not None else first
+    assert owner.token is not None
+    assert duplicate.token is None
+    assert duplicate.retry_at is not None
+
+    lock_wait_job_id = "postgres-lease-job"
+    async with factory() as session:
+        job = await session.get(AnalysisJob, lock_wait_job_id)
+        job.status = "downloading_media"
+        job.lease_token = "owner-before-lock-wait"
+        job.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        await session.commit()
+
+    async with factory() as locking_session:
+        locked_job = await locking_session.scalar(
+            select(AnalysisJob)
+            .where(AnalysisJob.id == lock_wait_job_id)
+            .with_for_update()
+        )
+        locked_job.lease_expires_at = datetime.now(timezone.utc) + timedelta(seconds=0.5)
+        await locking_session.flush()
+
+        async def claim_after_lock_wait():
+            async with factory() as session:
+                return await claim_job_lease(
+                    session,
+                    lock_wait_job_id,
+                    resume=True,
+                    lease_seconds=60,
+                )
+
+        waiting_claim = asyncio.create_task(claim_after_lock_wait())
+        await asyncio.sleep(0.1)
+        assert not waiting_claim.done()
+        await asyncio.sleep(0.5)
+        await locking_session.commit()
+
+    lock_wait_replacement = await waiting_claim
+    assert lock_wait_replacement.token is not None
+    assert lock_wait_replacement.token != "owner-before-lock-wait"
+
+    async with factory() as session:
+        job = await session.get(AnalysisJob, "postgres-lease-job")
+        job.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        await session.commit()
+
+    replacement = await claim()
+    assert replacement.token is not None
+    assert replacement.token != owner.token
+    async with factory() as session:
+        assert not await update_owned_job(
+            session,
+            "postgres-lease-job",
+            owner.token,
+            lease_seconds=60,
+            values={"status": "analyzing"},
+        )
 
 
 async def _complete_postgres_upload(factory, settings, session_id):

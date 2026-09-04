@@ -9,7 +9,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -49,6 +49,7 @@ from app.services.llm import (
     normalize_provider_config,
 )
 from app.services.media_upload import expire_complete_upload_if_unreferenced
+from app.services.job_lease import requeue_stale_job
 from app.security.installations import require_installation
 from app.security.credentials import JobCredentialCipher
 from app.security.quotas import (
@@ -414,6 +415,8 @@ async def attach_completed_upload_to_waiting_job(
         return None
     job.media_session_id = upload.id
     job.status = "queued"
+    job.lease_token = None
+    job.lease_expires_at = None
     await session.commit()
     return job.id
 
@@ -454,9 +457,7 @@ async def inspect_video(
             request.url, active_media_index=request.active_media_index
         )
     except UnsupportedSourceUrl as error:
-        raise _api_error(
-            422, "invalid_youtube_url", "请输入有效的 YouTube 视频链接"
-        ) from error
+        raise _invalid_source_url(request.url) from error
     except SourceRegistryConfigurationError as error:
         raise _source_adapter_unavailable() from error
     _validate_content_ref(ref)
@@ -576,34 +577,40 @@ async def create_analysis(
     )
     if existing and existing.status != "failed":
         if existing.status in INTERRUPTIBLE_JOB_STATUSES:
-            # A worker can disappear after claiming a job. Re-queue the job when
-            # the user explicitly starts the same analysis again.
-            existing.status = "queued"
-            _store_llm_credential(
-                existing,
+            credential_ciphertext, credential_expires_at = _encrypted_llm_credential(
+                existing.id,
                 request.llm_config,
                 credential_cipher,
                 settings.llm_credential_ttl_seconds,
             )
-            await session.commit()
-            try:
-                dispatcher(existing.id)
-            except WorkerUnavailableError as error:
-                await _fail_dispatch(
-                    session, settings, existing, "worker_unavailable", str(error)
-                )
-                raise _api_error(
-                    503,
-                    "worker_unavailable",
-                    "后台任务服务未启动，请运行 docker compose up -d 后重试",
-                ) from error
-            except Exception as error:
-                await _fail_dispatch(
-                    session, settings, existing, "dispatch_failed", str(error)
-                )
-                raise _api_error(
-                    503, "dispatch_failed", "后台任务暂时无法启动，请重试"
-                ) from error
+            requeued = await requeue_stale_job(
+                session,
+                existing.id,
+                values={
+                    "llm_credential_ciphertext": credential_ciphertext,
+                    "llm_credential_expires_at": credential_expires_at,
+                },
+            )
+            await session.refresh(existing)
+            if requeued:
+                try:
+                    dispatcher(existing.id)
+                except WorkerUnavailableError as error:
+                    await _fail_dispatch(
+                        session, settings, existing, "worker_unavailable"
+                    )
+                    raise _api_error(
+                        503,
+                        "worker_unavailable",
+                        "后台任务服务未启动，请运行 docker compose up -d 后重试",
+                    ) from error
+                except Exception as error:
+                    await _fail_dispatch(
+                        session, settings, existing, "dispatch_failed"
+                    )
+                    raise _api_error(
+                        503, "dispatch_failed", "后台任务暂时无法启动，请重试"
+                    ) from error
         cache_hit = existing.status == "completed"
         response.status_code = 200 if cache_hit else 202
         return AnalysisCreateResponse(
@@ -669,6 +676,8 @@ async def create_analysis(
     else:
         job = existing
         job.status = "queued"
+        job.lease_token = None
+        job.lease_expires_at = None
         job.failure_code = None
         job.failure_detail = None
         job.completed_at = None
@@ -717,7 +726,7 @@ async def create_analysis(
         dispatcher(job.id)
     except WorkerUnavailableError as error:
         await _fail_dispatch(
-            session, settings, job, "worker_unavailable", str(error)
+            session, settings, job, "worker_unavailable"
         )
         raise _api_error(
             503,
@@ -725,7 +734,7 @@ async def create_analysis(
             "后台任务服务未启动，请运行 docker compose up -d 后重试",
         ) from error
     except Exception as error:
-        await _fail_dispatch(session, settings, job, "dispatch_failed", str(error))
+        await _fail_dispatch(session, settings, job, "dispatch_failed")
         raise _api_error(
             503, "dispatch_failed", "后台任务暂时无法启动，请重试"
         ) from error
@@ -842,40 +851,39 @@ async def get_analysis_result(
     )
     translated_by_id: dict[str, str] = {}
     if track is not None:
-        translation_filters = [
+        base_translation_filters = [
             Translation.track_id == track.id,
             Translation.target_language == job.target_language,
             Translation.transcript_version == version,
         ]
-        if job.llm_config and job.llm_config.get("provider", "kimi") == "kimi":
-            translation_filters.extend(
-                [
-                    Translation.provider == job.llm_config.get("provider", "kimi"),
-                    Translation.provider_version
-                    == provider_translation_version(
-                        normalize_chat_completions_url(job.llm_config["api_url"]),
-                        provider=job.llm_config.get("provider", "kimi"),
-                        version=job.llm_config.get("model", "kimi-k2.5"),
-                    ),
-                ]
+        translation = None
+        if job.llm_config is not None:
+            provider = job.llm_config.get("provider")
+            model = job.llm_config.get("model")
+            api_url = job.llm_config.get("api_url")
+            has_complete_identity = all(
+                isinstance(value, str) and value
+                for value in (provider, model, api_url)
             )
-        translation = await session.scalar(
-            select(Translation)
-            .where(*translation_filters)
-            .order_by(Translation.created_at.desc())
-        )
-        if translation is None and job.llm_config.get("provider", "kimi") == "kimi":
-            # Preserve results from injected/legacy providers while ensuring a
-            # real Kimi result prefers the endpoint-specific cache entry.
-            translation = await session.scalar(
-                select(Translation)
-                .where(
-                    Translation.track_id == track.id,
-                    Translation.target_language == job.target_language,
-                    Translation.transcript_version == version,
-                )
-                .order_by(Translation.created_at.desc())
-            )
+            if has_complete_identity:
+                try:
+                    expected_version = provider_translation_version(
+                        normalize_chat_completions_url(api_url),
+                        provider=provider,
+                        version=model,
+                    )
+                except ValueError:
+                    expected_version = None
+                if expected_version is not None:
+                    translation = await session.scalar(
+                        select(Translation)
+                        .where(
+                            *base_translation_filters,
+                            Translation.provider == provider,
+                            Translation.provider_version == expected_version,
+                        )
+                        .order_by(Translation.created_at.desc())
+                    )
         if translation is not None:
             translated_by_id = {
                 str(segment["segment_id"]): str(segment["text"])
@@ -923,6 +931,22 @@ def extract_youtube_video_id(url: str) -> str:
     if ref is None:
         raise _api_error(422, "invalid_youtube_url", "请输入有效的 YouTube 视频链接")
     return ref.source_content_id
+
+
+def _invalid_source_url(url: str) -> HTTPException:
+    try:
+        hostname = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        hostname = ""
+    is_youtube_host = (
+        hostname in {"youtu.be", "www.youtu.be", "youtube.com"}
+        or hostname.endswith(".youtube.com")
+    )
+    if is_youtube_host:
+        return _api_error(
+            422, "invalid_youtube_url", "请输入有效的 YouTube 视频链接"
+        )
+    return _api_error(422, "invalid_source_url", "请输入有效的视频链接")
 
 
 async def _resolve_content_locator(
@@ -1111,9 +1135,10 @@ def _validate_llm_config(config: LlmConfigRequest | None) -> None:
     if config is None:
         raise _api_error(422, "llm_config_required", "请先配置 LLM 服务")
     try:
-        normalize_provider_config(
+        normalized = normalize_provider_config(
             config.provider, config.api_url, config.api_key, config.model
         )
+        normalize_chat_completions_url(normalized.api_url)
     except ValueError as error:
         raise _api_error(422, "llm_config_invalid", str(error)) from error
 
@@ -1138,19 +1163,26 @@ def _store_llm_credential(
     cipher: JobCredentialCipher,
     ttl_seconds: int,
 ) -> None:
+    ciphertext, expires_at = _encrypted_llm_credential(
+        job.id, config, cipher, ttl_seconds
+    )
+    job.llm_credential_ciphertext = ciphertext
+    job.llm_credential_expires_at = expires_at
+
+
+def _encrypted_llm_credential(
+    job_id: str,
+    config: LlmConfigRequest,
+    cipher: JobCredentialCipher,
+    ttl_seconds: int,
+) -> tuple[str, datetime]:
     normalized = normalize_provider_config(
         config.provider, config.api_url, config.api_key, config.model
     )
-    job.llm_credential_ciphertext = cipher.encrypt(job.id, normalized.api_key)
-    job.llm_credential_expires_at = datetime.now(timezone.utc) + timedelta(
-        seconds=ttl_seconds
+    return (
+        cipher.encrypt(job_id, normalized.api_key),
+        datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds),
     )
-
-
-def _clear_llm_credential(job: AnalysisJob) -> None:
-    job.llm_credential_ciphertext = None
-    job.llm_credential_expires_at = None
-    job.media_url_ciphertext = None
 
 
 async def _fail_dispatch(
@@ -1158,19 +1190,33 @@ async def _fail_dispatch(
     settings: Settings,
     job: AnalysisJob,
     failure_code: str,
-    failure_detail: str,
 ) -> None:
-    job.status = "failed"
-    job.failure_code = failure_code
-    job.failure_detail = failure_detail
-    job.completed_at = datetime.now(timezone.utc)
-    _clear_llm_credential(job)
     media_session_id = job.media_session_id
     installation_id = job.installation_id
     content_id = job.content_id
     job_id = job.id
+    result = await session.execute(
+        update(AnalysisJob)
+        .where(
+            AnalysisJob.id == job_id,
+            AnalysisJob.status == "queued",
+            AnalysisJob.lease_token.is_(None),
+        )
+        .values(
+            status="failed",
+            failure_code=failure_code,
+            failure_detail=None,
+            completed_at=datetime.now(timezone.utc),
+            lease_token=None,
+            lease_expires_at=None,
+            llm_credential_ciphertext=None,
+            llm_credential_expires_at=None,
+            media_url_ciphertext=None,
+        )
+        .execution_options(synchronize_session=False)
+    )
     await session.commit()
-    if media_session_id:
+    if result.rowcount == 1 and media_session_id:
         await expire_complete_upload_if_unreferenced(
             session,
             settings,

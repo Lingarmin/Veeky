@@ -10,9 +10,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from datetime import datetime, timezone
 
+import anyio
+from billiard.exceptions import SoftTimeLimitExceeded
 from celery import Celery
+from celery.exceptions import WorkerTerminate
 from cryptography.exceptions import InvalidTag
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -44,6 +47,12 @@ from app.services.llm import (
     normalize_chat_completions_url,
     normalize_provider_config,
 )
+from app.services.job_lease import (
+    JobLeaseClaim,
+    claim_job_lease,
+    finish_owned_job,
+    update_owned_job,
+)
 from app.services.media_upload import expire_complete_upload_if_unreferenced
 from app.services.transcripts import TranscriptService, transcript_version
 from app.services.video_metadata import VideoMetadataService
@@ -59,6 +68,7 @@ from app.services.translation import (
     TranslationProviderError,
     TranslationSegment,
     LlmTranslationProvider,
+    provider_translation_version,
 )
 from app.security.credentials import JobCredentialCipher
 
@@ -67,6 +77,20 @@ class AudioExtractionError(RuntimeError):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
+
+
+class JobLeaseLost(RuntimeError):
+    pass
+
+
+STDERR_CAPTURE_LIMIT_BYTES = 64 * 1024
+STDOUT_CAPTURE_LIMIT_BYTES = 64 * 1024
+PCM_SAMPLE_RATE = 16_000
+PCM_SAMPLE_WIDTH_BYTES = 2
+WAV_HEADER_BYTES = 44
+PCM_DURATION_TOLERANCE_MS = 100
+CELERY_HARD_LIMIT_GRACE_SECONDS = 60
+WORKER_TERMINATION_REQUIRED = "worker_termination_required"
 
 
 class FFmpegAudioExtractor:
@@ -107,9 +131,20 @@ class FFmpegAudioExtractor:
             raise AudioExtractionError("media_probe_failed", "无法读取媒体时长")
         return duration * 1000
 
-    async def extract(self, media_path: Path, audio_path: Path) -> Path:
+    async def extract(
+        self,
+        media_path: Path,
+        audio_path: Path,
+        *,
+        expected_duration_ms: float | None = None,
+    ) -> Path:
         self._validate_path(media_path)
         self._validate_path(audio_path)
+        if (
+            expected_duration_ms is not None
+            and self._required_wav_bytes(expected_duration_ms) > self.max_bytes
+        ):
+            raise AudioExtractionError("media_too_large", "媒体文件过大")
         process = await self.runner(
             "ffmpeg",
             "-nostdin",
@@ -125,6 +160,7 @@ class FFmpegAudioExtractor:
             "16000",
             "-c:a",
             "pcm_s16le",
+            "-bitexact",
             "-fs",
             str(self.max_bytes),
             "-y",
@@ -150,30 +186,87 @@ class FFmpegAudioExtractor:
             )
         if not audio_path.is_file() or audio_path.stat().st_size > self.max_bytes:
             raise AudioExtractionError("media_too_large", "媒体文件过大")
+        if expected_duration_ms is not None:
+            self._validate_wav_duration(audio_path, expected_duration_ms)
         return audio_path
 
     async def _run_subprocess(self, *arguments: str):
+        process = None
         try:
             process = await asyncio.create_subprocess_exec(
                 *arguments,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=self.timeout_seconds
+            assert process.stdout is not None
+            assert process.stderr is not None
+            stdout_task = asyncio.create_task(
+                self._read_bounded(process.stdout, STDOUT_CAPTURE_LIMIT_BYTES)
             )
-        except (OSError, TimeoutError):
-            if "process" in locals() and process.returncode is None:
+            stderr_task = asyncio.create_task(
+                self._read_bounded(process.stderr, STDERR_CAPTURE_LIMIT_BYTES)
+            )
+            await asyncio.wait_for(process.wait(), timeout=self.timeout_seconds)
+            stdout, stderr = await asyncio.gather(stdout_task, stderr_task)
+        except TimeoutError:
+            if process is not None and process.returncode is None:
                 process.kill()
-                await process.communicate()
+                await process.wait()
+            if "stdout_task" in locals() and "stderr_task" in locals():
+                await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+            raise AudioExtractionError(
+                "audio_extraction_timeout", "音频处理超时"
+            ) from None
+        except OSError:
             raise AudioExtractionError(
                 "audio_extraction_failed", "音频提取失败"
             ) from None
+        except asyncio.CancelledError:
+            if process is not None and process.returncode is None:
+                process.kill()
+                await process.wait()
+            if "stdout_task" in locals() and "stderr_task" in locals():
+                await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+            raise
         return SimpleNamespace(
             returncode=process.returncode,
             stdout=stdout.decode("utf-8", "replace"),
             stderr=stderr.decode("utf-8", "replace"),
         )
+
+    @staticmethod
+    async def _read_bounded(stream, limit: int) -> bytes:
+        captured = bytearray()
+        while chunk := await stream.read(64 * 1024):
+            remaining = limit - len(captured)
+            if remaining > 0:
+                captured.extend(chunk[:remaining])
+        return bytes(captured)
+
+    @staticmethod
+    def _required_wav_bytes(duration_ms: float) -> int:
+        samples = math.ceil(duration_ms * PCM_SAMPLE_RATE / 1000)
+        return WAV_HEADER_BYTES + samples * PCM_SAMPLE_WIDTH_BYTES
+
+    @staticmethod
+    def _validate_wav_duration(audio_path: Path, expected_duration_ms: float) -> None:
+        try:
+            import wave
+
+            with wave.open(str(audio_path), "rb") as audio:
+                if (
+                    audio.getnchannels() != 1
+                    or audio.getsampwidth() != PCM_SAMPLE_WIDTH_BYTES
+                    or audio.getframerate() != PCM_SAMPLE_RATE
+                ):
+                    raise ValueError("unexpected PCM format")
+                actual_duration_ms = audio.getnframes() * 1000 / audio.getframerate()
+        except (OSError, EOFError, ValueError, wave.Error):
+            raise AudioExtractionError(
+                "audio_extraction_failed", "音频提取失败"
+            ) from None
+        if actual_duration_ms + PCM_DURATION_TOLERANCE_MS < expected_duration_ms:
+            raise AudioExtractionError("audio_extraction_failed", "音频提取失败")
 
     def _validate_path(self, path: Path) -> None:
         resolved = path.resolve()
@@ -286,17 +379,51 @@ class AnalysisPipeline:
         self.transcriber = transcriber
         self._uses_default_providers = False
 
-    async def run(self, job_id: str, *, resume: bool = False) -> None:
-        job = await self._claim(job_id, resume=resume)
+    async def run(
+        self, job_id: str, *, resume: bool = False
+    ) -> datetime | str | None:
+        loop = asyncio.get_running_loop()
+        claim_started_at = loop.time()
+        claim = await self._claim(job_id, resume=resume)
+        if claim.retry_at is not None:
+            return claim.retry_at
+        if claim.token is None:
+            return None
+        lease_token = claim.token
+        job = await self._load_claimed_job(job_id, lease_token)
         if job is None:
-            return
+            return None
+        owner_task = asyncio.current_task()
+        assert owner_task is not None
+        lease_lost = asyncio.Event()
+        lease_deadline = claim_started_at + self._lease_seconds
+        heartbeat_task = asyncio.create_task(
+            self._heartbeat_lease(
+                job_id,
+                lease_token,
+                owner_task,
+                lease_lost,
+                lease_deadline,
+            )
+        )
+        deadline = loop.time() + self.settings.asr_job_timeout_seconds
         translation_provider = self.translation_provider
         analysis_service = self.analysis_service
         try:
+            track = await self._load_persisted_track(job)
+            if (
+                self._uses_default_providers
+                and job.result is not None
+                and track is not None
+                and await self._translation_is_persisted(job, track)
+            ):
+                await self._complete(job_id, lease_token)
+                return None
             if self._uses_default_providers:
                 if not self._credential_is_current(job):
                     await self._fail(
                         job_id,
+                        lease_token,
                         "llm_credentials_expired",
                         None,
                         expire_complete_upload=True,
@@ -310,6 +437,7 @@ class AnalysisPipeline:
                 except (ValueError, binascii.Error, InvalidTag, UnicodeDecodeError):
                     await self._fail(
                         job_id,
+                        lease_token,
                         "llm_credentials_expired",
                         None,
                         expire_complete_upload=True,
@@ -323,35 +451,47 @@ class AnalysisPipeline:
                 api_key = ""
                 provider_config.clear()
 
-            acquired = (
-                await self._acquire_x(job)
-                if job.video.platform == "x"
-                else await self._acquire_youtube(job)
-            )
-            if acquired is None:
-                return
-            track, stored_segments, version = acquired
-
-            await self._set_status(job_id, "analyzing")
-            analysis_segments = [
-                AnalysisSegment(
-                    segment_id=segment.id,
-                    start_ms=segment.start_ms,
-                    duration_ms=segment.duration_ms,
-                    original=segment.text,
+            if track is None:
+                initial_status = (
+                    "downloading_media"
+                    if job.video.platform == "x"
+                    else "fetching_transcript"
                 )
-                for segment in stored_segments
-            ]
-            result = await analysis_service.analyze(
-                analysis_segments,
-                job.target_language,
-                duration_ms=job.video.duration_ms,
-            )
-            async with self.session_factory() as session:
-                job_row = await session.scalar(
-                    select(AnalysisJob)
-                    .options(selectinload(AnalysisJob.result))
-                    .where(AnalysisJob.id == job_id)
+                await self._set_status(job_id, lease_token, initial_status)
+                acquired = (
+                    await self._before_deadline(
+                        self._acquire_x(job, lease_token), deadline
+                    )
+                    if job.video.platform == "x"
+                    else await self._before_deadline(
+                        self._acquire_youtube(job, lease_token), deadline
+                    )
+                )
+                if acquired is None:
+                    return None
+                track, stored_segments, version = acquired
+            else:
+                stored_segments = list(track.segments)
+                version = track.transcript_version
+
+            if job.result is None:
+                await self._set_status(job_id, lease_token, "analyzing")
+                analysis_segments = [
+                    AnalysisSegment(
+                        segment_id=segment.id,
+                        start_ms=segment.start_ms,
+                        duration_ms=segment.duration_ms,
+                        original=segment.text,
+                    )
+                    for segment in stored_segments
+                ]
+                result = await self._before_deadline(
+                    analysis_service.analyze(
+                        analysis_segments,
+                        job.target_language,
+                        duration_ms=job.video.duration_ms,
+                    ),
+                    deadline,
                 )
                 result_values = {
                     "one_line_summary": result.one_line_summary,
@@ -364,13 +504,11 @@ class AnalysisPipeline:
                     "model_version": result.model_version,
                     "generated_at": result.generated_at,
                 }
-                if job_row.result is None:
-                    job_row.result = StoredAnalysisResult(**result_values)
-                else:
-                    for field, value in result_values.items():
-                        setattr(job_row.result, field, value)
-                job_row.status = "translating"
-                await session.commit()
+                await self._store_analysis_result(
+                    job_id, lease_token, result_values
+                )
+            else:
+                await self._set_status(job_id, lease_token, "translating")
 
             translation_inputs = [
                 TranslationSegment(
@@ -382,34 +520,66 @@ class AnalysisPipeline:
                 for segment in stored_segments
             ]
             async with self.session_factory() as session:
+                if not await self._owns_lease(session, job_id, lease_token):
+                    raise JobLeaseLost()
                 cache = SqlTranslationCache(session)
                 translation_service = CachedTranslationService(
                     translation_provider, cache
                 )
-                await translation_service.translate(
-                    track.id,
-                    translation_inputs,
-                    track.language_code,
-                    job.target_language,
-                    version,
+                await self._before_deadline(
+                    translation_service.translate(
+                        track.id,
+                        translation_inputs,
+                        track.language_code,
+                        job.target_language,
+                        version,
+                    ),
+                    deadline,
                 )
+                if not await self._renew_owned_job(
+                    session, job_id, lease_token, status="translating"
+                ):
+                    raise JobLeaseLost()
                 await session.commit()
-            await self._complete(job_id)
+            await self._complete(job_id, lease_token)
+        except asyncio.CancelledError:
+            if lease_lost.is_set():
+                return None
+            raise
+        except JobLeaseLost:
+            return None
+        except (TimeoutError, SoftTimeLimitExceeded):
+            await self._fail(job_id, lease_token, "analysis_timeout", None)
+            return WORKER_TERMINATION_REQUIRED
         except MediaDownloadError:
-            await self._wait_for_media(job_id)
+            await self._wait_for_media(job_id, lease_token)
         except (AudioExtractionError, AsrError) as error:
-            await self._fail(job_id, error.code, str(error))
+            failure_detail = (
+                str(error)
+                if isinstance(error, AudioExtractionError)
+                and error.code == "video_too_long"
+                else None
+            )
+            await self._fail(job_id, lease_token, error.code, failure_detail)
         except TranslationProviderError as error:
-            await self._fail(job_id, "translation_failed", f"{error.code}: {error}")
+            await self._fail(
+                job_id,
+                lease_token,
+                "translation_failed",
+                None,
+            )
         except AnalysisGenerationError as error:
-            await self._fail(job_id, error.code, str(error))
+            await self._fail(job_id, lease_token, error.code, None)
         except Exception as error:
-            await self._fail(job_id, "analysis_internal_error", None)
+            await self._fail(job_id, lease_token, "analysis_internal_error", None)
             raise
         finally:
-            await self._cleanup_job_temp(job_id)
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+            await self._cleanup_job_temp(job_id, lease_token)
+        return None
 
-    async def _acquire_youtube(self, job):
+    async def _acquire_youtube(self, job, lease_token: str):
         ref = ContentRef(
             platform=job.video.platform,
             source_content_id=job.video.source_content_id,
@@ -420,36 +590,46 @@ class AnalysisPipeline:
         if not inspection.available:
             await self._fail(
                 job.id,
+                lease_token,
                 inspection.failure_code or "transcript_unavailable",
-                inspection.failure_detail,
+                None,
             )
             return None
         if (
             inspection.selected is None
             or inspection.selected.language_code != job.source_language
         ):
-            await self._fail(job.id, "source_language_unavailable", None)
+            await self._fail(
+                job.id, lease_token, "source_language_unavailable", None
+            )
             return None
 
         version = transcript_version(inspection.segments)
         if version != job.transcript_version:
             await self._fail(
                 job.id,
+                lease_token,
                 "transcript_changed",
                 "YouTube captions changed after the task was created",
             )
             return None
         async with self.session_factory() as session:
+            if not await self._owns_lease(session, job.id, lease_token):
+                raise JobLeaseLost()
             track = await self._persist_transcript(
                 session, job.video_id, inspection, version
             )
             stored_segments = list(track.segments)
+            if not await self._renew_owned_job(
+                session, job.id, lease_token, status="fetching_transcript"
+            ):
+                raise JobLeaseLost()
             await session.commit()
         return track, stored_segments, version
 
-    async def _acquire_x(self, job):
+    async def _acquire_x(self, job, lease_token: str):
         root = Path(self.settings.media_temp_root).resolve()
-        job_dir = root / f"job-{job.id}"
+        job_dir = root / f"job-{job.id}-{lease_token}"
         job_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         media_path = job_dir / "media.bin"
         uploaded_dir = None
@@ -462,7 +642,7 @@ class AnalysisPipeline:
                 )
             except (ValueError, binascii.Error, InvalidTag, UnicodeDecodeError):
                 raise MediaDownloadError("media candidate expired") from None
-            await self._set_status(job.id, "downloading_media")
+            await self._set_status(job.id, lease_token, "downloading_media")
             downloader = self.media_downloader or MediaDownloader(
                 max_bytes=self.settings.max_media_bytes,
                 timeout_seconds=self.settings.media_download_timeout_seconds,
@@ -470,36 +650,62 @@ class AnalysisPipeline:
             try:
                 await downloader.download(media_url, media_path)
             except MediaDownloadError:
-                await self._clear_media_candidate(job.id)
+                await self._clear_media_candidate(job.id, lease_token)
                 if not job.media_session_id:
                     raise
             media_url = ""
-            await self._clear_media_candidate(job.id)
         if not media_path.exists():
             async with self.session_factory() as session:
-                upload = await session.scalar(
-                    select(MediaUploadSession)
+                current = await session.scalar(
+                    select(AnalysisJob)
                     .where(
-                        MediaUploadSession.id == job.media_session_id,
-                        MediaUploadSession.installation_id == job.installation_id,
-                        MediaUploadSession.content_id == job.content_id,
-                        MediaUploadSession.status == "complete",
-                        MediaUploadSession.expires_at > datetime.now(timezone.utc),
+                        AnalysisJob.id == job.id,
+                        AnalysisJob.lease_token == lease_token,
+                        AnalysisJob.lease_expires_at > func.now(),
                     )
                     .with_for_update()
                 )
-                if upload is None:
-                    raise MediaDownloadError("media upload required")
-                upload.status = "consumed"
-                uploaded_dir = root / upload.directory_key
-                await asyncio.to_thread(
-                    self._copy_upload_artifact,
-                    uploaded_dir,
-                    upload.media_kind,
-                    media_path,
-                    self.settings.max_media_bytes,
+                if current is None:
+                    raise JobLeaseLost()
+                upload = await session.scalar(
+                    select(MediaUploadSession)
+                    .where(
+                        MediaUploadSession.id == current.media_session_id,
+                        MediaUploadSession.installation_id
+                        == current.installation_id,
+                        MediaUploadSession.content_id == current.content_id,
+                        MediaUploadSession.status.in_(("complete", "consumed")),
+                    )
+                    .with_for_update()
                 )
-                await session.commit()
+                if upload is None or (
+                    upload.status == "complete"
+                    and self._as_utc(upload.expires_at) <= datetime.now(timezone.utc)
+                ):
+                    raise MediaDownloadError("media upload required")
+                uploaded_dir = root / upload.directory_key
+                try:
+                    await anyio.to_thread.run_sync(
+                        self._copy_upload_artifact,
+                        uploaded_dir,
+                        upload.media_kind,
+                        media_path,
+                        self.settings.max_media_bytes,
+                        abandon_on_cancel=True,
+                    )
+                except AudioExtractionError as error:
+                    if error.code != "media_artifact_missing":
+                        raise
+                    raise MediaDownloadError("media upload required") from None
+                upload.status = "consumed"
+                if not await update_owned_job(
+                    session,
+                    job.id,
+                    lease_token,
+                    lease_seconds=self._lease_seconds,
+                    values={},
+                ):
+                    raise JobLeaseLost()
         media_size = media_path.stat().st_size
         if media_size > min(
             self.settings.max_media_bytes, self.settings.max_temp_bytes_per_job
@@ -515,27 +721,55 @@ class AnalysisPipeline:
         )
         exact_duration_ms = await extractor.probe_duration_ms(media_path)
         if exact_duration_ms > self.settings.max_video_duration_seconds * 1000:
-            raise AudioExtractionError("video_too_long", "视频时长不能超过 4 小时")
+            duration_limit = self._format_duration_limit(
+                self.settings.max_video_duration_seconds
+            )
+            raise AudioExtractionError(
+                "video_too_long", f"视频时长不能超过 {duration_limit}"
+            )
         duration_ms = round(exact_duration_ms)
         job.video.duration_ms = duration_ms
-        await self._set_status(job.id, "extracting_audio")
-        audio_path = await extractor.extract(media_path, job_dir / "audio.wav")
+        await self._set_status(job.id, lease_token, "extracting_audio")
+        audio_path = await extractor.extract(
+            media_path,
+            job_dir / "audio.wav",
+            expected_duration_ms=exact_duration_ms,
+        )
         if (
             media_size + audio_path.stat().st_size
             > self.settings.max_temp_bytes_per_job
         ):
             raise AudioExtractionError("media_too_large", "媒体文件过大")
-        await self._set_status(job.id, "transcribing")
+        await self._set_status(job.id, lease_token, "transcribing")
         transcriber = self.transcriber or get_default_transcriber(
             settings=self.settings
         )
-        segments, language = await asyncio.to_thread(transcriber.transcribe, audio_path)
-        artifact_hash = await asyncio.to_thread(self._sha256_file, media_path)
+        segments, language = await anyio.to_thread.run_sync(
+            transcriber.transcribe,
+            audio_path,
+            abandon_on_cancel=True,
+        )
+        artifact_hash = await anyio.to_thread.run_sync(
+            self._sha256_file,
+            media_path,
+            abandon_on_cancel=True,
+        )
         version = self._x_transcript_version(
             segments, artifact_hash, transcriber.version
         )
         async with self.session_factory() as session:
-            current = await session.get(AnalysisJob, job.id)
+            current = await session.scalar(
+                select(AnalysisJob)
+                .options(selectinload(AnalysisJob.result))
+                .where(
+                    AnalysisJob.id == job.id,
+                    AnalysisJob.lease_token == lease_token,
+                    AnalysisJob.lease_expires_at > func.now(),
+                )
+                .with_for_update()
+            )
+            if current is None:
+                raise JobLeaseLost()
             llm_cache_fingerprint = self._x_llm_cache_fingerprint(current.llm_config)
             final_cache_key = ":".join(
                 (
@@ -587,12 +821,26 @@ class AnalysisPipeline:
                     model_version=cached.result.model_version,
                     generated_at=cached.result.generated_at,
                 )
-                current.status = "completed"
-                current.completed_at = datetime.now(timezone.utc)
-                self._clear_credential(current)
-                await session.commit()
-                if uploaded_dir is not None:
-                    await asyncio.to_thread(shutil.rmtree, uploaded_dir, True)
+                if not await finish_owned_job(
+                    session,
+                    current.id,
+                    lease_token,
+                    values={
+                        "source_language": language,
+                        "transcript_version": version,
+                        "cache_key": f"{final_cache_key}:reuse:{current.id}",
+                        "status": "completed",
+                        "completed_at": datetime.now(timezone.utc),
+                        "failure_code": None,
+                        "failure_detail": None,
+                        "llm_credential_ciphertext": None,
+                        "llm_credential_expires_at": None,
+                        "media_url_ciphertext": None,
+                    },
+                ):
+                    raise JobLeaseLost()
+                await self._cleanup_consumed_upload(job.id)
+                await self._expire_complete_upload(job.id)
                 return None
             current.source_language = language
             current.transcript_version = version
@@ -618,54 +866,118 @@ class AnalysisPipeline:
             )
             track.transcript_source = "faster_whisper"
             track.asr_model = transcriber.model_size
-            await session.commit()
+            if not await update_owned_job(
+                session,
+                job.id,
+                lease_token,
+                lease_seconds=self._lease_seconds,
+                values={"media_url_ciphertext": None},
+            ):
+                raise JobLeaseLost()
             stored_segments = list(track.segments)
-        if uploaded_dir is not None:
-            await asyncio.to_thread(shutil.rmtree, uploaded_dir, True)
         return track, stored_segments, version
 
-    async def _set_status(self, job_id: str, status: str) -> None:
-        async with self.session_factory() as session:
-            job = await session.get(AnalysisJob, job_id)
-            if job is not None:
-                job.status = status
-                await session.commit()
+    @staticmethod
+    async def _before_deadline(awaitable, deadline: float):
+        async with asyncio.timeout_at(deadline):
+            return await awaitable
 
-    async def _clear_media_candidate(self, job_id: str) -> None:
-        async with self.session_factory() as session:
-            job = await session.get(AnalysisJob, job_id)
-            if job is not None:
-                job.media_url_ciphertext = None
-                await session.commit()
+    @staticmethod
+    def _format_duration_limit(seconds: int) -> str:
+        hours, remainder = divmod(seconds, 3600)
+        minutes, remaining_seconds = divmod(remainder, 60)
+        parts = []
+        if hours:
+            parts.append(f"{hours} 小时")
+        if minutes:
+            parts.append(f"{minutes} 分钟")
+        if remaining_seconds or not parts:
+            parts.append(f"{remaining_seconds} 秒")
+        return " ".join(parts)
 
-    async def _wait_for_media(self, job_id: str) -> None:
+    async def _set_status(
+        self, job_id: str, lease_token: str, status: str
+    ) -> None:
         async with self.session_factory() as session:
-            job = await session.get(AnalysisJob, job_id)
+            if not await update_owned_job(
+                session,
+                job_id,
+                lease_token,
+                lease_seconds=self._lease_seconds,
+                values={"status": status},
+            ):
+                raise JobLeaseLost()
+
+    async def _clear_media_candidate(
+        self, job_id: str, lease_token: str
+    ) -> None:
+        async with self.session_factory() as session:
+            if not await update_owned_job(
+                session,
+                job_id,
+                lease_token,
+                lease_seconds=self._lease_seconds,
+                values={"media_url_ciphertext": None},
+            ):
+                raise JobLeaseLost()
+
+    async def _wait_for_media(self, job_id: str, lease_token: str) -> None:
+        async with self.session_factory() as session:
+            job = await session.scalar(
+                select(AnalysisJob)
+                .where(
+                    AnalysisJob.id == job_id,
+                    AnalysisJob.lease_token == lease_token,
+                )
+            )
             if job is None:
                 return
-            job.status = "waiting_for_media"
-            job.failure_code = None
-            job.failure_detail = None
-            job.completed_at = None
-            job.media_url_ciphertext = None
-            await session.commit()
+            media_session_id = job.media_session_id
+            if job.media_session_id:
+                upload = await session.get(MediaUploadSession, job.media_session_id)
+                if not await asyncio.to_thread(
+                    self._upload_is_recoverable, job, upload
+                ):
+                    media_session_id = None
+            await finish_owned_job(
+                session,
+                job_id,
+                lease_token,
+                values={
+                    "status": "waiting_for_media",
+                    "failure_code": None,
+                    "failure_detail": None,
+                    "completed_at": None,
+                    "media_url_ciphertext": None,
+                    "media_session_id": media_session_id,
+                },
+            )
 
-    async def _complete(self, job_id: str) -> None:
+    async def _complete(self, job_id: str, lease_token: str) -> None:
         async with self.session_factory() as session:
-            job = await session.get(AnalysisJob, job_id)
-            if job is None:
-                return
-            job.status = "completed"
-            job.completed_at = datetime.now(timezone.utc)
-            job.failure_code = None
-            job.failure_detail = None
-            self._clear_credential(job)
-            await session.commit()
+            if not await finish_owned_job(
+                session,
+                job_id,
+                lease_token,
+                values={
+                    "status": "completed",
+                    "completed_at": datetime.now(timezone.utc),
+                    "failure_code": None,
+                    "failure_detail": None,
+                    "llm_credential_ciphertext": None,
+                    "llm_credential_expires_at": None,
+                    "media_url_ciphertext": None,
+                },
+            ):
+                raise JobLeaseLost()
         await self._cleanup_consumed_upload(job_id)
+        await self._expire_complete_upload(job_id)
 
-    async def _cleanup_job_temp(self, job_id: str) -> None:
+    async def _cleanup_job_temp(self, job_id: str, lease_token: str) -> None:
         root = Path(self.settings.media_temp_root).resolve()
-        await asyncio.to_thread(shutil.rmtree, root / f"job-{job_id}", True)
+        await asyncio.to_thread(
+            shutil.rmtree, root / f"job-{job_id}-{lease_token}", True
+        )
 
     async def _cleanup_consumed_upload(self, job_id: str) -> None:
         async with self.session_factory() as session:
@@ -728,6 +1040,40 @@ class AnalysisPipeline:
                         "media_artifact_missing", "媒体文件不存在"
                     ) from None
 
+    def _upload_is_recoverable(
+        self, job: AnalysisJob, upload: MediaUploadSession | None
+    ) -> bool:
+        if (
+            upload is None
+            or upload.installation_id != job.installation_id
+            or upload.content_id != job.content_id
+            or upload.status not in {"complete", "consumed"}
+        ):
+            return False
+        if (
+            upload.status == "complete"
+            and self._as_utc(upload.expires_at) <= datetime.now(timezone.utc)
+        ):
+            return False
+        root = Path(self.settings.media_temp_root).resolve()
+        directory = (root / upload.directory_key).resolve()
+        if directory != root and root not in directory.parents:
+            return False
+        if upload.media_kind == "mp4":
+            return (directory / "media.mp4").is_file()
+        try:
+            part_numbers = json.loads((directory / "manifest.json").read_text())[
+                "parts"
+            ]
+        except (OSError, KeyError, TypeError, json.JSONDecodeError):
+            return False
+        return bool(part_numbers) and all(
+            type(part_number) is int
+            and part_number >= 0
+            and (directory / f"part-{part_number:08d}.bin").is_file()
+            for part_number in part_numbers
+        )
+
     @staticmethod
     def _x_transcript_version(segments, artifact_hash, asr_version):
         body = json.dumps(
@@ -771,34 +1117,189 @@ class AnalysisPipeline:
         )
         return hashlib.sha256(identity.encode()).hexdigest()
 
-    async def _claim(self, job_id: str, *, resume: bool) -> AnalysisJob | None:
+    @property
+    def _lease_seconds(self) -> float:
+        return max(1.0, float(self.settings.analysis_job_lease_seconds))
+
+    async def _heartbeat_lease(
+        self,
+        job_id: str,
+        lease_token: str,
+        owner_task: asyncio.Task,
+        lease_lost: asyncio.Event,
+        lease_deadline: float,
+    ) -> None:
+        interval = max(0.25, self._lease_seconds / 3)
+        loop = asyncio.get_running_loop()
+        while True:
+            await asyncio.sleep(interval)
+            renewal_started_at = loop.time()
+            try:
+                async with self.session_factory() as session:
+                    renewed = await update_owned_job(
+                        session,
+                        job_id,
+                        lease_token,
+                        lease_seconds=self._lease_seconds,
+                        values={},
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if loop.time() < lease_deadline:
+                    continue
+                renewed = False
+            if renewed:
+                lease_deadline = renewal_started_at + self._lease_seconds
+                continue
+            lease_lost.set()
+            owner_task.cancel()
+            return
+
+    @staticmethod
+    def _as_utc(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    async def _claim(self, job_id: str, *, resume: bool) -> JobLeaseClaim:
+        async with self.session_factory() as session:
+            return await claim_job_lease(
+                session,
+                job_id,
+                resume=resume,
+                lease_seconds=self._lease_seconds,
+            )
+
+    async def _load_claimed_job(
+        self, job_id: str, lease_token: str
+    ) -> AnalysisJob | None:
+        async with self.session_factory() as session:
+            return await session.scalar(
+                select(AnalysisJob)
+                .options(
+                    selectinload(AnalysisJob.video),
+                    selectinload(AnalysisJob.result),
+                )
+                .where(
+                    AnalysisJob.id == job_id,
+                    AnalysisJob.lease_token == lease_token,
+                    AnalysisJob.lease_expires_at > func.now(),
+                )
+            )
+
+    async def _load_persisted_track(
+        self, job: AnalysisJob
+    ) -> TranscriptTrack | None:
+        if job.transcript_version.startswith("pending:"):
+            return None
+        async with self.session_factory() as session:
+            return await session.scalar(
+                select(TranscriptTrack)
+                .options(selectinload(TranscriptTrack.segments))
+                .where(
+                    TranscriptTrack.video_id == job.video_id,
+                    TranscriptTrack.language_code == job.source_language,
+                    TranscriptTrack.transcript_version == job.transcript_version,
+                )
+            )
+
+    async def _translation_is_persisted(
+        self, job: AnalysisJob, track: TranscriptTrack
+    ) -> bool:
+        config = job.llm_config or {}
+        provider = config.get("provider")
+        model = config.get("model")
+        api_url = config.get("api_url")
+        if not all(
+            isinstance(value, str) and value
+            for value in (provider, model, api_url)
+        ):
+            return False
+        try:
+            version = provider_translation_version(
+                normalize_chat_completions_url(api_url),
+                provider=provider,
+                version=model,
+            )
+        except ValueError:
+            return False
+        async with self.session_factory() as session:
+            return (
+                await session.scalar(
+                    select(Translation.id).where(
+                        Translation.track_id == track.id,
+                        Translation.target_language == job.target_language,
+                        Translation.transcript_version == track.transcript_version,
+                        Translation.provider == provider,
+                        Translation.provider_version == version,
+                    )
+                )
+                is not None
+            )
+
+    async def _owns_lease(
+        self, session: AsyncSession, job_id: str, lease_token: str
+    ) -> bool:
+        return (
+            await session.scalar(
+                select(AnalysisJob.id).where(
+                    AnalysisJob.id == job_id,
+                    AnalysisJob.lease_token == lease_token,
+                    AnalysisJob.lease_expires_at > func.now(),
+                )
+            )
+            is not None
+        )
+
+    async def _renew_owned_job(
+        self,
+        session: AsyncSession,
+        job_id: str,
+        lease_token: str,
+        *,
+        status: str,
+    ) -> bool:
+        return await update_owned_job(
+            session,
+            job_id,
+            lease_token,
+            lease_seconds=self._lease_seconds,
+            values={"status": status},
+        )
+
+    async def _store_analysis_result(
+        self,
+        job_id: str,
+        lease_token: str,
+        result_values: dict,
+    ) -> None:
         async with self.session_factory() as session:
             job = await session.scalar(
                 select(AnalysisJob)
-                .options(selectinload(AnalysisJob.video))
-                .where(AnalysisJob.id == job_id)
+                .options(selectinload(AnalysisJob.result))
+                .where(
+                    AnalysisJob.id == job_id,
+                    AnalysisJob.lease_token == lease_token,
+                    AnalysisJob.lease_expires_at > func.now(),
+                )
                 .with_for_update()
             )
-            resumable = job is not None and job.status in {
-                "waiting_for_media",
-                "downloading_media",
-                "extracting_audio",
-                "transcribing",
-                "fetching_transcript",
-                "translating",
-                "analyzing",
-            }
-            if job is not None and job.video.platform == "x":
-                resumable = job.status == "waiting_for_media"
-            if job is None or (job.status != "queued" and not (resume and resumable)):
-                return None
-            job.status = (
-                "downloading_media"
-                if job.video.platform == "x"
-                else "fetching_transcript"
-            )
-            await session.commit()
-            return job
+            if job is None:
+                raise JobLeaseLost()
+            if job.result is None:
+                job.result = StoredAnalysisResult(**result_values)
+            else:
+                for field, value in result_values.items():
+                    setattr(job.result, field, value)
+            if not await update_owned_job(
+                session,
+                job_id,
+                lease_token,
+                lease_seconds=self._lease_seconds,
+                values={"status": "translating"},
+            ):
+                raise JobLeaseLost()
 
     async def _persist_transcript(self, session, video_id, inspection, version):
         selected = inspection.selected
@@ -838,21 +1339,28 @@ class AnalysisPipeline:
     async def _fail(
         self,
         job_id: str,
+        lease_token: str,
         failure_code: str,
         failure_detail: str | None,
         *,
         expire_complete_upload: bool = False,
     ) -> None:
         async with self.session_factory() as session:
-            job = await session.get(AnalysisJob, job_id)
-            if job is None:
+            if not await finish_owned_job(
+                session,
+                job_id,
+                lease_token,
+                values={
+                    "status": "failed",
+                    "failure_code": failure_code,
+                    "failure_detail": failure_detail,
+                    "completed_at": datetime.now(timezone.utc),
+                    "llm_credential_ciphertext": None,
+                    "llm_credential_expires_at": None,
+                    "media_url_ciphertext": None,
+                },
+            ):
                 return
-            job.status = "failed"
-            job.failure_code = failure_code
-            job.failure_detail = failure_detail
-            job.completed_at = datetime.now(timezone.utc)
-            self._clear_credential(job)
-            await session.commit()
         if expire_complete_upload:
             await self._expire_complete_upload(job_id)
         await self._cleanup_consumed_upload(job_id)
@@ -883,13 +1391,6 @@ class AnalysisPipeline:
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
         return expires_at > datetime.now(timezone.utc)
-
-    @staticmethod
-    def _clear_credential(job: AnalysisJob) -> None:
-        job.llm_credential_ciphertext = None
-        job.llm_credential_expires_at = None
-        job.media_url_ciphertext = None
-
 
 def build_default_pipeline(
     session_factory: async_sessionmaker[AsyncSession],
@@ -941,12 +1442,14 @@ def build_default_pipeline(
     return pipeline
 
 
-async def run_analysis_task(job_id: str, *, resume: bool = False) -> None:
+async def run_analysis_task(
+    job_id: str, *, resume: bool = False
+) -> datetime | str | None:
     current = get_settings()
     engine = create_async_engine(current.database_url, pool_pre_ping=True)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
-        await build_default_pipeline(session_factory).run(job_id, resume=resume)
+        return await build_default_pipeline(session_factory).run(job_id, resume=resume)
     finally:
         await engine.dispose()
 
@@ -985,15 +1488,30 @@ async def run_expired_credential_cleanup() -> int:
         await engine.dispose()
 
 
-@celery_app.task(bind=True, name="analysis.analyze_video")
+@celery_app.task(
+    bind=True,
+    name="analysis.analyze_video",
+    soft_time_limit=settings.asr_job_timeout_seconds,
+    time_limit=settings.asr_job_timeout_seconds + CELERY_HARD_LIMIT_GRACE_SECONDS,
+)
 def analyze_video(task, job_id: str, *, resume: bool = False) -> None:
     delivery_info = task.request.delivery_info or {}
-    asyncio.run(
+    retry_at = asyncio.run(
         run_analysis_task(
             job_id,
             resume=resume or bool(delivery_info.get("redelivered")),
         )
     )
+    if retry_at == WORKER_TERMINATION_REQUIRED:
+        raise WorkerTerminate()
+    if retry_at is not None:
+        countdown = max(
+            1,
+            math.ceil(
+                (retry_at - datetime.now(timezone.utc)).total_seconds()
+            ),
+        )
+        task.retry(countdown=countdown, kwargs={"resume": True})
 
 
 @celery_app.task(name="maintenance.clear_expired_llm_credentials")
