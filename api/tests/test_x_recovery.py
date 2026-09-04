@@ -365,6 +365,45 @@ async def test_lease_loss_during_asr_requires_retry_and_worker_exit(
 
 
 @pytest.mark.asyncio
+async def test_lease_loss_during_artifact_hash_requires_worker_exit(
+    x_context,
+    monkeypatch,
+):
+    factory, _, settings, _ = x_context
+    settings.analysis_job_lease_seconds = 1
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def blocking_hash(path):
+        entered.set()
+        release.wait(timeout=5)
+        finished.set()
+        return "a" * 64
+
+    monkeypatch.setattr(
+        AnalysisPipeline,
+        "_sha256_file",
+        staticmethod(blocking_hash),
+    )
+    running = asyncio.create_task(make_pipeline(x_context).run("job-x"))
+    assert await asyncio.to_thread(entered.wait, 2)
+    async with factory() as session:
+        job = await session.get(AnalysisJob, "job-x")
+        job.lease_token = "replacement-worker-token"
+        job.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
+        await session.commit()
+
+    retry = await asyncio.wait_for(running, timeout=2)
+
+    assert retry is not None
+    assert retry.terminate_worker is True
+    assert not finished.is_set()
+    release.set()
+    assert await asyncio.to_thread(finished.wait, 2)
+
+
+@pytest.mark.asyncio
 async def test_external_pipeline_cancellation_is_not_treated_as_lease_loss(x_context):
     entered = asyncio.Event()
     cancelled = asyncio.Event()

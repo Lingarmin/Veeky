@@ -468,14 +468,16 @@ def test_analyze_video_publishes_one_lease_retry_before_optional_worker_exit(
     class RetryRequested(RuntimeError):
         pass
 
-    retry_requested = RetryRequested()
+    class WorkerTerminated(BaseException):
+        pass
 
-    def fake_retry(*, countdown, kwargs, throw):
-        retry_calls.append((countdown, kwargs, throw))
-        return retry_requested
+    def fake_retry(*, countdown, kwargs):
+        retry_calls.append((countdown, kwargs))
+        raise RetryRequested()
 
     def fake_terminate():
         terminations.append(True)
+        raise WorkerTerminated()
 
     monkeypatch.setattr(worker_tasks, "run_analysis_task", fake_run)
     monkeypatch.setattr(analyze_video, "retry", fake_retry)
@@ -486,15 +488,17 @@ def test_analyze_video_publishes_one_lease_retry_before_optional_worker_exit(
         raising=False,
     )
 
-    with pytest.raises(RetryRequested):
+    expected_exception = WorkerTerminated if terminate_worker else RetryRequested
+    with pytest.raises(expected_exception):
         analyze_video.run("job-id")
 
-    assert len(retry_calls) == 1
-    countdown, kwargs, throw = retry_calls[0]
-    assert 1 <= countdown <= 30
-    assert kwargs == {"resume": True}
-    assert throw is False
+    assert len(retry_calls) == (0 if terminate_worker else 1)
+    if retry_calls:
+        countdown, kwargs = retry_calls[0]
+        assert 1 <= countdown <= 30
+        assert kwargs == {"resume": True}
     assert terminations == ([True] if terminate_worker else [])
+    assert len(retry_calls) + len(terminations) == 1
 
 
 def test_analyze_video_recovers_when_soft_limit_escapes_asyncio_run(

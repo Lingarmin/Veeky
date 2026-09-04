@@ -442,7 +442,7 @@ class AnalysisPipeline:
         self._uses_default_providers = False
         self.lease_state: TaskLeaseState | None = None
         self._lease_released: asyncio.Event | None = None
-        self._orphaned_asr_thread = False
+        self._orphaned_blocking_work = False
 
     async def run(
         self, job_id: str, *, resume: bool = False
@@ -464,7 +464,7 @@ class AnalysisPipeline:
         assert owner_task is not None
         lease_lost = asyncio.Event()
         self._lease_released = asyncio.Event()
-        self._orphaned_asr_thread = False
+        self._orphaned_blocking_work = False
         lease_deadline = claim_started_at + self._lease_seconds
         heartbeat_task = asyncio.create_task(
             self._heartbeat_lease(
@@ -615,13 +615,13 @@ class AnalysisPipeline:
             if lease_lost.is_set():
                 return await self._lease_retry(
                     job_id,
-                    terminate_worker=self._orphaned_asr_thread,
+                    terminate_worker=self._orphaned_blocking_work,
                 )
             raise
         except JobLeaseLost:
             return await self._lease_retry(
                 job_id,
-                terminate_worker=self._orphaned_asr_thread,
+                terminate_worker=self._orphaned_blocking_work,
             )
         except RetryableMediaCopyError:
             return await self._lease_retry(job_id, terminate_worker=False)
@@ -791,7 +791,7 @@ class AnalysisPipeline:
                 ):
                     raise JobLeaseLost()
             try:
-                await anyio.to_thread.run_sync(
+                await self._run_abandonable_thread(
                     functools.partial(
                         self._copy_upload_artifact,
                         uploaded_dir,
@@ -848,19 +848,13 @@ class AnalysisPipeline:
         transcriber = self.transcriber or get_default_transcriber(
             settings=self.settings
         )
-        try:
-            segments, language = await anyio.to_thread.run_sync(
-                transcriber.transcribe,
-                audio_path,
-                abandon_on_cancel=True,
-            )
-        except asyncio.CancelledError:
-            self._orphaned_asr_thread = True
-            raise
-        artifact_hash = await anyio.to_thread.run_sync(
+        segments, language = await self._run_abandonable_thread(
+            transcriber.transcribe,
+            audio_path,
+        )
+        artifact_hash = await self._run_abandonable_thread(
             self._sha256_file,
             media_path,
-            abandon_on_cancel=True,
         )
         version = self._x_transcript_version(
             segments, artifact_hash, transcriber.version
@@ -1398,6 +1392,17 @@ class AnalysisPipeline:
             retry_at = now + timedelta(seconds=1)
         return TaskRetry(retry_at, terminate_worker)
 
+    async def _run_abandonable_thread(self, function, *args):
+        try:
+            return await anyio.to_thread.run_sync(
+                function,
+                *args,
+                abandon_on_cancel=True,
+            )
+        except asyncio.CancelledError:
+            self._orphaned_blocking_work = True
+            raise
+
     async def _load_claimed_job(
         self, job_id: str, lease_token: str
     ) -> AnalysisJob | None:
@@ -1809,31 +1814,21 @@ def analyze_video(task, job_id: str, *, resume: bool = False) -> None:
             )
         )
     except SoftTimeLimitExceeded:
-        retry_at = asyncio.run(
-            recover_analysis_soft_timeout(job_id, lease_state.token)
-        )
-        if retry_at is not None:
-            retry_signal = task.retry(
-                countdown=_retry_countdown(retry_at),
-                kwargs={"resume": True},
-                throw=False,
-            )
-            terminate_worker_child()
-            raise retry_signal
+        asyncio.run(recover_analysis_soft_timeout(job_id, lease_state.token))
         terminate_worker_child()
         return
     if retry_at == WORKER_TERMINATION_REQUIRED:
         terminate_worker_child()
         return
     if isinstance(retry_at, TaskRetry):
-        retry_signal = task.retry(
-            countdown=_retry_countdown(retry_at.retry_at),
-            kwargs={"resume": True},
-            throw=False,
-        )
         if retry_at.terminate_worker:
             terminate_worker_child()
-        raise retry_signal
+            return
+        task.retry(
+            countdown=_retry_countdown(retry_at.retry_at),
+            kwargs={"resume": True},
+        )
+        return
     if retry_at is not None:
         task.retry(
             countdown=_retry_countdown(retry_at),
