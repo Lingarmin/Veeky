@@ -60,7 +60,12 @@ export function installXPlayerTracker(options: XPlayerTrackerOptions): () => voi
     ) {
       return;
     }
-    if (selection && selection.video !== video) clearSelection();
+    if (
+      selection
+      && (selection.video !== video || !sameContentRef(selection.contentRef, contentRef))
+    ) {
+      clearSelection();
+    }
     selection = { video, contentRef, durationMs };
     options.onActive(contentRef, durationMs);
   };
@@ -103,13 +108,14 @@ export function installXPlayerTracker(options: XPlayerTrackerOptions): () => voi
 
     const videos = Array.from(pageDocument.querySelectorAll<HTMLVideoElement>("video"));
     for (const video of videos) bind(video);
-    if (
-      selection
-      && selection.video.isConnected
-      && !selection.video.paused
-      && contentRefForVideo(selection.video, pageRoute(pageWindow))
-    ) {
-      return;
+    if (selection && selection.video.isConnected && !selection.video.paused) {
+      const selectedVideo = selection.video;
+      const currentRef = contentRefForVideo(selectedVideo, pageRoute(pageWindow));
+      if (currentRef) {
+        if (!sameContentRef(selection.contentRef, currentRef)) select(selectedVideo);
+        return;
+      }
+      clearSelection();
     }
     const playing = videos
       .filter((video) => !video.paused && contentRefForVideo(video, pageRoute(pageWindow)))

@@ -19,6 +19,8 @@ const MAX_TOTAL_CANDIDATE_URL_BYTES = 128_000;
 const RECENT_REQUEST_MAX_AGE_MS = 1_500;
 const MAX_RECENT_REQUESTS_PER_TAB = 12;
 const MAX_RECENT_REQUEST_URL_BYTES = 32_000;
+const MAX_TOTAL_RECENT_REQUESTS = 48;
+const MAX_TOTAL_RECENT_REQUEST_URL_BYTES = 64_000;
 const X_STATUS_PATH = /^\/[^/]+\/status\/([0-9]+)(?:\/video\/([1-9][0-9]*))?\/?$/;
 type AnalyzedTabs = Record<string, Record<string, AnalyzedTab>>;
 
@@ -36,14 +38,10 @@ interface LastDetectedContent {
 
 type LastDetectedContentState = Record<string, LastDetectedContent>;
 
-interface BufferedMediaCandidate extends MediaCandidate {
-  routeGeneration: number;
-}
-
 interface BackgroundState {
   lastDetectedContentByTab: Map<number, ContentRef>;
-  recentRequestsByTab: Map<number, BufferedMediaCandidate[]>;
-  routeGenerationByTab: Map<number, number>;
+  recentRequestsByTab: Map<number, MediaCandidate[]>;
+  rescheduleRecentRequestCleanup: () => void;
   runCaptureTask: <T>(task: () => Promise<T>) => Promise<T>;
 }
 
@@ -59,8 +57,21 @@ export function parseVideoId(url?: string): string | null {
 
 export function installBackgroundHandlers(chromeApi: ChromeApi): void {
   const lastDetectedContentByTab = new Map<number, ContentRef>();
-  const recentRequestsByTab = new Map<number, BufferedMediaCandidate[]>();
-  const routeGenerationByTab = new Map<number, number>();
+  const recentRequestsByTab = new Map<number, MediaCandidate[]>();
+  let recentRequestCleanupTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
+  const rescheduleRecentRequestCleanup = () => {
+    if (recentRequestCleanupTimer !== null) globalThis.clearTimeout(recentRequestCleanupTimer);
+    pruneRecentRequestMap(recentRequestsByTab, Date.now());
+    const nextExpiry = nextRecentRequestExpiry(recentRequestsByTab);
+    if (nextExpiry === null) {
+      recentRequestCleanupTimer = null;
+      return;
+    }
+    recentRequestCleanupTimer = globalThis.setTimeout(() => {
+      recentRequestCleanupTimer = null;
+      rescheduleRecentRequestCleanup();
+    }, Math.max(0, nextExpiry - Date.now()));
+  };
   let captureQueue: Promise<void> = Promise.resolve();
   const runCaptureTask = <T>(task: () => Promise<T>): Promise<T> => {
     const result = captureQueue.then(task);
@@ -70,16 +81,17 @@ export function installBackgroundHandlers(chromeApi: ChromeApi): void {
   const state: BackgroundState = {
     lastDetectedContentByTab,
     recentRequestsByTab,
-    routeGenerationByTab,
+    rescheduleRecentRequestCleanup,
     runCaptureTask,
   };
   void chromeApi.sidePanel
     .setPanelBehavior({ openPanelOnActionClick: false })
     .catch(reportBackgroundError);
-  void runCaptureTask(async () => {
+  const initialization = runCaptureTask(async () => {
     await initializeMediaCapture(chromeApi);
     await configureActiveTab(chromeApi, lastDetectedContentByTab);
-  }).catch(reportBackgroundError);
+  });
+  void initialization.catch(reportBackgroundError);
 
   chromeApi.action.onClicked.addListener((tab) => {
     const tabId = tab.id;
@@ -90,6 +102,11 @@ export function installBackgroundHandlers(chromeApi: ChromeApi): void {
       openPanelForTab(chromeApi, tabId);
       return;
     }
+    return initialization.then(() => {
+      if (activeContentMatchesUrl(lastDetectedContentByTab.get(tabId), tab.url)) {
+        openPanelForTab(chromeApi, tabId);
+      }
+    }).catch(reportBackgroundError);
   });
 
   chromeApi.tabs.onActivated.addListener(({ tabId }) => {
@@ -103,8 +120,6 @@ export function installBackgroundHandlers(chromeApi: ChromeApi): void {
 
   chromeApi.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (!changeInfo.url) return;
-    routeGenerationByTab.set(tabId, (routeGenerationByTab.get(tabId) ?? 0) + 1);
-    recentRequestsByTab.delete(tabId);
     const explicitRef = parseContentRef(tab.url);
     const rememberedRef = lastDetectedContentByTab.get(tabId);
     const rememberedRefStillMatches = activeContentMatchesUrl(rememberedRef, tab.url);
@@ -134,20 +149,18 @@ export function installBackgroundHandlers(chromeApi: ChromeApi): void {
   chromeApi.tabs.onRemoved.addListener((tabId) => {
     lastDetectedContentByTab.delete(tabId);
     recentRequestsByTab.delete(tabId);
-    routeGenerationByTab.delete(tabId);
+    rescheduleRecentRequestCleanup();
     return runCaptureTask(() => removeAllTabState(chromeApi, tabId))
       .catch(reportBackgroundError);
   });
 
   chromeApi.webRequest.onBeforeRequest.addListener(
     (details) => {
-      const routeGeneration = routeGenerationByTab.get(details.tabId) ?? 0;
       void runCaptureTask(() => captureMediaCandidate(
         chromeApi,
         details,
         recentRequestsByTab,
-        routeGenerationByTab,
-        routeGeneration,
+        rescheduleRecentRequestCleanup,
       )).catch(reportBackgroundError);
     },
     { urls: ["https://video.twimg.com/*"], types: ["media", "xmlhttprequest"] },
@@ -201,14 +214,6 @@ async function handleMessage(
       const mediaState = await loadMediaCaptureState(chromeApi);
       const tabKey = String(tabId);
       const prior = mediaState[tabKey];
-      const previousRef = state.lastDetectedContentByTab.get(tabId);
-      if (previousRef && !sameContentRef(previousRef, message.contentRef)) {
-        state.routeGenerationByTab.set(
-          tabId,
-          (state.routeGenerationByTab.get(tabId) ?? 0) + 1,
-        );
-        state.recentRequestsByTab.delete(tabId);
-      }
       const samePlayer = Boolean(
         prior?.active && sameContentRef(prior.active.contentRef, message.contentRef),
       );
@@ -217,8 +222,8 @@ async function handleMessage(
         state.recentRequestsByTab,
         tabId,
         signalAt,
-        state.routeGenerationByTab.get(tabId) ?? 0,
       );
+      state.rescheduleRecentRequestCleanup();
       const candidates = pruneCandidateMap(prior?.candidates ?? {}, Date.now());
       if (buffered.length) {
         candidates[key] = mergeCandidates(candidates[key] ?? [], buffered, Date.now());
@@ -357,9 +362,8 @@ async function handleMessage(
 async function captureMediaCandidate(
   chromeApi: ChromeApi,
   details: chrome.webRequest.WebRequestBodyDetails,
-  recentRequestsByTab: Map<number, BufferedMediaCandidate[]>,
-  routeGenerationByTab: Map<number, number>,
-  routeGeneration: number,
+  recentRequestsByTab: Map<number, MediaCandidate[]>,
+  rescheduleRecentRequestCleanup: () => void,
 ): Promise<void> {
   if (details.tabId < 0 || (details.type !== "media" && details.type !== "xmlhttprequest")) return;
   const candidate = mediaCandidateFromRequest(details.url, details.timeStamp);
@@ -369,9 +373,8 @@ async function captureMediaCandidate(
   const tabState = state[String(details.tabId)];
   const now = Date.now();
   if (!tabState?.active) {
-    if ((routeGenerationByTab.get(details.tabId) ?? 0) === routeGeneration) {
-      bufferRecentRequest(recentRequestsByTab, details.tabId, candidate, now, routeGeneration);
-    }
+    bufferRecentRequest(recentRequestsByTab, details.tabId, candidate, now);
+    rescheduleRecentRequestCleanup();
     return;
   }
   const windowOpenedAt = tabState.active.expiresAt - CAPTURE_WINDOW_MS;
@@ -394,16 +397,15 @@ function mergeCandidates(
 }
 
 function bufferRecentRequest(
-  recentRequestsByTab: Map<number, BufferedMediaCandidate[]>,
+  recentRequestsByTab: Map<number, MediaCandidate[]>,
   tabId: number,
   candidate: MediaCandidate,
   now: number,
-  routeGeneration: number,
 ): void {
   const recent = (recentRequestsByTab.get(tabId) ?? [])
     .filter((item) => now - item.capturedAt <= RECENT_REQUEST_MAX_AGE_MS)
     .filter((item) => item.url !== candidate.url);
-  recent.push({ ...candidate, routeGeneration });
+  recent.push(candidate);
   while (
     recent.length > MAX_RECENT_REQUESTS_PER_TAB
     || estimatedCandidateUrlBytes(recent) > MAX_RECENT_REQUEST_URL_BYTES
@@ -412,21 +414,77 @@ function bufferRecentRequest(
   }
   if (recent.length) recentRequestsByTab.set(tabId, recent);
   else recentRequestsByTab.delete(tabId);
+  pruneRecentRequestMap(recentRequestsByTab, now);
+  enforceAggregateRecentRequestLimits(recentRequestsByTab);
 }
 
 function claimRecentRequests(
-  recentRequestsByTab: Map<number, BufferedMediaCandidate[]>,
+  recentRequestsByTab: Map<number, MediaCandidate[]>,
   tabId: number,
   signalAt: number,
-  routeGeneration: number,
 ): MediaCandidate[] {
+  pruneRecentRequestMap(recentRequestsByTab, signalAt);
   const claimed = (recentRequestsByTab.get(tabId) ?? []).filter((candidate) => (
-    candidate.routeGeneration === routeGeneration
-    && candidate.capturedAt <= signalAt
+    candidate.capturedAt <= signalAt
     && signalAt - candidate.capturedAt <= RECENT_REQUEST_MAX_AGE_MS
   ));
   recentRequestsByTab.delete(tabId);
-  return claimed.map(({ routeGeneration: _routeGeneration, ...candidate }) => candidate);
+  return claimed;
+}
+
+function pruneRecentRequestMap(
+  recentRequestsByTab: Map<number, MediaCandidate[]>,
+  now: number,
+): void {
+  for (const [tabId, candidates] of recentRequestsByTab) {
+    const recent = candidates.filter((candidate) => (
+      now - candidate.capturedAt <= RECENT_REQUEST_MAX_AGE_MS
+    ));
+    if (recent.length) recentRequestsByTab.set(tabId, recent);
+    else recentRequestsByTab.delete(tabId);
+  }
+}
+
+function nextRecentRequestExpiry(
+  recentRequestsByTab: Map<number, MediaCandidate[]>,
+): number | null {
+  let nextExpiry = Number.POSITIVE_INFINITY;
+  for (const candidates of recentRequestsByTab.values()) {
+    for (const candidate of candidates) {
+      nextExpiry = Math.min(nextExpiry, candidate.capturedAt + RECENT_REQUEST_MAX_AGE_MS + 1);
+    }
+  }
+  return Number.isFinite(nextExpiry) ? nextExpiry : null;
+}
+
+function enforceAggregateRecentRequestLimits(
+  recentRequestsByTab: Map<number, MediaCandidate[]>,
+): void {
+  const entries = [...recentRequestsByTab.entries()].flatMap(([tabId, candidates]) => (
+    candidates.map((candidate) => ({ tabId, candidate }))
+  )).sort((left, right) => (
+    left.candidate.capturedAt - right.candidate.capturedAt
+    || left.tabId - right.tabId
+    || left.candidate.url.localeCompare(right.candidate.url)
+  ));
+  let totalBytes = entries.reduce(
+    (total, entry) => total + entry.candidate.url.length * 2,
+    0,
+  );
+  while (
+    entries.length > MAX_TOTAL_RECENT_REQUESTS
+    || totalBytes > MAX_TOTAL_RECENT_REQUEST_URL_BYTES
+  ) {
+    const oldest = entries.shift();
+    if (!oldest) break;
+    const candidates = recentRequestsByTab.get(oldest.tabId);
+    if (!candidates) continue;
+    const index = candidates.findIndex(({ url }) => url === oldest.candidate.url);
+    if (index < 0) continue;
+    totalBytes -= candidates[index].url.length * 2;
+    candidates.splice(index, 1);
+    if (candidates.length === 0) recentRequestsByTab.delete(oldest.tabId);
+  }
 }
 
 function estimatedCandidateUrlBytes(candidates: MediaCandidate[]): number {
@@ -458,6 +516,9 @@ function enforceAggregateCandidateLimits(state: MediaCaptureState): void {
     totalBytes -= candidates[index].url.length * 2;
     candidates.splice(index, 1);
     if (candidates.length === 0) delete state[oldest.tabKey].candidates[oldest.key];
+  }
+  for (const [tabKey, tabState] of Object.entries(state)) {
+    if (!tabState.active && Object.keys(tabState.candidates).length === 0) delete state[tabKey];
   }
 }
 

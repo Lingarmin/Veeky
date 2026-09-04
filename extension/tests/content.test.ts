@@ -395,6 +395,85 @@ describe("X active player tracking", () => {
     teardown();
   });
 
+  it("updates a playing video's ownership when its media link changes", async () => {
+    window.history.replaceState({}, "", `/owner/status/${STATUS_ID}`);
+    document.body.innerHTML = `
+      <article>
+        <a href="/owner/status/${STATUS_ID}">status</a>
+        <a id="media-link" href="/owner/status/${STATUS_ID}/video/1">
+          <video id="playing-video"></video>
+        </a>
+      </article>
+    `;
+    const onActive = vi.fn();
+    const onInactive = vi.fn();
+    const teardown = installXPlayerTracker({ onActive, onInactive });
+    const video = document.querySelector<HTMLVideoElement>("#playing-video")!;
+    const mediaLink = document.querySelector<HTMLAnchorElement>("#media-link")!;
+    setPlayerState(video, false);
+    video.dispatchEvent(new Event("play"));
+
+    mediaLink.setAttribute("href", `/owner/status/${STATUS_ID}/video/2`);
+    await flushMutations();
+
+    expect(onInactive).toHaveBeenCalledWith(expect.objectContaining({ mediaIndex: 1 }));
+    expect(onActive).toHaveBeenLastCalledWith(expect.objectContaining({ mediaIndex: 2 }), 12_500);
+    teardown();
+  });
+
+  it("clears a playing video's ownership when its media link becomes ineligible", async () => {
+    window.history.replaceState({}, "", `/owner/status/${STATUS_ID}`);
+    document.body.innerHTML = `
+      <article>
+        <a href="/owner/status/${STATUS_ID}">status</a>
+        <a id="media-link" href="/owner/status/${STATUS_ID}/video/1">
+          <video id="playing-video"></video>
+        </a>
+      </article>
+    `;
+    const onActive = vi.fn();
+    const onInactive = vi.fn();
+    const teardown = installXPlayerTracker({ onActive, onInactive });
+    const video = document.querySelector<HTMLVideoElement>("#playing-video")!;
+    const mediaLink = document.querySelector<HTMLAnchorElement>("#media-link")!;
+    setPlayerState(video, false);
+    video.dispatchEvent(new Event("play"));
+
+    mediaLink.setAttribute("href", "/quoted/status/2075545587093807222/video/1");
+    await flushMutations();
+
+    expect(onInactive).toHaveBeenCalledWith(expect.objectContaining({ mediaIndex: 1 }));
+    expect(onActive).toHaveBeenCalledTimes(1);
+    teardown();
+  });
+
+  it("updates a playing video's ownership when media tiles move", async () => {
+    window.history.replaceState({}, "", `/owner/status/${STATUS_ID}`);
+    document.body.innerHTML = `
+      <article id="tile-status">
+        <a href="/owner/status/${STATUS_ID}">status</a>
+        <div data-testid="videoPlayer" id="video-tile"><video id="tile-video"></video></div>
+      </article>
+    `;
+    const onActive = vi.fn();
+    const onInactive = vi.fn();
+    const teardown = installXPlayerTracker({ onActive, onInactive });
+    const video = document.querySelector<HTMLVideoElement>("#tile-video")!;
+    const videoTile = document.querySelector<HTMLElement>("#video-tile")!;
+    setPlayerState(video, false);
+    video.dispatchEvent(new Event("play"));
+
+    const photoTile = document.createElement("div");
+    photoTile.dataset.testid = "tweetPhoto";
+    photoTile.innerHTML = '<img src="first.jpg">';
+    videoTile.before(photoTile);
+    await flushMutations();
+
+    expect(onInactive).toHaveBeenCalledWith(expect.objectContaining({ mediaIndex: 1 }));
+    expect(onActive).toHaveBeenLastCalledWith(expect.objectContaining({ mediaIndex: 2 }), 12_500);
+    teardown();
+  });
+
   it("polls for route-only transitions and stops polling on teardown", () => {
     vi.useFakeTimers();
     const originalPushState = window.history.pushState;
