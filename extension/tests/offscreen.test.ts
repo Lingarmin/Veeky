@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { uploadMediaCandidate, type MediaUploadApi } from "../src/offscreen/index";
+import {
+  installOffscreenHandlers,
+  uploadMediaCandidate,
+  type MediaPartSpool,
+  type MediaUploadApi,
+} from "../src/offscreen/index";
 import type { ContentRef, MediaCandidate, MediaUploadProgressMessage } from "../src/shared/types";
 
 const MIB = 1024 * 1024;
@@ -10,17 +15,42 @@ const contentRef: ContentRef = {
   mediaIndex: 1,
 };
 
-function responseFromChunks(chunks: Uint8Array[], headers: HeadersInit = {}): Response {
-  return new Response(new ReadableStream({
+function responseFromChunks(
+  chunks: Uint8Array[],
+  headers: HeadersInit = {},
+  finalUrl?: string,
+): Response {
+  const response = new Response(new ReadableStream({
     start(controller) {
       for (const chunk of chunks) controller.enqueue(chunk);
       controller.close();
     },
   }), { headers });
+  if (finalUrl) Object.defineProperty(response, "url", { value: finalUrl });
+  return response;
 }
 
-function textResponse(body: string): Response {
-  return new Response(body, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } });
+function textResponse(body: string, finalUrl?: string): Response {
+  const response = new Response(body, {
+    headers: { "Content-Type": "application/vnd.apple.mpegurl" },
+  });
+  if (finalUrl) Object.defineProperty(response, "url", { value: finalUrl });
+  return response;
+}
+
+function createSpool() {
+  const parts = new Map<number, Uint8Array>();
+  return {
+    write: vi.fn<MediaPartSpool["write"]>(async (partNumber, bytes) => {
+      parts.set(partNumber, bytes.slice());
+    }),
+    read: vi.fn<MediaPartSpool["read"]>(async (partNumber) => {
+      const part = parts.get(partNumber);
+      if (!part) throw new Error(`missing spooled part ${partNumber}`);
+      return part.slice();
+    }),
+    dispose: vi.fn<MediaPartSpool["dispose"]>(async () => { parts.clear(); }),
+  } satisfies MediaPartSpool;
 }
 
 function createApi(overrides: Partial<MediaUploadApi> = {}) {
@@ -115,6 +145,52 @@ describe("offscreen X media upload", () => {
       uploadedBytes: 18 * MIB,
       totalBytes: 18 * MIB,
     });
+  });
+
+  it("spools an MP4 without Content-Length in bounded 8 MiB parts", async () => {
+    const spool = createSpool();
+    const api = createApi();
+    const bytes = new Uint8Array(18 * MIB);
+
+    await uploadMediaCandidate({
+      type: "START_MEDIA_UPLOAD",
+      jobId: "job-no-length",
+      contentRef,
+      candidate: { url: "https://video.twimg.com/no-length.mp4", kind: "mp4", capturedAt: 1 },
+    }, {
+      fetchMedia: vi.fn(async () => responseFromChunks([
+        bytes.subarray(0, 7 * MIB),
+        bytes.subarray(7 * MIB, 15 * MIB),
+        bytes.subarray(15 * MIB),
+      ])),
+      api,
+      reportProgress: async () => undefined,
+      createPartSpool: vi.fn(async () => spool),
+    });
+
+    expect(spool.write.mock.calls.map(([partNumber, part]) => [partNumber, part.byteLength]))
+      .toEqual([[0, 8 * MIB], [1, 8 * MIB], [2, 2 * MIB]]);
+    expect(spool.read.mock.calls.map(([partNumber]) => partNumber)).toEqual([0, 1, 2]);
+    expect(spool.dispose).toHaveBeenCalledOnce();
+    expect(vi.mocked(api.createMediaSession)).toHaveBeenCalledWith({
+      contentId: "33333333-3333-4333-8333-333333333333",
+      kind: "mp4",
+      expectedBytes: 18 * MIB,
+      partCount: 3,
+    });
+  });
+
+  it("reports a stable error when browser part storage is unavailable", async () => {
+    await expect(uploadMediaCandidate({
+      type: "START_MEDIA_UPLOAD",
+      jobId: "job-no-storage",
+      contentRef,
+      candidate: { url: "https://video.twimg.com/no-length.mp4", kind: "mp4", capturedAt: 1 },
+    }, {
+      fetchMedia: vi.fn(async () => responseFromChunks([new Uint8Array([1])])),
+      api: createApi(),
+      reportProgress: async () => undefined,
+    })).rejects.toMatchObject({ code: "media_spool_unavailable" });
   });
 
   it("queries session state before retrying a failed part", async () => {
@@ -263,7 +339,12 @@ describe("offscreen X media upload", () => {
       jobId: "job-hls",
       contentRef,
       candidate: { url: masterUrl, kind: "hls", capturedAt: 1 },
-    }, { fetchMedia, api, reportProgress: async () => undefined });
+    }, {
+      fetchMedia,
+      api,
+      reportProgress: async () => undefined,
+      createPartSpool: async () => createSpool(),
+    });
 
     expect(fetchMedia.mock.calls.map(([url]) => String(url))).toEqual([
       masterUrl,
@@ -294,6 +375,7 @@ describe("offscreen X media upload", () => {
       fetchMedia: vi.fn(),
       api: createApi(),
       reportProgress: async () => undefined,
+      createPartSpool: async () => createSpool(),
     })).rejects.toMatchObject({ code: "invalid_media_url" });
   });
 
@@ -312,5 +394,152 @@ describe("offscreen X media upload", () => {
       api: createApi(),
       reportProgress: async () => undefined,
     })).rejects.toMatchObject({ code: "invalid_media_url" });
+  });
+
+  it.each([
+    "#EXT-X-KEY:METHOD=AES-128,URI=\"https://evil.example/key.bin\"",
+    "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",URI=\"https://evil.example/audio.m3u8\"",
+    "#EXT-X-MAP:URI=\"https://evil.example/init.mp4\"",
+    "#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=1000,URI=\"https://evil.example/iframe.m3u8\"",
+    "#EXT-X-SESSION-DATA:DATA-ID=\"com.example\",URI=\"https://evil.example/data.json\"",
+    "#EXT-X-SESSION-KEY:METHOD=AES-128,URI=\"https://evil.example/key.bin\"",
+    "#EXT-X-RENDITION-REPORT:URI=\"https://evil.example/live.m3u8\"",
+    "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"https://evil.example/next.m4s\"",
+    "#EXT-X-PART:DURATION=0.333,URI=\"https://evil.example/part.m4s\"",
+    "#EXT-X-CONTENT-STEERING:SERVER-URI=\"https://evil.example/steering.json\"",
+  ])("rejects an off-host URI attribute in %s", async (tag) => {
+    const playlistUrl = "https://video.twimg.com/path/media.m3u8";
+    await expect(uploadMediaCandidate({
+      type: "START_MEDIA_UPLOAD",
+      jobId: "job-invalid-tag",
+      contentRef,
+      candidate: { url: playlistUrl, kind: "hls", capturedAt: 1 },
+    }, {
+      fetchMedia: vi.fn(async (url) => String(url) === playlistUrl
+        ? textResponse(["#EXTM3U", tag, "segment.m4s"].join("\n"), playlistUrl)
+        : responseFromChunks([new Uint8Array([1])], {}, String(url))),
+      api: createApi(),
+      reportProgress: async () => undefined,
+    })).rejects.toMatchObject({ code: "invalid_media_url" });
+  });
+
+  it("rejects a playlist redirect outside video.twimg.com", async () => {
+    await expect(uploadMediaCandidate({
+      type: "START_MEDIA_UPLOAD",
+      jobId: "job-playlist-redirect",
+      contentRef,
+      candidate: {
+        url: "https://video.twimg.com/path/master.m3u8",
+        kind: "hls",
+        capturedAt: 1,
+      },
+    }, {
+      fetchMedia: vi.fn(async () => textResponse(
+        "#EXTM3U\nhttps://video.twimg.com/path/segment.m4s",
+        "https://evil.example/master.m3u8",
+      )),
+      api: createApi(),
+      reportProgress: async () => undefined,
+    })).rejects.toMatchObject({ code: "invalid_media_url" });
+  });
+
+  it("rejects a media segment redirect outside video.twimg.com", async () => {
+    const playlistUrl = "https://video.twimg.com/path/media.m3u8";
+    const segmentUrl = "https://video.twimg.com/path/segment.m4s";
+    await expect(uploadMediaCandidate({
+      type: "START_MEDIA_UPLOAD",
+      jobId: "job-segment-redirect",
+      contentRef,
+      candidate: { url: playlistUrl, kind: "hls", capturedAt: 1 },
+    }, {
+      fetchMedia: vi.fn(async (url) => String(url) === playlistUrl
+        ? textResponse(`#EXTM3U\n${segmentUrl}`, playlistUrl)
+        : responseFromChunks([new Uint8Array([1])], {}, "https://evil.example/segment.m4s")),
+      api: createApi(),
+      reportProgress: async () => undefined,
+      createPartSpool: async () => createSpool(),
+    })).rejects.toMatchObject({ code: "invalid_media_url" });
+  });
+});
+
+describe("offscreen message handling", () => {
+  function createRuntime() {
+    const listeners: Array<(message: unknown) => void> = [];
+    return {
+      onMessage: {
+        addListener: vi.fn((listener: (message: unknown) => void) => { listeners.push(listener); }),
+      },
+      sendMessage: vi.fn(async () => undefined),
+      dispatch(message: unknown) {
+        for (const listener of listeners) listener(message);
+      },
+    };
+  }
+
+  const startMessage = {
+    type: "START_MEDIA_UPLOAD" as const,
+    jobId: "job-handler",
+    contentRef,
+    candidate: { url: "https://video.twimg.com/file.mp4", kind: "mp4" as const, capturedAt: 1 },
+  };
+
+  it("sends MEDIA_UPLOAD_COMPLETE after a successful upload", async () => {
+    const runtime = createRuntime();
+    installOffscreenHandlers({ runtime } as never, {
+      fetchMedia: vi.fn(async () => responseFromChunks([new Uint8Array([1])], {
+        "Content-Length": "1",
+      })),
+      api: createApi(),
+      reportProgress: async () => undefined,
+    });
+
+    runtime.dispatch(startMessage);
+
+    await vi.waitFor(() => expect(runtime.sendMessage).toHaveBeenCalledWith({
+      type: "MEDIA_UPLOAD_COMPLETE",
+      jobId: "job-handler",
+      mediaSessionId: "session-1",
+    }));
+  });
+
+  it("sends MEDIA_UPLOAD_FAILED with the upload error code", async () => {
+    const runtime = createRuntime();
+    installOffscreenHandlers({ runtime } as never, {
+      fetchMedia: vi.fn(async () => new Response(null, { status: 403 })),
+      api: createApi(),
+      reportProgress: async () => undefined,
+    });
+
+    runtime.dispatch(startMessage);
+
+    await vi.waitFor(() => expect(runtime.sendMessage).toHaveBeenCalledWith({
+      type: "MEDIA_UPLOAD_FAILED",
+      jobId: "job-handler",
+      code: "media_fetch_failed",
+    }));
+  });
+
+  it("runs only one upload for concurrent START messages for the same job", async () => {
+    const runtime = createRuntime();
+    let releaseFetch: ((response: Response) => void) | undefined;
+    const fetchMedia = vi.fn(() => new Promise<Response>((resolve) => { releaseFetch = resolve; }));
+    const api = createApi();
+    installOffscreenHandlers({ runtime } as never, {
+      fetchMedia,
+      api,
+      reportProgress: async () => undefined,
+    });
+
+    runtime.dispatch(startMessage);
+    runtime.dispatch(startMessage);
+    await vi.waitFor(() => expect(fetchMedia).toHaveBeenCalledOnce());
+    releaseFetch?.(responseFromChunks([new Uint8Array([1])], { "Content-Length": "1" }));
+    await vi.waitFor(() => expect(runtime.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      type: "MEDIA_UPLOAD_COMPLETE",
+      jobId: "job-handler",
+    })));
+
+    expect(api.inspect).toHaveBeenCalledOnce();
+    expect(api.createMediaSession).toHaveBeenCalledOnce();
   });
 });
