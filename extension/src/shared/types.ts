@@ -81,6 +81,11 @@ export interface MediaUploadContextMessage {
   mediaSessionId: string | null;
 }
 
+export interface MediaUploadAckMessage {
+  type: "MEDIA_UPLOAD_ACK";
+  jobId: string;
+}
+
 export type MediaUploadMessage =
   | StartMediaUploadMessage
   | MediaUploadProgressMessage

@@ -1,8 +1,11 @@
 import type {
   ContentRef,
   MediaSessionCreatedMessage,
+  MediaUploadAckMessage,
+  MediaUploadCompleteMessage,
   MediaUploadConfigMessage,
   MediaUploadContextMessage,
+  MediaUploadFailedMessage,
   MediaUploadProgressMessage,
   StartMediaUploadMessage,
 } from "../shared/types";
@@ -248,6 +251,7 @@ async function uploadHls(
       throw new UploadError("unsupported_hls_playlist", "Nested HLS master playlists are not supported");
     }
   }
+  validateFinishedMediaPlaylist(mediaPlaylist);
 
   const resourceUrls = parseMediaResources(mediaPlaylist, mediaPlaylistUrl);
   return spoolAndUpload(
@@ -675,6 +679,16 @@ function validateSupportedPlaylist(playlist: string): void {
   }
 }
 
+function validateFinishedMediaPlaylist(playlist: string): void {
+  const lines = playlist.split(/\r?\n/).map((line) => line.trim().toUpperCase());
+  if (lines.some((line) => /^#EXT-X-PLAYLIST-TYPE:\s*EVENT$/.test(line))) {
+    throw new UploadError("unsupported_hls_playlist", "HLS event playlists are not supported");
+  }
+  if (!lines.includes("#EXT-X-ENDLIST")) {
+    throw new UploadError("unsupported_hls_playlist", "Live HLS playlists are not supported");
+  }
+}
+
 function parseAttributeList(value: string): Array<[string, string]> {
   const attributes: Array<[string, string]> = [];
   let offset = 0;
@@ -920,9 +934,26 @@ export function installOffscreenHandlers(
   port: MediaPort,
   provided: Partial<UploadDependencies> = {},
 ): () => string | null {
+  let pendingProgress: MediaUploadProgressMessage | null = null;
+  let pendingTerminal: MediaUploadCompleteMessage | MediaUploadFailedMessage | null = null;
+  const safePost = (message: unknown): void => {
+    try {
+      port.postMessage(message);
+    } catch {
+      // The latest upload state is replayed after the background reconnects.
+    }
+  };
+  const reportProgress = async (message: MediaUploadProgressMessage): Promise<void> => {
+    pendingProgress = message;
+    if (provided.reportProgress) {
+      await provided.reportProgress(message).catch(() => undefined);
+      return;
+    }
+    safePost(message);
+  };
   const dependencies = {
     fetchMedia: provided.fetchMedia ?? globalThis.fetch.bind(globalThis),
-    reportProgress: provided.reportProgress ?? (async (message) => { port.postMessage(message); }),
+    reportProgress,
     createPartSpool: provided.createPartSpool ?? createOpfsPartSpool,
     cleanupPartSpools: provided.cleanupPartSpools ?? cleanupOpfsPartSpools,
     limits: provided.limits ?? {
@@ -950,18 +981,30 @@ export function installOffscreenHandlers(
         resolveApi(createApi(message.apiBaseUrl, identityStore));
         resolveApi = null;
       }
-      port.postMessage({
+      safePost({
         type: "MEDIA_UPLOAD_CONTEXT",
         jobId: activeJobId,
         mediaSessionId: activeSession?.mediaSessionId ?? null,
       } satisfies MediaUploadContextMessage);
-      if (activeSession) port.postMessage(activeSession);
+      if (activeSession) safePost(activeSession);
+      if (pendingProgress) safePost(pendingProgress);
+      if (pendingTerminal) safePost(pendingTerminal);
+      return;
+    }
+    if (isMediaUploadAckMessage(message)) {
+      if (pendingTerminal?.jobId !== message.jobId) return;
+      pendingTerminal = null;
+      pendingProgress = null;
+      if (activeJobId === message.jobId) {
+        activeJobId = null;
+        activeSession = null;
+      }
       return;
     }
     if (!isStartMediaUploadMessage(message)) return;
     if (activeJobId === message.jobId) return;
     if (activeJobId !== null) {
-      port.postMessage({
+      safePost({
         type: "MEDIA_UPLOAD_FAILED",
         jobId: message.jobId,
         code: "media_upload_in_progress",
@@ -992,32 +1035,40 @@ export function installOffscreenHandlers(
           contentId: session.contentId,
           contentRef: message.contentRef,
         };
-        try {
-          port.postMessage(activeSession);
-        } catch {
-          // A reconnecting background learns this session from MEDIA_UPLOAD_CONTEXT.
-        }
+        safePost(activeSession);
       },
     }))
-      .then((mediaSessionId) => port.postMessage({
-        type: "MEDIA_UPLOAD_COMPLETE",
-        jobId: message.jobId,
-        mediaSessionId,
-      }))
-      .catch((error) => port.postMessage({
-        type: "MEDIA_UPLOAD_FAILED",
-        jobId: message.jobId,
-        code: errorCode(error),
-      }))
+      .then(
+        (mediaSessionId) => {
+          pendingProgress = null;
+          pendingTerminal = {
+            type: "MEDIA_UPLOAD_COMPLETE",
+            jobId: message.jobId,
+            mediaSessionId,
+          };
+          safePost(pendingTerminal);
+        },
+        (error) => {
+          pendingProgress = null;
+          pendingTerminal = {
+            type: "MEDIA_UPLOAD_FAILED",
+            jobId: message.jobId,
+            code: errorCode(error),
+          };
+          safePost(pendingTerminal);
+        },
+      )
       .finally(() => {
         globalThis.clearTimeout(overallTimer);
-        if (activeJobId === message.jobId) {
-          activeJobId = null;
-          activeSession = null;
-        }
       });
   });
   return () => activeJobId;
+}
+
+function isMediaUploadAckMessage(message: unknown): message is MediaUploadAckMessage {
+  if (typeof message !== "object" || message === null) return false;
+  const ack = message as Partial<MediaUploadAckMessage>;
+  return ack.type === "MEDIA_UPLOAD_ACK" && typeof ack.jobId === "string";
 }
 
 function isStartMediaUploadMessage(message: unknown): message is StartMediaUploadMessage {

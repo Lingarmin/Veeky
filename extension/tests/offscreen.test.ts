@@ -583,6 +583,7 @@ describe("offscreen X media upload", () => {
         "segment-1.m4s",
         "#EXTINF:2.0,",
         "segment-2.m4s",
+        "#EXT-X-ENDLIST",
       ].join("\n"))],
       ["https://video.twimg.com/path/1080/init.mp4", responseFromChunks([new Uint8Array([1, 2])])],
       ["https://video.twimg.com/path/1080/segment-1.m4s", responseFromChunks([new Uint8Array([3, 4, 5])])],
@@ -720,7 +721,7 @@ describe("offscreen X media upload", () => {
       candidate: { url: playlistUrl, kind: "hls", capturedAt: 1 },
     }, {
       fetchMedia: vi.fn(async (url) => String(url) === playlistUrl
-        ? textResponse(`#EXTM3U\n${segmentUrl}`, playlistUrl)
+        ? textResponse(`#EXTM3U\n${segmentUrl}\n#EXT-X-ENDLIST`, playlistUrl)
         : responseFromChunks([new Uint8Array([1])], {}, "https://evil.example/segment.m4s")),
       api: createApi(),
       reportProgress: async () => undefined,
@@ -745,6 +746,51 @@ describe("offscreen X media upload", () => {
       reportProgress: async () => undefined,
       createPartSpool: async () => createSpool(),
     })).rejects.toMatchObject({ code: "hls_playlist_too_large" });
+  });
+
+  it("rejects an HLS media playlist without ENDLIST", async () => {
+    const playlistUrl = "https://video.twimg.com/path/live.m3u8";
+    await expect(uploadMediaCandidate({
+      type: "START_MEDIA_UPLOAD",
+      tabId: 7,
+      jobId: "job-live-hls",
+      contentRef,
+      candidate: { url: playlistUrl, kind: "hls", capturedAt: 1 },
+    }, {
+      fetchMedia: vi.fn(async () => textResponse([
+        "#EXTM3U",
+        "#EXTINF:2.0,",
+        "segment.m4s",
+      ].join("\n"), playlistUrl)),
+      api: createApi(),
+      reportProgress: async () => undefined,
+      createPartSpool: async () => createSpool(),
+    })).rejects.toMatchObject({ code: "unsupported_hls_playlist" });
+  });
+
+  it.each([
+    "#EXT-X-PLAYLIST-TYPE:EVENT",
+    "#EXT-X-PLAYLIST-TYPE: EVENT",
+  ])("rejects an HLS event playlist even when its current snapshot has ENDLIST: %s", async (playlistType) => {
+    const playlistUrl = "https://video.twimg.com/path/event.m3u8";
+    await expect(uploadMediaCandidate({
+      type: "START_MEDIA_UPLOAD",
+      tabId: 7,
+      jobId: "job-event-hls",
+      contentRef,
+      candidate: { url: playlistUrl, kind: "hls", capturedAt: 1 },
+    }, {
+      fetchMedia: vi.fn(async () => textResponse([
+        "#EXTM3U",
+        playlistType,
+        "#EXTINF:2.0,",
+        "segment.m4s",
+        "#EXT-X-ENDLIST",
+      ].join("\n"), playlistUrl)),
+      api: createApi(),
+      reportProgress: async () => undefined,
+      createPartSpool: async () => createSpool(),
+    })).rejects.toMatchObject({ code: "unsupported_hls_playlist" });
   });
 
   it.each([
@@ -977,6 +1023,126 @@ describe("offscreen message handling", () => {
     });
   });
 
+  it("continues uploading when progress cannot cross a disconnected Port and replays the latest value", async () => {
+    const port = createRuntimePort();
+    let disconnected = true;
+    port.postMessage.mockImplementation((message: unknown) => {
+      if (disconnected && (message as { type?: string }).type === "MEDIA_UPLOAD_PROGRESS") {
+        throw new Error("Port disconnected");
+      }
+    });
+    let releaseSecondPart: (() => void) | undefined;
+    const uploadPart = vi.fn<MediaUploadApi["uploadPart"]>(async (_sessionId, partNumber) => {
+      if (partNumber === 1) await new Promise<void>((resolve) => { releaseSecondPart = resolve; });
+    });
+    const api = createApi({ uploadPart });
+    installOffscreenHandlers(port as never, {
+      fetchMedia: vi.fn(async () => responseFromChunks([new Uint8Array(9 * MIB)], {
+        "Content-Length": String(9 * MIB),
+      })),
+      api,
+    });
+    port.dispatch(startMessage);
+    await vi.waitFor(() => expect(uploadPart).toHaveBeenCalledTimes(2));
+
+    expect(api.cancelMediaSession).not.toHaveBeenCalled();
+    disconnected = false;
+    port.postMessage.mockClear();
+    port.dispatch({
+      type: "MEDIA_UPLOAD_CONFIG",
+      apiBaseUrl: "http://api.test",
+      installationId: "11111111-1111-4111-8111-111111111111",
+      installationToken: "a".repeat(43),
+    });
+
+    expect(port.postMessage).toHaveBeenCalledWith({
+      type: "MEDIA_UPLOAD_PROGRESS",
+      jobId: "job-handler",
+      uploadedBytes: 8 * MIB,
+      totalBytes: 9 * MIB,
+    });
+    releaseSecondPart?.();
+    await vi.waitFor(() => expect(port.postMessage).toHaveBeenCalledWith(expect.objectContaining({
+      type: "MEDIA_UPLOAD_COMPLETE",
+    })));
+    expect(api.cancelMediaSession).not.toHaveBeenCalled();
+  });
+
+  it("retains a successful terminal notification until the reconnected background acknowledges it", async () => {
+    const port = createRuntimePort();
+    let disconnected = true;
+    port.postMessage.mockImplementation((message: unknown) => {
+      if (disconnected && (message as { type?: string }).type === "MEDIA_UPLOAD_COMPLETE") {
+        throw new Error("Port disconnected");
+      }
+    });
+    const api = createApi();
+    const activeJobId = installOffscreenHandlers(port as never, {
+      fetchMedia: vi.fn(async () => responseFromChunks([new Uint8Array([1])], {
+        "Content-Length": "1",
+      })),
+      api,
+    });
+    port.dispatch(startMessage);
+    await vi.waitFor(() => expect(api.completeMediaSession).toHaveBeenCalledOnce());
+    await flushMicrotasks();
+
+    expect(api.cancelMediaSession).not.toHaveBeenCalled();
+    expect(activeJobId()).toBe("job-handler");
+
+    disconnected = false;
+    port.postMessage.mockClear();
+    port.dispatch({
+      type: "MEDIA_UPLOAD_CONFIG",
+      apiBaseUrl: "http://api.test",
+      installationId: "11111111-1111-4111-8111-111111111111",
+      installationToken: "a".repeat(43),
+    });
+    expect(port.postMessage).toHaveBeenCalledWith({
+      type: "MEDIA_UPLOAD_COMPLETE",
+      jobId: "job-handler",
+      mediaSessionId: "session-1",
+    });
+    expect(activeJobId()).toBe("job-handler");
+
+    port.dispatch({ type: "MEDIA_UPLOAD_ACK", jobId: "job-handler" });
+    expect(activeJobId()).toBeNull();
+  });
+
+  it("retains a failed terminal notification until the reconnected background acknowledges it", async () => {
+    const port = createRuntimePort();
+    let disconnected = true;
+    port.postMessage.mockImplementation((message: unknown) => {
+      if (disconnected && (message as { type?: string }).type === "MEDIA_UPLOAD_FAILED") {
+        throw new Error("Port disconnected");
+      }
+    });
+    const activeJobId = installOffscreenHandlers(port as never, {
+      fetchMedia: vi.fn(async () => new Response(null, { status: 403 })),
+      api: createApi(),
+    });
+    port.dispatch(startMessage);
+    await flushMicrotasks();
+    expect(activeJobId()).toBe("job-handler");
+
+    disconnected = false;
+    port.postMessage.mockClear();
+    port.dispatch({
+      type: "MEDIA_UPLOAD_CONFIG",
+      apiBaseUrl: "http://api.test",
+      installationId: "11111111-1111-4111-8111-111111111111",
+      installationToken: "a".repeat(43),
+    });
+    expect(port.postMessage).toHaveBeenCalledWith({
+      type: "MEDIA_UPLOAD_FAILED",
+      jobId: "job-handler",
+      code: "media_fetch_failed",
+    });
+
+    port.dispatch({ type: "MEDIA_UPLOAD_ACK", jobId: "job-handler" });
+    expect(activeJobId()).toBeNull();
+  });
+
   it("reports its active context when the background reconnects", async () => {
     const port = createRuntimePort();
     let releaseUpload: (() => void) | undefined;
@@ -1053,6 +1219,7 @@ describe("offscreen message handling", () => {
         jobId: "job-handler",
         code: "media_api_config_timeout",
       });
+      port.dispatch({ type: "MEDIA_UPLOAD_ACK", jobId: "job-handler" });
       expect(activeJobId()).toBeNull();
     } finally {
       vi.useRealTimers();
@@ -1094,6 +1261,7 @@ describe("offscreen message handling", () => {
       });
       expect(api.cancelMediaSession).toHaveBeenCalledWith("session-1");
       expect(firstSpool.dispose).toHaveBeenCalledOnce();
+      port.dispatch({ type: "MEDIA_UPLOAD_ACK", jobId: "job-handler" });
       expect(activeJobId()).toBeNull();
 
       port.dispatch({ ...startMessage, jobId: "job-after-timeout" });
