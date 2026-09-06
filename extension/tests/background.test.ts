@@ -465,6 +465,93 @@ describe("background tab isolation", () => {
     }));
   });
 
+  it("interrupts a cold-start upload slot when neither a session nor offscreen document exists", async () => {
+    const chrome = createChrome({
+      mediaUploadJobs: { activeJobId: "job-interrupted", completedJobIds: [] },
+    });
+    installBackgroundHandlers(chrome as never, { identityStore: pendingIdentityStore() });
+    await flushMicrotasks();
+
+    expect(chrome.getStored().mediaUploadJobs).toEqual({
+      activeJobId: null,
+      completedJobIds: [],
+    });
+    expect(chrome.runtime.sendMessage).toHaveBeenCalledTimes(1);
+    expect(chrome.runtime.sendMessage).toHaveBeenCalledWith({
+      type: "MEDIA_UPLOAD_FAILED",
+      jobId: "job-interrupted",
+      code: "media_upload_interrupted",
+    });
+  });
+
+  it("gives an existing offscreen document a handshake window before interrupting a pre-session slot", async () => {
+    vi.useFakeTimers();
+    try {
+      const chrome = createChrome({
+        mediaUploadJobs: { activeJobId: "job-waiting", completedJobIds: [] },
+      });
+      chrome.setHasOffscreenDocument(true);
+      installBackgroundHandlers(chrome as never, { identityStore: pendingIdentityStore() });
+      await flushMicrotasks();
+
+      expect(chrome.getStored().mediaUploadJobs).toEqual({
+        activeJobId: "job-waiting",
+        completedJobIds: [],
+      });
+      expect(chrome.runtime.sendMessage).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      await flushMicrotasks();
+      expect(chrome.getStored().mediaUploadJobs).toEqual({
+        activeJobId: null,
+        completedJobIds: [],
+      });
+      expect(chrome.runtime.sendMessage).toHaveBeenCalledTimes(1);
+      expect(chrome.runtime.sendMessage).toHaveBeenCalledWith({
+        type: "MEDIA_UPLOAD_FAILED",
+        jobId: "job-waiting",
+        code: "media_upload_interrupted",
+      });
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(chrome.runtime.sendMessage).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a pre-session slot when an early Port reports the matching upload context", async () => {
+    vi.useFakeTimers();
+    try {
+      const chrome = createChrome({
+        mediaUploadJobs: { activeJobId: "job-connected", completedJobIds: [] },
+      });
+      const port = createPort("veeky-offscreen-media", {
+        id: "extension-id",
+        url: "chrome-extension://extension-id/offscreen.html",
+      });
+      installBackgroundHandlers(chrome as never, { identityStore: pendingIdentityStore() });
+      chrome.events.connect.listeners[0](port);
+      await flushMicrotasks();
+
+      port.events.message.listeners[0]({
+        type: "MEDIA_UPLOAD_CONTEXT",
+        jobId: "job-connected",
+        mediaSessionId: null,
+      });
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(6_000);
+
+      expect(chrome.getStored().mediaUploadJobs).toEqual({
+        activeJobId: "job-connected",
+        completedJobIds: [],
+      });
+      expect(chrome.runtime.sendMessage).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("persists a created media session in local storage and clears it on completion", async () => {
     const contentRef = {
       platform: "x" as const,
@@ -513,9 +600,14 @@ describe("background tab isolation", () => {
     });
   });
 
-  it("cancels a persisted orphan after restart when no offscreen context exists", async () => {
+  it.each([
+    ["created", true],
+    ["uploading", true],
+    ["failed", false],
+    ["expired", false],
+  ])("interrupts a persisted %s orphan after restart", async (status, shouldCancel) => {
     const cancelMediaSession = vi.fn(async () => undefined);
-    const getMediaSession = vi.fn(async () => remoteMediaSession("session-orphan", "uploading"));
+    const getMediaSession = vi.fn(async () => remoteMediaSession("session-orphan", status));
     const contentRef = {
       platform: "x" as const,
       sourceContentId: "2075545587093807111",
@@ -539,9 +631,16 @@ describe("background tab isolation", () => {
     });
     await flushMicrotasks();
 
-    expect(cancelMediaSession).toHaveBeenCalledWith("session-orphan");
+    if (shouldCancel) expect(cancelMediaSession).toHaveBeenCalledWith("session-orphan");
+    else expect(cancelMediaSession).not.toHaveBeenCalled();
     expect(chrome.getLocalStored()).not.toHaveProperty("activeMediaUploadSession");
     expect(chrome.getStored().mediaUploadJobs).toEqual({ activeJobId: null, completedJobIds: [] });
+    expect(chrome.runtime.sendMessage).toHaveBeenCalledTimes(1);
+    expect(chrome.runtime.sendMessage).toHaveBeenCalledWith({
+      type: "MEDIA_UPLOAD_FAILED",
+      jobId: "job-orphan",
+      code: "media_upload_interrupted",
+    });
   });
 
   it.each(["complete", "consumed"])(
@@ -712,9 +811,21 @@ describe("background tab isolation", () => {
       mediaSessionId: null,
     });
     await flushMicrotasks();
+    port.events.message.listeners[0]({
+      type: "MEDIA_UPLOAD_CONTEXT",
+      jobId: null,
+      mediaSessionId: null,
+    });
+    await flushMicrotasks();
 
     expect(cancelMediaSession).toHaveBeenCalledWith("session-orphan");
     expect(chrome.getLocalStored()).not.toHaveProperty("activeMediaUploadSession");
+    expect(chrome.runtime.sendMessage).toHaveBeenCalledTimes(1);
+    expect(chrome.runtime.sendMessage).toHaveBeenCalledWith({
+      type: "MEDIA_UPLOAD_FAILED",
+      jobId: "job-orphan",
+      code: "media_upload_interrupted",
+    });
   });
 
   it("releases a pre-session upload slot when the offscreen context is lost", async () => {
@@ -736,8 +847,20 @@ describe("background tab isolation", () => {
       mediaSessionId: null,
     });
     await flushMicrotasks();
+    port.events.message.listeners[0]({
+      type: "MEDIA_UPLOAD_CONTEXT",
+      jobId: null,
+      mediaSessionId: null,
+    });
+    await flushMicrotasks();
 
     expect(chrome.getStored().mediaUploadJobs).toEqual({ activeJobId: null, completedJobIds: [] });
+    expect(chrome.runtime.sendMessage).toHaveBeenCalledTimes(1);
+    expect(chrome.runtime.sendMessage).toHaveBeenCalledWith({
+      type: "MEDIA_UPLOAD_FAILED",
+      jobId: "job-before-session",
+      code: "media_upload_interrupted",
+    });
   });
 
   it("leaves offscreen upload notifications for the side panel", async () => {

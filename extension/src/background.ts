@@ -71,6 +71,7 @@ interface BackgroundState {
   runCaptureTask: <T>(task: () => Promise<T>) => Promise<T>;
   offscreenCreation: Promise<void> | null;
   offscreenPort: chrome.runtime.Port | null;
+  pendingOffscreenPorts: number;
   offscreenPortWaiters: Array<(port: chrome.runtime.Port) => void>;
   activeUploadJobId: string | null;
   completedUploadJobIds: Set<string>;
@@ -170,6 +171,7 @@ export function installBackgroundHandlers(
     runCaptureTask,
     offscreenCreation: null,
     offscreenPort: null,
+    pendingOffscreenPorts: 0,
     offscreenPortWaiters: [],
     activeUploadJobId: null,
     completedUploadJobIds: new Set(),
@@ -195,6 +197,13 @@ export function installBackgroundHandlers(
     if (activeMediaSession) {
       if (await chromeApi.offscreen.hasDocument()) scheduleOrphanCheck(chromeApi, mediaApi, state);
       else await reconcilePersistedMediaSession(chromeApi, mediaApi, state, activeMediaSession);
+    } else if (state.activeUploadJobId !== null) {
+      const hasOffscreenDocument = await chromeApi.offscreen.hasDocument();
+      if (hasOffscreenDocument || state.pendingOffscreenPorts > 0) {
+        scheduleOrphanCheck(chromeApi, mediaApi, state);
+      } else {
+        await interruptUpload(chromeApi, state, state.activeUploadJobId);
+      }
     }
     await initializeMediaCapture(chromeApi);
     await configureActiveTab(chromeApi, lastDetectedContentByTab, routeEpochByTab);
@@ -288,7 +297,9 @@ export function installBackgroundHandlers(
       port.disconnect();
       return;
     }
+    state.pendingOffscreenPorts += 1;
     const connected = initialization.then(() => {
+      state.pendingOffscreenPorts -= 1;
       if (state.offscreenPort && state.offscreenPort !== port) {
         port.disconnect();
         return false;
@@ -306,6 +317,9 @@ export function installBackgroundHandlers(
         } satisfies MediaUploadConfigMessage);
       }).catch(reportBackgroundError);
       return true;
+    }, (error) => {
+      state.pendingOffscreenPorts -= 1;
+      throw error;
     });
     void connected.catch(reportBackgroundError);
     port.onMessage.addListener((message: unknown) => {
@@ -656,11 +670,38 @@ function scheduleOrphanCheck(
         await reconcilePersistedMediaSession(chromeApi, mediaApi, state, state.activeMediaSession);
         return;
       }
-      if (state.offscreenPort !== null) return;
-      state.activeUploadJobId = null;
-      await saveMediaUploadJobsState(chromeApi, state);
+      const activeJobId = state.activeUploadJobId;
+      if (activeJobId === null || state.offscreenContext?.jobId === activeJobId) return;
+      await interruptUpload(chromeApi, state, activeJobId);
     }).catch(reportBackgroundError);
   }, 5_000);
+}
+
+async function interruptUpload(
+  chromeApi: ChromeApi,
+  state: BackgroundState,
+  jobId: string,
+  sessionId?: string,
+): Promise<boolean> {
+  const sessionMatches = sessionId !== undefined
+    && state.activeMediaSession?.sessionId === sessionId;
+  const slotMatches = state.activeUploadJobId === jobId;
+  if (!sessionMatches && !slotMatches) return false;
+  if (sessionMatches) {
+    state.activeMediaSession = null;
+    await chromeApi.storage.local.remove(ACTIVE_MEDIA_SESSION_KEY);
+  }
+  if (slotMatches) {
+    state.activeUploadJobId = null;
+    await saveMediaUploadJobsState(chromeApi, state);
+  }
+  clearOrphanCheck(state);
+  await chromeApi.runtime.sendMessage({
+    type: "MEDIA_UPLOAD_FAILED",
+    jobId,
+    code: "media_upload_interrupted",
+  } satisfies MediaUploadMessage).catch(reportBackgroundError);
+  return true;
 }
 
 async function reconcilePersistedMediaSession(
@@ -682,6 +723,10 @@ async function reconcilePersistedMediaSession(
   const completed = remoteSession.status === "complete" || remoteSession.status === "consumed";
   if (remoteSession.status === "created" || remoteSession.status === "uploading") {
     await mediaApi.cancelMediaSession(active.sessionId).catch(() => undefined);
+  }
+  if (!completed) {
+    await interruptUpload(chromeApi, state, active.jobId, active.sessionId);
+    return;
   }
   state.activeMediaSession = null;
   await chromeApi.storage.local.remove(ACTIVE_MEDIA_SESSION_KEY);
@@ -732,9 +777,7 @@ async function handleOffscreenPortMessage(
           clearOrphanCheck(state);
           return;
         }
-        state.activeUploadJobId = null;
-        await saveMediaUploadJobsState(chromeApi, state);
-        clearOrphanCheck(state);
+        await interruptUpload(chromeApi, state, state.activeUploadJobId);
         return;
       }
       if (message.jobId === active.jobId && message.mediaSessionId === active.sessionId) {
