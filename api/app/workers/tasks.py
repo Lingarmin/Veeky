@@ -58,6 +58,7 @@ from app.services.job_lease import (
     update_owned_job,
 )
 from app.services.media_upload import (
+    MediaCleanupCounts,
     cleanup_expired_uploads,
     expire_complete_upload_if_unreferenced,
     expire_consumed_upload_for_terminal_job,
@@ -1794,13 +1795,13 @@ async def cleanup_expired_media_sessions_async(
     session_factory: async_sessionmaker[AsyncSession],
     *,
     settings=None,
-) -> int:
+) -> MediaCleanupCounts:
     current = settings or get_settings()
     async with session_factory() as session:
         return await cleanup_expired_uploads(session, current, limit=100)
 
 
-async def run_expired_media_cleanup() -> int:
+async def run_expired_media_cleanup() -> MediaCleanupCounts:
     current = get_settings()
     engine = create_async_engine(current.database_url, pool_pre_ping=True)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -1870,5 +1871,5 @@ def clear_expired_llm_credentials() -> int:
 
 
 @celery_app.task(name="maintenance.cleanup_expired_media_sessions")
-def cleanup_expired_media_sessions() -> int:
+def cleanup_expired_media_sessions() -> MediaCleanupCounts:
     return asyncio.run(run_expired_media_cleanup())

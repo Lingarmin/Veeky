@@ -548,7 +548,11 @@ async def test_expired_lease_reuses_consumed_upload_after_extraction_loss(
     cleanup_time = datetime.now(timezone.utc) + timedelta(minutes=2)
     monkeypatch.setattr(media_upload, "utc_now", lambda: cleanup_time)
     async with factory() as session:
-        assert await cleanup_expired_uploads(session, settings) == 0
+        assert await cleanup_expired_uploads(session, settings) == {
+            "processed": 0,
+            "expired": 0,
+            "failed": 0,
+        }
     assert (upload_dir / "media.mp4").is_file()
 
     await expire_lease(factory)

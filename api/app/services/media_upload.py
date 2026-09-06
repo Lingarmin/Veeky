@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import shutil
 import stat
@@ -12,7 +13,7 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -47,6 +48,8 @@ MEDIA_SESSION_TRANSITIONS = {
 ACTIVE_UPLOAD_STATES = {"created", "uploading"}
 RESERVED_UPLOAD_STATES = ACTIVE_UPLOAD_STATES | {"complete", "consumed", "failed"}
 MAX_PART_COUNT = 100_000
+MEDIA_CLEANUP_RETRY_DELAY_SECONDS = 900
+logger = logging.getLogger(__name__)
 
 
 class MediaUploadError(Exception):
@@ -59,6 +62,12 @@ class MediaUploadError(Exception):
 
 class PartIntegrityError(RuntimeError):
     pass
+
+
+class MediaCleanupCounts(TypedDict):
+    processed: int
+    expired: int
+    failed: int
 
 
 @dataclass(frozen=True)
@@ -614,7 +623,7 @@ async def cleanup_expired_uploads(
     settings: Settings,
     *,
     limit: int = 100,
-) -> int:
+) -> MediaCleanupCounts:
     cutoff = time.time() - settings.media_upload_session_ttl_seconds
     await _to_thread_uninterruptibly(
         _cleanup_stale_staging_files_sync, settings, cutoff
@@ -632,25 +641,76 @@ async def cleanup_expired_uploads(
         )
     )
     await database.rollback()
-    cleaned = 0
+    counts: MediaCleanupCounts = {"processed": 0, "expired": 0, "failed": 0}
     for session_id in session_ids:
+        counts["processed"] += 1
+        try:
+            await _serialize_sqlite_write(database)
+            upload = await database.scalar(
+                select(MediaUploadSession)
+                .options(selectinload(MediaUploadSession.parts))
+                .where(MediaUploadSession.id == session_id)
+                .with_for_update()
+            )
+            if (
+                upload is not None
+                and upload.status != "consumed"
+                and _is_expired(upload)
+            ):
+                await _expire_locked(database, settings, upload)
+                counts["expired"] += 1
+            else:
+                await database.rollback()
+        except (MediaUploadError, OSError) as error:
+            await database.rollback()
+            counts["failed"] += 1
+            error_code = (
+                error.code
+                if isinstance(error, MediaUploadError)
+                else "storage_unavailable"
+            )
+            logger.warning(
+                "expired media session cleanup failed",
+                extra={
+                    "cleanup_operation": "expire_session",
+                    "media_session_id": session_id,
+                    "error_code": error_code,
+                },
+            )
+            await _defer_failed_cleanup(database, session_id)
+    return counts
+
+
+async def _defer_failed_cleanup(database: AsyncSession, session_id: str) -> None:
+    try:
         await _serialize_sqlite_write(database)
         upload = await database.scalar(
             select(MediaUploadSession)
-            .options(selectinload(MediaUploadSession.parts))
-            .where(MediaUploadSession.id == session_id)
+            .where(
+                MediaUploadSession.id == session_id,
+                MediaUploadSession.status.not_in(("consumed", "expired")),
+            )
             .with_for_update()
         )
-        if (
-            upload is not None
-            and upload.status != "consumed"
-            and _is_expired(upload)
-        ):
-            await _expire_locked(database, settings, upload)
-            cleaned += 1
-        else:
+        if upload is None:
             await database.rollback()
-    return cleaned
+            return
+        now = utc_now()
+        upload.updated_at = now
+        upload.expires_at = now + timedelta(
+            seconds=MEDIA_CLEANUP_RETRY_DELAY_SECONDS
+        )
+        await database.commit()
+    except Exception:
+        await database.rollback()
+        logger.warning(
+            "expired media session retry scheduling failed",
+            extra={
+                "cleanup_operation": "schedule_retry",
+                "media_session_id": session_id,
+                "error_code": "database_unavailable",
+            },
+        )
 
 
 async def _select_owned(

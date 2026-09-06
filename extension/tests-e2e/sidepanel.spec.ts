@@ -356,7 +356,23 @@ test("renders translated subtitles as an X video advances", async () => {
       (video as HTMLVideoElement).currentTime = 1.5;
       video.dispatchEvent(new Event("timeupdate"));
     });
-    await expect(xPage.locator(".veeky-subtitle-overlay")).toHaveText("预期的中文字幕");
+    const overlay = xPage.locator(".veeky-subtitle-overlay");
+    await expect(overlay).toHaveText("预期的中文字幕");
+    const layout = await overlay.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return {
+        parentTestId: element.parentElement?.dataset.testid,
+        lineClamp: style.webkitLineClamp,
+        boxOrient: style.webkitBoxOrient,
+        overflow: style.overflow,
+      };
+    });
+    expect(layout).toEqual({
+      parentTestId: "videoPlayer",
+      lineClamp: "2",
+      boxOrient: "vertical",
+      overflow: "hidden",
+    });
     await expect(xPage.getByText("Original subtitle")).toHaveCount(0);
   } finally {
     await context.close();

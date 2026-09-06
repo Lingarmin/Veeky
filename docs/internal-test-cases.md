@@ -36,11 +36,11 @@
 
 | 检查 | 结果 | 观察耗时或阻塞 |
 |---|---|---|
-| API focused tests | 47 passed | 31.76 秒 |
-| API full pytest | 461 passed | 49.29 秒 |
-| Extension unit tests | 270 passed | 4.20 秒 |
-| Extension typecheck and build | 通过 | 3.27 秒 |
-| Extension Playwright | 4 passed | 10.5 秒；Chromium 已通过本地代理下载到 Playwright 缓存 |
+| API focused regression tests | 7 passed | 7.17 秒 |
+| API full pytest | 462 passed | 38.28 秒 |
+| Extension unit tests | 270 passed | 7.47 秒 |
+| Extension typecheck and build | 通过 | typecheck 7.72 秒，build 1.27 秒 |
+| Extension Playwright | 4 passed | 8.4 秒；Chromium 已通过本地代理下载到 Playwright 缓存 |
 | Docker Compose config and API/Worker build | 通过 | 镜像构建约 72 秒 |
 | Docker Compose startup and health | 通过 | 默认端口被已有用户服务占用，改用隔离端口后约 12 秒启动；`http://127.0.0.1:18000/health` 返回 `{"status":"ok"}` |
 
@@ -52,7 +52,7 @@
 | 4 | 验证服务端下载成功路径 | 未执行 | 未记录 | 没有向真实 X 媒体地址发起下载 |
 | 5 | 模拟服务端 403 并验证浏览器分片上传接管 | 未执行 | 未记录 | 需要真实浏览器登录态和运行中的服务栈 |
 | 6 | 核对下载、上传、提取音频、识别、摘要和翻译文案 | 未执行 | 未记录 | 需要完整真实任务 |
-| 7 | 播放完成结果并确认视频只显示中文字幕 | 未执行 | 未记录 | Playwright mock 有自动覆盖，真实链接未执行 |
+| 7 | 播放完成结果，确认视频只显示两行内的中文字幕且不遮挡关键画面 | 未执行 | 未记录 | Playwright mock 覆盖容器和两行样式，真实播放与遮挡仍需人工验收 |
 | 8 | 检查暂停、拖动、倍速播放和切换路由后的同步 | 未执行 | 未记录 | 单元测试覆盖状态变化，真实播放器未执行 |
 | 9 | 点击侧边栏时间戳并确认当前 X 视频直接跳转 | 未执行 | 未记录 | 单元测试覆盖跳转消息，真实播放器未执行 |
 | 10 | 再次打开帖子并确认直接显示最新完成结果 | 未执行 | 未记录 | 需要先生成真实历史记录 |

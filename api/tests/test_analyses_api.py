@@ -2685,6 +2685,8 @@ async def test_dispatch_cleanup_storage_failure_preserves_error_and_retries_late
             expires_at = expires_at.replace(tzinfo=timezone.utc)
         assert expires_at <= datetime.now(timezone.utc)
         assert upload_dir.is_dir()
-        assert await media_upload_service.cleanup_expired_uploads(session, settings) == 1
+        assert await media_upload_service.cleanup_expired_uploads(
+            session, settings
+        ) == {"processed": 1, "expired": 1, "failed": 0}
 
     assert not upload_dir.exists()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
 import subprocess
 import sys
@@ -1180,7 +1181,7 @@ async def test_cleanup_primitive_expires_only_due_sessions(media_context):
     async with factory() as session:
         cleaned = await cleanup_expired_uploads(session, media_settings(media_root))
 
-    assert cleaned == 1
+    assert cleaned == {"processed": 1, "expired": 1, "failed": 0}
     async with factory() as session:
         due = await session.get(MediaUploadSession, due_id)
         future = await session.get(MediaUploadSession, future_id)
@@ -1188,6 +1189,79 @@ async def test_cleanup_primitive_expires_only_due_sessions(media_context):
         assert future.status == "uploading"
     assert not due_directory.exists()
     assert future_directory.exists()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_isolates_failures_and_keeps_failed_sessions_retryable(
+    media_context,
+    monkeypatch,
+    caplog,
+):
+    client, _, factory, media_root = media_context
+    failed_id = (await create_session(client)).json()["sessionId"]
+    successful_id = (await create_session(client)).json()["sessionId"]
+    await upload_part(client, failed_id, 0, b"0123456789abcdef")
+    await upload_part(client, successful_id, 0, b"0123456789abcdef")
+    now = datetime.now(timezone.utc)
+
+    async with factory() as session:
+        failed = await session.get(MediaUploadSession, failed_id)
+        successful = await session.get(MediaUploadSession, successful_id)
+        failed_directory_key = failed.directory_key
+        failed.directory_key = "invalid-directory-key"
+        failed.expires_at = now - timedelta(seconds=2)
+        successful.expires_at = now - timedelta(seconds=1)
+        successful_directory = media_root / successful.directory_key
+        await session.commit()
+
+    with caplog.at_level(logging.WARNING, logger="app.services.media_upload"):
+        async with factory() as session:
+            result = await cleanup_expired_uploads(
+                session,
+                media_settings(media_root),
+                limit=2,
+            )
+
+    assert result == {"processed": 2, "expired": 1, "failed": 1}
+    assert not successful_directory.exists()
+    async with factory() as session:
+        failed = await session.get(MediaUploadSession, failed_id)
+        successful = await session.get(MediaUploadSession, successful_id)
+        assert failed.status == "uploading"
+        retry_at = failed.expires_at
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        assert retry_at > now
+        assert successful.status == "expired"
+
+        failed.directory_key = failed_directory_key
+        await session.commit()
+
+    cleanup_record = next(
+        record
+        for record in caplog.records
+        if record.getMessage() == "expired media session cleanup failed"
+    )
+    assert cleanup_record.media_session_id == failed_id
+    assert cleanup_record.error_code == "upload_failed"
+    assert "invalid-directory-key" not in cleanup_record.getMessage()
+
+    monkeypatch.setattr(
+        media_upload,
+        "utc_now",
+        lambda: retry_at + timedelta(seconds=1),
+    )
+    async with factory() as session:
+        retry_result = await cleanup_expired_uploads(
+            session,
+            media_settings(media_root),
+            limit=1,
+        )
+
+    assert retry_result == {"processed": 1, "expired": 1, "failed": 0}
+    async with factory() as session:
+        failed = await session.get(MediaUploadSession, failed_id)
+        assert failed.status == "expired"
 
 
 @pytest.mark.asyncio
@@ -1218,7 +1292,7 @@ async def test_cleanup_does_not_expire_a_session_consumed_after_selection(
     async with factory() as session:
         cleaned = await cleanup_expired_uploads(session, media_settings(media_root))
 
-    assert cleaned == 0
+    assert cleaned == {"processed": 1, "expired": 0, "failed": 0}
     assert directory.is_dir()
     async with factory() as session:
         upload = await session.get(MediaUploadSession, session_id)
@@ -1315,7 +1389,7 @@ async def test_celery_cleanup_expires_abandoned_media_without_deleting_results(
         settings=media_settings(media_root),
     )
 
-    assert cleaned == 1
+    assert cleaned == {"processed": 1, "expired": 1, "failed": 0}
     assert not abandoned_directory.exists()
     async with factory() as session:
         abandoned = await session.get(MediaUploadSession, abandoned_id)
@@ -1356,7 +1430,7 @@ async def test_cleanup_removes_only_old_uuid_staging_files(media_context):
     async with factory() as session:
         cleaned = await cleanup_expired_uploads(session, settings)
 
-    assert cleaned == 0
+    assert cleaned == {"processed": 0, "expired": 0, "failed": 0}
     assert not old_file.exists()
     assert fresh_file.read_bytes() == b"fresh"
     assert malformed_file.read_bytes() == b"malformed"
@@ -1427,7 +1501,7 @@ async def test_cleanup_continues_when_a_staging_entry_disappears(
     async with factory() as session:
         cleaned = await cleanup_expired_uploads(session, settings)
 
-    assert cleaned == 0
+    assert cleaned == {"processed": 0, "expired": 0, "failed": 0}
     assert not disappearing.exists()
     assert not remaining.exists()
 
@@ -1867,7 +1941,7 @@ async def test_postgres_complete_serializes_delete_and_expiration(
     assert not expire_task.done()
     release.set()
     await complete_task
-    assert await expire_task == 1
+    assert await expire_task == {"processed": 1, "expired": 1, "failed": 0}
     async with factory() as session:
         upload = await session.get(MediaUploadSession, expiring_id)
         assert upload.status == "expired"
