@@ -77,7 +77,7 @@ export function App({
   llmStore = browserLlmConfigStore,
   pollIntervalMs = 2000,
 }: AppProps) {
-  const [phase, setPhase] = useState<Phase>("loading");
+  const [phase, setPhaseState] = useState<Phase>("loading");
   const [context, setContext] = useState<ActiveTabContext | null>(null);
   const [inspection, setInspection] = useState<VideoInspection | null>(null);
   const [sourceLanguage, setSourceLanguage] = useState("");
@@ -112,8 +112,13 @@ export function App({
   const activeTabIdRef = useRef<number | null>(null);
   const activeContentRef = useRef<ContentRef | null>(null);
   const uploadStartedJobsRef = useRef(new Set<string>());
-  const settingsOpenRef = useRef(false);
+  const phaseRef = useRef<Phase>("loading");
   const completedResultRef = useRef<AnalysisResult | null>(null);
+
+  const setPhase = useCallback((nextPhase: Phase) => {
+    phaseRef.current = nextPhase;
+    setPhaseState(nextPhase);
+  }, []);
 
   const stopPolling = useCallback(() => {
     pollGenerationRef.current += 1;
@@ -157,7 +162,11 @@ export function App({
     completedResultRef.current = analysis;
     setResult(analysis);
     setResultFromHistory(fromHistory);
-    if (!settingsOpenRef.current) setPhase("complete");
+    if (phaseRef.current === "settings") {
+      setSettingsReturnPhase("complete");
+    } else {
+      setPhase("complete");
+    }
     activeJobRef.current = null;
     if (
       analysis.contentRef.platform === "x"
@@ -169,7 +178,7 @@ export function App({
       void browser.showSubtitles(activeTabIdRef.current, analysis.contentRef, translated)
         .catch(() => undefined);
     }
-  }, [browser]);
+  }, [browser, setPhase]);
 
   const poll = useCallback(async (
     jobId: string,
@@ -646,14 +655,12 @@ export function App({
   };
 
   const openSettings = () => {
-    settingsOpenRef.current = true;
     setSettingsReturnPhase(phase === "settings" ? "selecting" : phase);
     setSettingsError("");
     setPhase("settings");
   };
 
   const closeSettings = () => {
-    settingsOpenRef.current = false;
     if (
       settingsReturnPhase === "processing"
       && activeJobRef.current === null

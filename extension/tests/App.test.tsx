@@ -131,6 +131,24 @@ function createXBrowser() {
   };
 }
 
+function createProcessingBrowser() {
+  const browser = createBrowser();
+  browser.getActiveContext.mockResolvedValue({
+    tabId: 7,
+    url: "https://www.youtube.com/watch?v=aircAruvnKk",
+    title: "But what is a neural network?",
+    contentRef: youtubeContentRef,
+    videoId: "aircAruvnKk",
+    analysis: {
+      tabId: 7,
+      contentRef: youtubeContentRef,
+      videoId: "aircAruvnKk",
+      jobId: "job-processing",
+    },
+  });
+  return browser;
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((done) => { resolve = done; });
@@ -996,6 +1014,118 @@ describe("Side Panel", () => {
     });
     await waitFor(() => expect(api.getResult).toHaveBeenCalledWith("job-1"));
     pendingSave.resolve(undefined);
+
+    expect(await screen.findByText("视频解释神经网络如何识别手写数字。")).toBeInTheDocument();
+  });
+
+  it("opens a completed job after leaving settings for video selection", async () => {
+    const pendingStatus = deferred<Awaited<ReturnType<AnalysisApi["getStatus"]>>>();
+    const api = createApi();
+    api.getStatus
+      .mockResolvedValueOnce({
+        jobId: "job-processing", status: "analyzing", failureCode: null, failureDetail: null,
+      })
+      .mockReturnValueOnce(pendingStatus.promise)
+      .mockResolvedValueOnce({
+        jobId: "job-processing", status: "completed", failureCode: null, failureDetail: null,
+      });
+    const browser = createProcessingBrowser();
+    const user = userEvent.setup();
+    render(<App api={api} browser={browser} llmStore={createLlmStore()} pollIntervalMs={1000} />);
+
+    await waitFor(() => expect(api.getStatus).toHaveBeenCalledTimes(2));
+    await user.click(screen.getByRole("button", { name: "LLM 设置" }));
+    await user.click(screen.getByRole("button", { name: "选择视频" }));
+
+    expect(await screen.findByText("视频解释神经网络如何识别手写数字。")).toBeInTheDocument();
+    expect(api.getResult).toHaveBeenCalledWith("job-processing");
+  });
+
+  it("opens a history result after leaving settings for history", async () => {
+    const pendingStatus = deferred<Awaited<ReturnType<AnalysisApi["getStatus"]>>>();
+    const api = createApi();
+    api.getStatus
+      .mockResolvedValueOnce({
+        jobId: "job-processing", status: "analyzing", failureCode: null, failureDetail: null,
+      })
+      .mockReturnValueOnce(pendingStatus.promise);
+    api.getHistory.mockResolvedValueOnce({
+      items: [{ ...historyItem, jobId: "job-processing" }],
+      hasMore: false,
+    });
+    const browser = createProcessingBrowser();
+    const user = userEvent.setup();
+    render(<App api={api} browser={browser} llmStore={createLlmStore()} pollIntervalMs={1000} />);
+
+    await waitFor(() => expect(api.getStatus).toHaveBeenCalledTimes(2));
+    await user.click(screen.getByRole("button", { name: "LLM 设置" }));
+    await user.click(screen.getByRole("button", { name: "历史记录" }));
+    await user.click(await screen.findByRole("button", { name: "打开 Neural networks" }));
+
+    expect(await screen.findByText("视频解释神经网络如何识别手写数字。")).toBeInTheDocument();
+    expect(api.getResult).toHaveBeenCalledWith("job-processing");
+  });
+
+  it("can reopen a completed job after polling leaves settings for translation", async () => {
+    const pendingStatus = deferred<Awaited<ReturnType<AnalysisApi["getStatus"]>>>();
+    const api = createApi();
+    const completeResult = await api.getResult("fixture");
+    api.getResult.mockClear();
+    api.getResult
+      .mockResolvedValueOnce({
+        ...completeResult,
+        oneLineSummary: "概览已经生成，字幕仍在翻译。",
+        partial: true,
+      })
+      .mockResolvedValueOnce(completeResult);
+    api.getStatus
+      .mockResolvedValueOnce({
+        jobId: "job-processing", status: "analyzing", failureCode: null, failureDetail: null,
+      })
+      .mockReturnValueOnce(pendingStatus.promise)
+      .mockResolvedValueOnce({
+        jobId: "job-processing", status: "completed", failureCode: null, failureDetail: null,
+      });
+    const browser = createProcessingBrowser();
+    const user = userEvent.setup();
+    render(<App api={api} browser={browser} llmStore={createLlmStore()} pollIntervalMs={1000} />);
+
+    await waitFor(() => expect(api.getStatus).toHaveBeenCalledTimes(2));
+    await user.click(screen.getByRole("button", { name: "LLM 设置" }));
+    pendingStatus.resolve({
+      jobId: "job-processing", status: "translating", failureCode: null, failureDetail: null,
+    });
+    expect(await screen.findByText("概览已经生成，字幕仍在翻译。")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "选择视频" }));
+
+    expect(await screen.findByText("视频解释神经网络如何识别手写数字。")).toBeInTheDocument();
+  });
+
+  it("can reopen a completed job after polling leaves settings for an error", async () => {
+    const pendingStatus = deferred<Awaited<ReturnType<AnalysisApi["getStatus"]>>>();
+    const api = createApi();
+    api.getStatus
+      .mockResolvedValueOnce({
+        jobId: "job-processing", status: "analyzing", failureCode: null, failureDetail: null,
+      })
+      .mockReturnValueOnce(pendingStatus.promise)
+      .mockResolvedValueOnce({
+        jobId: "job-processing", status: "completed", failureCode: null, failureDetail: null,
+      });
+    api.getHistory.mockResolvedValueOnce({ items: [], hasMore: false });
+    const browser = createProcessingBrowser();
+    const user = userEvent.setup();
+    render(<App api={api} browser={browser} llmStore={createLlmStore()} pollIntervalMs={1000} />);
+
+    await waitFor(() => expect(api.getStatus).toHaveBeenCalledTimes(2));
+    await user.click(screen.getByRole("button", { name: "LLM 设置" }));
+    pendingStatus.resolve({
+      jobId: "job-processing",
+      status: "failed",
+      failureCode: "analysis_unavailable",
+      failureDetail: "failed",
+    });
+    await user.click(await screen.findByRole("button", { name: "重新检查" }));
 
     expect(await screen.findByText("视频解释神经网络如何识别手写数字。")).toBeInTheDocument();
   });
