@@ -637,6 +637,91 @@ describe("background tab isolation", () => {
     });
   });
 
+  it("acknowledges a failed candidate session clear before accepting a reconnected fallback", async () => {
+    vi.useFakeTimers();
+    try {
+      const contentRef = {
+        platform: "x" as const,
+        sourceContentId: "2075545587093807111",
+        mediaIndex: 1,
+      };
+      const cancelMediaSession = vi.fn(async () => undefined);
+      const getMediaSession = vi.fn(async () => {
+        throw new Error("matching fallback context must not be reconciled");
+      });
+      const chrome = createChrome({
+        mediaUploadJobs: { activeJobId: "job-fallback", completedJobIds: [] },
+      });
+      chrome.setHasOffscreenDocument(true);
+      const firstPort = createPort("veeky-offscreen-media", {
+        id: "extension-id",
+        url: "chrome-extension://extension-id/offscreen.html",
+      });
+      installBackgroundHandlers(chrome as never, {
+        mediaApi: { cancelMediaSession, getMediaSession } as never,
+        identityStore: pendingIdentityStore(),
+      });
+      chrome.events.connect.listeners[0](firstPort);
+      await flushMicrotasks();
+
+      firstPort.events.message.listeners[0]({
+        type: "MEDIA_SESSION_CREATED",
+        jobId: "job-fallback",
+        mediaSessionId: "session-1",
+        contentId: "33333333-3333-4333-8333-333333333333",
+        contentRef,
+      });
+      await flushMicrotasks();
+      firstPort.events.message.listeners[0]({
+        type: "MEDIA_SESSION_CLEARED",
+        jobId: "job-fallback",
+        mediaSessionId: "session-1",
+      });
+      await flushMicrotasks();
+
+      expect(chrome.getLocalStored()).not.toHaveProperty("activeMediaUploadSession");
+      expect(firstPort.postMessage).toHaveBeenCalledWith({
+        type: "MEDIA_SESSION_CLEARED_ACK",
+        jobId: "job-fallback",
+        mediaSessionId: "session-1",
+      });
+
+      firstPort.events.disconnect.listeners[0]();
+      const secondPort = createPort("veeky-offscreen-media", {
+        id: "extension-id",
+        url: "chrome-extension://extension-id/offscreen.html",
+      });
+      chrome.events.connect.listeners[0](secondPort);
+      await flushMicrotasks();
+      secondPort.events.message.listeners[0]({
+        type: "MEDIA_SESSION_CREATED",
+        jobId: "job-fallback",
+        mediaSessionId: "session-2",
+        contentId: "33333333-3333-4333-8333-333333333333",
+        contentRef,
+      });
+      secondPort.events.message.listeners[0]({
+        type: "MEDIA_UPLOAD_CONTEXT",
+        jobId: "job-fallback",
+        mediaSessionId: "session-2",
+      });
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(6_000);
+
+      expect(getMediaSession).not.toHaveBeenCalled();
+      expect(cancelMediaSession).not.toHaveBeenCalled();
+      expect(chrome.getLocalStored().activeMediaUploadSession).toEqual({
+        jobId: "job-fallback",
+        sessionId: "session-2",
+        contentId: "33333333-3333-4333-8333-333333333333",
+        contentRef,
+        updatedAt: expect.any(Number),
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each([
     ["created", true],
     ["uploading", true],

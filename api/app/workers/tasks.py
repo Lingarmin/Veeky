@@ -6,7 +6,9 @@ import functools
 import hashlib
 import json
 import math
+import signal
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -176,6 +178,8 @@ class FFmpegAudioExtractor:
         self._validate_path(video_path)
         self._validate_path(audio_path)
         self._validate_path(destination)
+        expected_video_packets = await self._probe_packet_count(video_path, "v:0")
+        expected_audio_packets = await self._probe_packet_count(audio_path, "a:0")
         temporary = destination.with_name(f".{destination.name}.muxing")
         temporary.unlink(missing_ok=True)
         process = await self.runner(
@@ -195,21 +199,72 @@ class FFmpegAudioExtractor:
             "copy",
             "-f",
             "mp4",
+            "-fs",
+            str(self.max_bytes),
             "-y",
             str(temporary),
         )
         if process.returncode:
             temporary.unlink(missing_ok=True)
-            raise AudioExtractionError("media_mux_failed", "无法合并媒体音视频轨")
+            stderr = process.stderr.lower()
+            file_size_signal = getattr(signal, "SIGXFSZ", None)
+            hit_file_size_limit = (
+                file_size_signal is not None
+                and process.returncode == -file_size_signal
+            ) or any(
+                marker in stderr
+                for marker in ("file too large", "file size limit exceeded", "errno 27")
+            )
+            raise AudioExtractionError(
+                "media_too_large" if hit_file_size_limit else "media_mux_failed",
+                "媒体文件过大" if hit_file_size_limit else "无法合并媒体音视频轨",
+            )
         try:
             size = temporary.stat().st_size
             if size <= 0 or size > self.max_bytes:
+                raise AudioExtractionError("media_too_large", "媒体文件过大")
+            try:
+                actual_video_packets = await self._probe_packet_count(temporary, "v:0")
+                actual_audio_packets = await self._probe_packet_count(temporary, "a:0")
+            except AudioExtractionError:
+                raise AudioExtractionError("media_too_large", "媒体文件过大") from None
+            if (
+                actual_video_packets != expected_video_packets
+                or actual_audio_packets != expected_audio_packets
+            ):
                 raise AudioExtractionError("media_too_large", "媒体文件过大")
             temporary.replace(destination)
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise
         return destination
+
+    async def _probe_packet_count(self, media_path: Path, stream: str) -> int:
+        process = await self.runner(
+            "ffprobe",
+            "-v",
+            "error",
+            "-count_packets",
+            "-select_streams",
+            stream,
+            "-show_entries",
+            "stream=nb_read_packets",
+            "-of",
+            "json",
+            str(media_path),
+        )
+        if process.returncode:
+            raise AudioExtractionError("media_mux_failed", "无法合并媒体音视频轨")
+        try:
+            streams = json.loads(process.stdout)["streams"]
+            count = int(streams[0]["nb_read_packets"])
+        except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            raise AudioExtractionError(
+                "media_mux_failed", "无法合并媒体音视频轨"
+            ) from None
+        if count <= 0:
+            raise AudioExtractionError("media_mux_failed", "无法合并媒体音视频轨")
+        return count
 
     async def probe_audio_duration_ms(self, media_path: Path) -> float | None:
         self._validate_path(media_path)
@@ -313,8 +368,9 @@ class FFmpegAudioExtractor:
     async def _run_subprocess(self, *arguments: str):
         process = None
         try:
+            command = self._with_file_size_limit(arguments)
             process = await asyncio.create_subprocess_exec(
-                *arguments,
+                *command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -353,6 +409,20 @@ class FFmpegAudioExtractor:
             stdout=stdout.decode("utf-8", "replace"),
             stderr=stderr.decode("utf-8", "replace"),
         )
+
+    @staticmethod
+    def _with_file_size_limit(arguments: tuple[str, ...]) -> tuple[str, ...]:
+        if Path(arguments[0]).name != "ffmpeg" or "-fs" not in arguments:
+            return arguments
+        limit_index = arguments.index("-fs") + 1
+        limit = int(arguments[limit_index])
+        limiter = (
+            "import os, resource, sys; "
+            "limit = int(sys.argv[1]); "
+            "resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit)); "
+            "os.execvp(sys.argv[2], sys.argv[2:])"
+        )
+        return (sys.executable, "-c", limiter, str(limit), *arguments)
 
     @staticmethod
     async def _read_bounded(stream, limit: int) -> bytes:
@@ -477,6 +547,7 @@ class AnalysisPipeline:
         audio_extractor=None,
         transcriber=None,
         settings=None,
+        job_usage_probe=None,
     ):
         self.session_factory = session_factory
         if isinstance(source_registry, SourceRegistry):
@@ -501,6 +572,7 @@ class AnalysisPipeline:
         self.media_downloader = media_downloader
         self.audio_extractor = audio_extractor
         self.transcriber = transcriber
+        self.job_usage_probe = job_usage_probe or self._directory_usage
         self._uses_default_providers = False
         self.lease_state: TaskLeaseState | None = None
         self._lease_released: asyncio.Event | None = None
@@ -869,6 +941,8 @@ class AnalysisPipeline:
                         parts=upload_parts,
                         manifest_parts=manifest_parts,
                         manifest_tracks=manifest_tracks,
+                        max_temp_bytes=self.settings.max_temp_bytes_per_job,
+                        job_usage_probe=self.job_usage_probe,
                     )
                 )
             except AudioExtractionError as error:
@@ -879,13 +953,28 @@ class AnalysisPipeline:
                 raise RetryableMediaCopyError() from None
             if track_paths:
                 video_path, audio_path = track_paths
+                available_mux_bytes = (
+                    self.settings.max_temp_bytes_per_job
+                    - self.job_usage_probe(job_dir)
+                )
+                if available_mux_bytes <= 0:
+                    raise AudioExtractionError("media_too_large", "媒体文件过大")
                 muxer = self.audio_extractor or FFmpegAudioExtractor(
                     str(root),
                     timeout_seconds=self.settings.asr_job_timeout_seconds,
-                    max_bytes=self.settings.max_temp_bytes_per_job,
+                    max_bytes=min(
+                        self.settings.max_media_bytes, available_mux_bytes
+                    ),
                 )
                 try:
                     await muxer.mux_tracks(video_path, audio_path, media_path)
+                    if (
+                        self.job_usage_probe(job_dir)
+                        > self.settings.max_temp_bytes_per_job
+                    ):
+                        raise AudioExtractionError(
+                            "media_too_large", "媒体文件过大"
+                        )
                 finally:
                     video_path.unlink(missing_ok=True)
                     audio_path.unlink(missing_ok=True)
@@ -1191,6 +1280,8 @@ class AnalysisPipeline:
         parts: tuple[tuple[int, int, str], ...] = (),
         manifest_parts: tuple[int, ...] = (),
         manifest_tracks: tuple[dict, ...] = (),
+        max_temp_bytes: int | None = None,
+        job_usage_probe=None,
     ) -> tuple[Path, Path] | None:
         temporary = destination.with_name(f".{destination.name}.copying")
         temporary.unlink(missing_ok=True)
@@ -1200,6 +1291,18 @@ class AnalysisPipeline:
         }
         try:
             with temporary.open("xb") as output:
+                before_write = None
+                if kind == "hls" and max_temp_bytes is not None:
+                    usage_probe = job_usage_probe or AnalysisPipeline._directory_usage
+
+                    def ensure_job_capacity(chunk_size: int) -> None:
+                        output.flush()
+                        if usage_probe(destination.parent) + chunk_size > max_temp_bytes:
+                            raise AudioExtractionError(
+                                "media_too_large", "媒体文件过大"
+                            )
+
+                    before_write = ensure_job_capacity
                 if kind == "mp4":
                     source_path = directory / "media.mp4"
                     before = source_path.stat()
@@ -1213,6 +1316,7 @@ class AnalysisPipeline:
                             output,
                             max_bytes,
                             tuple(sorted(parts)),
+                            before_write=before_write,
                         )
                     after = source_path.stat()
                     if (
@@ -1249,6 +1353,7 @@ class AnalysisPipeline:
                                 output,
                                 max_bytes - total,
                                 ((part_number, metadata[0], metadata[1]),),
+                                before_write=before_write,
                             )
                         after = part_path.stat()
                         if (
@@ -1272,7 +1377,11 @@ class AnalysisPipeline:
                     )
             if kind == "hls" and manifest_tracks:
                 track_paths = AnalysisPipeline._split_hls_tracks(
-                    temporary, destination, manifest_tracks
+                    temporary,
+                    destination,
+                    manifest_tracks,
+                    max_temp_bytes=max_temp_bytes,
+                    job_usage_probe=job_usage_probe,
                 )
                 temporary.unlink(missing_ok=True)
                 return track_paths
@@ -1289,30 +1398,61 @@ class AnalysisPipeline:
 
     @staticmethod
     def _split_hls_tracks(
-        source_path: Path, destination: Path, manifest_tracks: tuple[dict, ...]
+        source_path: Path,
+        destination: Path,
+        manifest_tracks: tuple[dict, ...],
+        *,
+        max_temp_bytes: int | None = None,
+        job_usage_probe=None,
     ) -> tuple[Path, Path]:
         outputs: dict[str, Path] = {}
         created: list[Path] = []
         try:
-            with source_path.open("rb") as source:
-                for track in manifest_tracks:
-                    kind = track.get("kind") if isinstance(track, dict) else None
-                    resources = track.get("resources") if isinstance(track, dict) else None
-                    if kind not in {"video", "audio"} or kind in outputs or not resources:
+            normalized_tracks: list[tuple[str, list[tuple[int, int]]]] = []
+            estimated_track_bytes = 0
+            for track in manifest_tracks:
+                kind = track.get("kind") if isinstance(track, dict) else None
+                resources = track.get("resources") if isinstance(track, dict) else None
+                if (
+                    kind not in {"video", "audio"}
+                    or any(existing_kind == kind for existing_kind, _ in normalized_tracks)
+                    or not isinstance(resources, list)
+                    or not resources
+                ):
+                    raise AudioExtractionError(
+                        "media_artifact_invalid", "媒体文件校验失败"
+                    )
+                normalized_resources = []
+                for resource in resources:
+                    offset = resource.get("offset") if isinstance(resource, dict) else None
+                    length = resource.get("length") if isinstance(resource, dict) else None
+                    if type(offset) is not int or type(length) is not int or length <= 0:
                         raise AudioExtractionError(
                             "media_artifact_invalid", "媒体文件校验失败"
                         )
+                    normalized_resources.append((offset, length))
+                    estimated_track_bytes += length
+                normalized_tracks.append((kind, normalized_resources))
+            if {kind for kind, _ in normalized_tracks} != {"video", "audio"}:
+                raise AudioExtractionError(
+                    "media_artifact_invalid", "媒体文件校验失败"
+                )
+
+            usage_probe = job_usage_probe or AnalysisPipeline._directory_usage
+            if (
+                max_temp_bytes is not None
+                and usage_probe(destination.parent) + estimated_track_bytes
+                > max_temp_bytes
+            ):
+                raise AudioExtractionError("media_too_large", "媒体文件过大")
+
+            with source_path.open("rb") as source:
+                for kind, resources in normalized_tracks:
                     track_path = destination.with_name(f".{destination.name}.{kind}")
                     track_path.unlink(missing_ok=True)
                     created.append(track_path)
                     with track_path.open("xb") as output:
-                        for resource in resources:
-                            offset = resource.get("offset") if isinstance(resource, dict) else None
-                            length = resource.get("length") if isinstance(resource, dict) else None
-                            if type(offset) is not int or type(length) is not int or length <= 0:
-                                raise AudioExtractionError(
-                                    "media_artifact_invalid", "媒体文件校验失败"
-                                )
+                        for offset, length in resources:
                             source.seek(offset)
                             remaining = length
                             while remaining:
@@ -1321,13 +1461,18 @@ class AnalysisPipeline:
                                     raise AudioExtractionError(
                                         "media_artifact_invalid", "媒体文件校验失败"
                                     )
+                                output.flush()
+                                if (
+                                    max_temp_bytes is not None
+                                    and usage_probe(destination.parent) + len(chunk)
+                                    > max_temp_bytes
+                                ):
+                                    raise AudioExtractionError(
+                                        "media_too_large", "媒体文件过大"
+                                    )
                                 output.write(chunk)
                                 remaining -= len(chunk)
                     outputs[kind] = track_path
-            if set(outputs) != {"video", "audio"}:
-                raise AudioExtractionError(
-                    "media_artifact_invalid", "媒体文件校验失败"
-                )
             return outputs["video"], outputs["audio"]
         except BaseException:
             for path in created:
@@ -1335,13 +1480,25 @@ class AnalysisPipeline:
             raise
 
     @staticmethod
-    def _copy_verified_stream(source, output, max_bytes, parts) -> int:
+    def _directory_usage(directory: Path) -> int:
+        return sum(
+            path.stat().st_size
+            for path in directory.rglob("*")
+            if path.is_file()
+        )
+
+    @staticmethod
+    def _copy_verified_stream(
+        source, output, max_bytes, parts, *, before_write=None
+    ) -> int:
         total = 0
         if not parts:
             while chunk := source.read(1024 * 1024):
                 total += len(chunk)
                 if total > max_bytes:
                     raise AudioExtractionError("media_too_large", "媒体文件过大")
+                if before_write:
+                    before_write(len(chunk))
                 output.write(chunk)
             return total
         for _, byte_size, expected_sha256 in parts:
@@ -1358,6 +1515,8 @@ class AnalysisPipeline:
                 if total > max_bytes:
                     raise AudioExtractionError("media_too_large", "媒体文件过大")
                 digest.update(chunk)
+                if before_write:
+                    before_write(len(chunk))
                 output.write(chunk)
             if digest.hexdigest() != expected_sha256:
                 raise AudioExtractionError(

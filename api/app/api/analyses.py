@@ -1239,12 +1239,13 @@ async def _fail_dispatch(
 def _validate_direct_media_url(url: str) -> None:
     try:
         parsed = urlsplit(url)
+        port = parsed.port
     except ValueError as error:
         raise _api_error(422, "invalid_media_url", "媒体地址无效") from error
     if (
         parsed.scheme != "https"
         or parsed.hostname != "video.twimg.com"
-        or parsed.port is not None
+        or port is not None
         or parsed.username is not None
         or parsed.password is not None
         or parsed.fragment

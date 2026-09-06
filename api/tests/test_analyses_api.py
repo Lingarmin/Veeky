@@ -1633,7 +1633,7 @@ async def test_x_create_uses_pending_identity_and_encrypts_direct_media_url(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("port", [443, 444])
+@pytest.mark.parametrize("port", [443, 444, "abc", 99999])
 async def test_x_create_rejects_direct_media_urls_with_explicit_ports(
     api_context, port
 ):

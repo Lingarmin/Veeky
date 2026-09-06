@@ -3,6 +3,8 @@ import type {
   AnalyzedTab,
   ContentRef,
   ExtensionMessage,
+  MediaSessionClearedAckMessage,
+  MediaSessionClearedMessage,
   MediaSessionCreatedMessage,
   MediaCandidate,
   MediaUploadAckMessage,
@@ -901,6 +903,37 @@ async function handleOffscreenPortMessage(
     });
     return;
   }
+  if (isMediaSessionClearedMessage(message)) {
+    await state.runCaptureTask(async () => {
+      if (
+        state.activeMediaSession?.jobId === message.jobId
+        && state.activeMediaSession.sessionId === message.mediaSessionId
+      ) {
+        state.activeMediaSession = null;
+        await chromeApi.storage.local.remove(ACTIVE_MEDIA_SESSION_KEY);
+      }
+      if (
+        state.offscreenContext?.jobId === message.jobId
+        && state.offscreenContext.mediaSessionId === message.mediaSessionId
+      ) {
+        state.offscreenContext = {
+          type: "MEDIA_UPLOAD_CONTEXT",
+          jobId: message.jobId,
+          mediaSessionId: null,
+        };
+      }
+    });
+    try {
+      port.postMessage({
+        type: "MEDIA_SESSION_CLEARED_ACK",
+        jobId: message.jobId,
+        mediaSessionId: message.mediaSessionId,
+      } satisfies MediaSessionClearedAckMessage);
+    } catch (error) {
+      reportBackgroundError(error);
+    }
+    return;
+  }
   if (!isMediaUploadNotification(message)) return;
   const result = await state.runCaptureTask(async () => {
     if (message.jobId !== state.activeUploadJobId) {
@@ -944,6 +977,14 @@ function isMediaSessionCreatedMessage(message: unknown): message is MediaSession
     && typeof created.mediaSessionId === "string"
     && typeof created.contentId === "string"
     && isValidXContentRef(created.contentRef);
+}
+
+function isMediaSessionClearedMessage(message: unknown): message is MediaSessionClearedMessage {
+  if (typeof message !== "object" || message === null) return false;
+  const cleared = message as Partial<MediaSessionClearedMessage>;
+  return cleared.type === "MEDIA_SESSION_CLEARED"
+    && typeof cleared.jobId === "string"
+    && typeof cleared.mediaSessionId === "string";
 }
 
 function isMediaUploadContextMessage(message: unknown): message is MediaUploadContextMessage {

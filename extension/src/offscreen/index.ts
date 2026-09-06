@@ -1,5 +1,7 @@
 import type {
   ContentRef,
+  MediaSessionClearedAckMessage,
+  MediaSessionClearedMessage,
   MediaSessionCreatedMessage,
   MediaUploadAckMessage,
   MediaUploadCompleteMessage,
@@ -1069,6 +1071,20 @@ export function installOffscreenHandlers(
     : new Promise<MediaUploadApi>((resolve) => { resolveApi = resolve; });
   let activeJobId: string | null = null;
   let activeSession: MediaSessionCreatedMessage | null = null;
+  let pendingSessionClear: MediaSessionClearedMessage | null = null;
+  let resolveSessionClear: (() => void) | null = null;
+  const reportSessionCleared = (session: MediaSessionCreatedMessage): Promise<void> => {
+    pendingSessionClear = {
+      type: "MEDIA_SESSION_CLEARED",
+      jobId: session.jobId,
+      mediaSessionId: session.mediaSessionId,
+    };
+    const acknowledged = new Promise<void>((resolve) => {
+      resolveSessionClear = resolve;
+    });
+    safePost(pendingSessionClear);
+    return acknowledged;
+  };
   const cleanup = dependencies.cleanupPartSpools?.().catch(() => undefined) ?? Promise.resolve();
   port.onMessage.addListener((message: unknown) => {
     if (isMediaUploadConfigMessage(message)) {
@@ -1088,8 +1104,24 @@ export function installOffscreenHandlers(
         mediaSessionId: activeSession?.mediaSessionId ?? null,
       } satisfies MediaUploadContextMessage);
       if (activeSession) safePost(activeSession);
+      if (pendingSessionClear) safePost(pendingSessionClear);
       if (pendingProgress) safePost(pendingProgress);
       if (pendingTerminal) safePost(pendingTerminal);
+      return;
+    }
+    if (isMediaSessionClearedAckMessage(message)) {
+      if (
+        pendingSessionClear?.jobId !== message.jobId
+        || pendingSessionClear.mediaSessionId !== message.mediaSessionId
+      ) return;
+      pendingSessionClear = null;
+      if (
+        activeSession?.jobId === message.jobId
+        && activeSession.mediaSessionId === message.mediaSessionId
+      ) activeSession = null;
+      const resolve = resolveSessionClear;
+      resolveSessionClear = null;
+      resolve?.();
       return;
     }
     if (isMediaUploadAckMessage(message)) {
@@ -1146,7 +1178,13 @@ export function installOffscreenHandlers(
           });
         } catch (error) {
           lastError = error;
-          activeSession = null;
+          const failedSession = activeSession;
+          if (failedSession) {
+            await waitForAbort(
+              reportSessionCleared(failedSession),
+              controller.signal,
+            );
+          }
         }
       }
       throw lastError ?? new UploadError("unsupported_media_candidate", "No media candidate was provided");
@@ -1182,6 +1220,16 @@ function isMediaUploadAckMessage(message: unknown): message is MediaUploadAckMes
   if (typeof message !== "object" || message === null) return false;
   const ack = message as Partial<MediaUploadAckMessage>;
   return ack.type === "MEDIA_UPLOAD_ACK" && typeof ack.jobId === "string";
+}
+
+function isMediaSessionClearedAckMessage(
+  message: unknown,
+): message is MediaSessionClearedAckMessage {
+  if (typeof message !== "object" || message === null) return false;
+  const ack = message as Partial<MediaSessionClearedAckMessage>;
+  return ack.type === "MEDIA_SESSION_CLEARED_ACK"
+    && typeof ack.jobId === "string"
+    && typeof ack.mediaSessionId === "string";
 }
 
 function isStartMediaUploadMessage(message: unknown): message is StartMediaUploadMessage {

@@ -81,6 +81,18 @@ export interface MediaSessionCreatedMessage {
   contentRef: ContentRef;
 }
 
+export interface MediaSessionClearedMessage {
+  type: "MEDIA_SESSION_CLEARED";
+  jobId: string;
+  mediaSessionId: string;
+}
+
+export interface MediaSessionClearedAckMessage {
+  type: "MEDIA_SESSION_CLEARED_ACK";
+  jobId: string;
+  mediaSessionId: string;
+}
+
 export interface MediaUploadContextMessage {
   type: "MEDIA_UPLOAD_CONTEXT";
   jobId: string | null;

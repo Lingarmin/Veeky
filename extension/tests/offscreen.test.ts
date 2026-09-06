@@ -1152,6 +1152,103 @@ describe("offscreen message handling", () => {
     expect(api.cancelMediaSession).not.toHaveBeenCalled();
   });
 
+  it("waits for a reconnected background to clear a failed candidate session before fallback", async () => {
+    const port = createRuntimePort();
+    let sessionNumber = 0;
+    const createMediaSession = vi.fn<MediaUploadApi["createMediaSession"]>(async (input) => ({
+      sessionId: `session-${++sessionNumber}`,
+      contentId: input.contentId,
+      kind: input.kind,
+      status: "created",
+      expectedBytes: input.expectedBytes,
+      receivedBytes: 0,
+      partSizeBytes: 8 * MIB,
+      partCount: input.partCount,
+      uploadedParts: [],
+    }));
+    const uploadPart = vi.fn<MediaUploadApi["uploadPart"]>(async (sessionId) => {
+      if (sessionId === "session-1") throw new Error("candidate expired");
+    });
+    const getMediaSession = vi.fn<MediaUploadApi["getMediaSession"]>(async (sessionId) => ({
+      sessionId,
+      contentId: "33333333-3333-4333-8333-333333333333",
+      kind: "mp4",
+      status: "uploading",
+      expectedBytes: 1,
+      receivedBytes: 0,
+      partSizeBytes: 8 * MIB,
+      partCount: 1,
+      uploadedParts: [],
+    }));
+    const api = createApi({ createMediaSession, uploadPart, getMediaSession });
+    let disconnected = true;
+    port.postMessage.mockImplementation((message: unknown) => {
+      if (disconnected && (message as { type?: string }).type === "MEDIA_SESSION_CLEARED") {
+        throw new Error("Port disconnected");
+      }
+    });
+    installOffscreenHandlers(port as never, {
+      fetchMedia: vi.fn(async () => responseFromChunks(
+        [new Uint8Array([1])],
+        { "Content-Length": "1" },
+      )),
+      api,
+      reportProgress: async () => undefined,
+    });
+
+    port.dispatch({
+      type: "START_MEDIA_UPLOAD",
+      tabId: 7,
+      jobId: "job-fallback-session",
+      contentRef,
+      candidates: [
+        { url: "https://video.twimg.com/expired.mp4", kind: "mp4", capturedAt: 2 },
+        { url: "https://video.twimg.com/working.mp4", kind: "mp4", capturedAt: 1 },
+      ],
+    });
+
+    await vi.waitFor(() => expect(api.cancelMediaSession).toHaveBeenCalledWith("session-1"));
+    expect(createMediaSession).toHaveBeenCalledOnce();
+    expect(port.postMessage).toHaveBeenCalledWith({
+      type: "MEDIA_SESSION_CLEARED",
+      jobId: "job-fallback-session",
+      mediaSessionId: "session-1",
+    });
+
+    disconnected = false;
+    port.postMessage.mockClear();
+    port.dispatch({
+      type: "MEDIA_UPLOAD_CONFIG",
+      apiBaseUrl: "http://api.test",
+      installationId: "11111111-1111-4111-8111-111111111111",
+      installationToken: "a".repeat(43),
+    });
+    expect(port.postMessage).toHaveBeenCalledWith({
+      type: "MEDIA_UPLOAD_CONTEXT",
+      jobId: "job-fallback-session",
+      mediaSessionId: "session-1",
+    });
+    expect(port.postMessage).toHaveBeenCalledWith({
+      type: "MEDIA_SESSION_CLEARED",
+      jobId: "job-fallback-session",
+      mediaSessionId: "session-1",
+    });
+    expect(createMediaSession).toHaveBeenCalledOnce();
+
+    port.dispatch({
+      type: "MEDIA_SESSION_CLEARED_ACK",
+      jobId: "job-fallback-session",
+      mediaSessionId: "session-1",
+    });
+
+    await vi.waitFor(() => expect(port.postMessage).toHaveBeenCalledWith({
+      type: "MEDIA_UPLOAD_COMPLETE",
+      jobId: "job-fallback-session",
+      mediaSessionId: "session-2",
+    }));
+    expect(createMediaSession).toHaveBeenCalledTimes(2);
+  });
+
   it("continues uploading when progress cannot cross a disconnected Port and replays the latest value", async () => {
     const port = createRuntimePort();
     let disconnected = true;

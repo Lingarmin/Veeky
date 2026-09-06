@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import asyncio
 import hashlib
+import json
 import sys
 import wave
 from datetime import datetime, timedelta, timezone
@@ -201,6 +202,7 @@ def make_pipeline(
     transcriber=None,
     translation=None,
     analysis=None,
+    job_usage_probe=None,
 ):
     factory, cipher, settings, _ = context
     return AnalysisPipeline(
@@ -213,6 +215,7 @@ def make_pipeline(
         audio_extractor=extractor or FakeAudioExtractor(),
         transcriber=transcriber or FakeTranscriber(),
         settings=settings,
+        job_usage_probe=job_usage_probe,
     )
 
 
@@ -437,6 +440,178 @@ async def test_completed_hls_upload_reconstructs_and_muxes_separate_tracks(x_con
     async with factory() as session:
         job = await session.get(AnalysisJob, "job-x")
         assert job.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_hls_pipeline_reports_temp_overflow_and_cleans_job_files(x_context):
+    factory, _, settings, media_root = x_context
+    payload = b"videoaudio"
+    upload_dir = media_root / "55555555-5555-4555-8555-555555555555"
+    upload_dir.mkdir()
+    (upload_dir / "part-00000000.bin").write_bytes(payload)
+
+    async with factory() as session:
+        job = await session.get(AnalysisJob, "job-x")
+        job.status = "waiting_for_media"
+        job.media_url_ciphertext = None
+        upload = MediaUploadSession(
+            id="upload-hls-overflow",
+            installation_id=INSTALLATION_ID,
+            content_id=job.content_id,
+            status="complete",
+            expected_bytes=len(payload),
+            received_bytes=len(payload),
+            media_kind="hls",
+            part_count=1,
+            part_size_bytes=len(payload),
+            hls_manifest={
+                "parts": [0],
+                "tracks": [
+                    {"kind": "video", "resources": [{"offset": 0, "length": 5}]},
+                    {"kind": "audio", "resources": [{"offset": 5, "length": 5}]},
+                ],
+            },
+            directory_key=upload_dir.name,
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        upload.parts.append(
+            MediaUploadPart(
+                part_number=0,
+                byte_size=len(payload),
+                sha256=hashlib.sha256(payload).hexdigest(),
+            )
+        )
+        job.media_session_id = upload.id
+        session.add(upload)
+        await session.commit()
+
+    simulated_existing_bytes = settings.max_temp_bytes_per_job - len(payload) - 1
+
+    def job_usage_probe(directory: Path) -> int:
+        return simulated_existing_bytes + sum(
+            path.stat().st_size for path in directory.iterdir() if path.is_file()
+        )
+
+    await make_pipeline(x_context, job_usage_probe=job_usage_probe).run(
+        "job-x", resume=True
+    )
+
+    async with factory() as session:
+        job = await session.get(AnalysisJob, "job-x")
+        assert job.status == "failed"
+        assert job.failure_code == "media_too_large"
+    assert list(media_root.glob("job-job-x-*")) == []
+
+
+def test_hls_split_rejects_projected_job_usage_over_temp_budget(tmp_path):
+    upload_dir = tmp_path / "upload"
+    job_dir = tmp_path / "job"
+    upload_dir.mkdir()
+    job_dir.mkdir()
+    payload = b"videoaudio"
+    source = upload_dir / "part-00000000.bin"
+    source.write_bytes(payload)
+    max_temp_bytes = 6 * 1024 * 1024 * 1024
+    simulated_existing_bytes = max_temp_bytes - len(payload) - 1
+
+    def job_usage_probe(directory: Path) -> int:
+        return simulated_existing_bytes + sum(
+            path.stat().st_size for path in directory.iterdir() if path.is_file()
+        )
+
+    destination = job_dir / "media.bin"
+    with pytest.raises(AudioExtractionError) as raised:
+        AnalysisPipeline._copy_upload_artifact(
+            upload_dir,
+            "hls",
+            destination,
+            1024,
+            expected_bytes=len(payload),
+            parts=((0, len(payload), hashlib.sha256(payload).hexdigest()),),
+            manifest_parts=(0,),
+            manifest_tracks=(
+                {"kind": "video", "resources": [{"offset": 0, "length": 5}]},
+                {"kind": "audio", "resources": [{"offset": 5, "length": 5}]},
+            ),
+            max_temp_bytes=max_temp_bytes,
+            job_usage_probe=job_usage_probe,
+        )
+
+    assert raised.value.code == "media_too_large"
+    assert list(job_dir.iterdir()) == []
+
+
+def test_hls_reconstruction_checks_job_usage_before_writing_each_chunk(tmp_path):
+    upload_dir = tmp_path / "upload"
+    job_dir = tmp_path / "job"
+    upload_dir.mkdir()
+    job_dir.mkdir()
+    payload = b"videoaudio"
+    source = upload_dir / "part-00000000.bin"
+    source.write_bytes(payload)
+    max_temp_bytes = 6 * 1024 * 1024 * 1024
+    simulated_existing_bytes = max_temp_bytes - len(payload) + 1
+    observed_usage = []
+
+    def job_usage_probe(directory: Path) -> int:
+        usage = simulated_existing_bytes + sum(
+            path.stat().st_size for path in directory.iterdir() if path.is_file()
+        )
+        observed_usage.append(usage)
+        return usage
+
+    destination = job_dir / "media.bin"
+    with pytest.raises(AudioExtractionError) as raised:
+        AnalysisPipeline._copy_upload_artifact(
+            upload_dir,
+            "hls",
+            destination,
+            1024,
+            expected_bytes=len(payload),
+            parts=((0, len(payload), hashlib.sha256(payload).hexdigest()),),
+            manifest_parts=(0,),
+            manifest_tracks=(
+                {"kind": "video", "resources": [{"offset": 0, "length": 5}]},
+                {"kind": "audio", "resources": [{"offset": 5, "length": 5}]},
+            ),
+            max_temp_bytes=max_temp_bytes,
+            job_usage_probe=job_usage_probe,
+        )
+
+    assert raised.value.code == "media_too_large"
+    assert observed_usage
+    assert max(observed_usage) <= max_temp_bytes
+    assert list(job_dir.iterdir()) == []
+
+
+def test_hls_split_rechecks_actual_job_usage_between_track_writes(tmp_path):
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    source = job_dir / ".media.bin.copying"
+    source.write_bytes(b"videoaudio")
+    max_temp_bytes = 6 * 1024 * 1024 * 1024
+    observed_usage = iter(
+        [
+            max_temp_bytes - 10,
+            max_temp_bytes - 10,
+            max_temp_bytes - 4,
+        ]
+    )
+
+    with pytest.raises(AudioExtractionError) as raised:
+        AnalysisPipeline._split_hls_tracks(
+            source,
+            job_dir / "media.bin",
+            (
+                {"kind": "video", "resources": [{"offset": 0, "length": 5}]},
+                {"kind": "audio", "resources": [{"offset": 5, "length": 5}]},
+            ),
+            max_temp_bytes=max_temp_bytes,
+            job_usage_probe=lambda _directory: next(observed_usage),
+        )
+
+    assert raised.value.code == "media_too_large"
+    assert list(job_dir.iterdir()) == [source]
 
 
 @pytest.mark.asyncio
@@ -839,6 +1014,23 @@ async def test_ffmpeg_muxes_separate_hls_tracks_into_an_explicit_mp4_container(
 
     async def runner(*arguments):
         calls.append(arguments)
+        if arguments[0] == "ffprobe":
+            path = Path(arguments[-1])
+            streams = (
+                [{"codec_type": "video", "nb_read_packets": "1"}]
+                if path == video_path
+                else [{"codec_type": "audio", "nb_read_packets": "1"}]
+                if path == audio_path
+                else [
+                    {"codec_type": "video", "nb_read_packets": "1"},
+                    {"codec_type": "audio", "nb_read_packets": "1"},
+                ]
+            )
+            return type(
+                "Result",
+                (),
+                {"returncode": 0, "stdout": json.dumps({"streams": streams}), "stderr": ""},
+            )()
         Path(arguments[-1]).write_bytes(b"muxed")
         return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
@@ -848,11 +1040,177 @@ async def test_ffmpeg_muxes_separate_hls_tracks_into_an_explicit_mp4_container(
 
     assert await extractor.mux_tracks(video_path, audio_path, destination) == destination
     assert destination.read_bytes() == b"muxed"
-    first_map = calls[0].index("-map")
-    assert calls[0][first_map : first_map + 2] == ("-map", "0:v:0")
-    second_map = calls[0].index("-map", calls[0].index("-map") + 1)
-    assert calls[0][second_map : second_map + 2] == ("-map", "1:a:0")
-    assert ("-f", "mp4") == calls[0][calls[0].index("-f") : calls[0].index("-f") + 2]
+    ffmpeg_call = next(call for call in calls if call[0] == "ffmpeg")
+    first_map = ffmpeg_call.index("-map")
+    assert ffmpeg_call[first_map : first_map + 2] == ("-map", "0:v:0")
+    second_map = ffmpeg_call.index("-map", ffmpeg_call.index("-map") + 1)
+    assert ffmpeg_call[second_map : second_map + 2] == ("-map", "1:a:0")
+    assert ("-f", "mp4") == ffmpeg_call[
+        ffmpeg_call.index("-f") : ffmpeg_call.index("-f") + 2
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_mux_caps_output_to_available_temp_budget_and_cleans_overflow(
+    tmp_path,
+):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    video_path = media_root / "video-track"
+    audio_path = media_root / "audio-track"
+    destination = media_root / "media.bin"
+    video_path.write_bytes(b"video")
+    audio_path.write_bytes(b"audio")
+    calls = []
+
+    async def runner(*arguments):
+        calls.append(arguments)
+        if arguments[0] == "ffprobe":
+            path = Path(arguments[-1])
+            streams = (
+                [{"codec_type": "video", "nb_read_packets": "1"}]
+                if path == video_path
+                else [{"codec_type": "audio", "nb_read_packets": "1"}]
+                if path == audio_path
+                else [
+                    {"codec_type": "video", "nb_read_packets": "1"},
+                    {"codec_type": "audio", "nb_read_packets": "1"},
+                ]
+            )
+            return type(
+                "Result",
+                (),
+                {"returncode": 0, "stdout": json.dumps({"streams": streams}), "stderr": ""},
+            )()
+        Path(arguments[-1]).write_bytes(b"1234567")
+        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    extractor = FFmpegAudioExtractor(
+        str(media_root), timeout_seconds=10, max_bytes=6, runner=runner
+    )
+
+    with pytest.raises(AudioExtractionError) as raised:
+        await extractor.mux_tracks(video_path, audio_path, destination)
+
+    assert raised.value.code == "media_too_large"
+    ffmpeg_call = next(call for call in calls if call[0] == "ffmpeg")
+    assert ffmpeg_call[
+        ffmpeg_call.index("-fs") : ffmpeg_call.index("-fs") + 2
+    ] == (
+        "-fs",
+        "6",
+    )
+    assert not destination.exists()
+    assert not (media_root / ".media.bin.muxing").exists()
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_mux_rejects_successful_size_limited_output_missing_packets(
+    tmp_path,
+):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    video_path = media_root / "video-track"
+    audio_path = media_root / "audio-track"
+    destination = media_root / "media.bin"
+    video_path.write_bytes(b"video")
+    audio_path.write_bytes(b"audio")
+
+    async def runner(*arguments):
+        if arguments[0] == "ffmpeg":
+            Path(arguments[-1]).write_bytes(b"123456789012")
+            return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        path = Path(arguments[-1])
+        if path == video_path:
+            streams = [{"codec_type": "video", "nb_read_packets": "2"}]
+        elif path == audio_path:
+            streams = [{"codec_type": "audio", "nb_read_packets": "2"}]
+        else:
+            streams = [
+                {"codec_type": "video", "nb_read_packets": "1"},
+                {"codec_type": "audio", "nb_read_packets": "2"},
+            ]
+        return type(
+            "Result",
+            (),
+            {"returncode": 0, "stdout": json.dumps({"streams": streams}), "stderr": ""},
+        )()
+
+    extractor = FFmpegAudioExtractor(
+        str(media_root), timeout_seconds=10, max_bytes=12, runner=runner
+    )
+
+    with pytest.raises(AudioExtractionError) as raised:
+        await extractor.mux_tracks(video_path, audio_path, destination)
+
+    assert raised.value.code == "media_too_large"
+    assert not destination.exists()
+    assert not (media_root / ".media.bin.muxing").exists()
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_runner_enforces_a_hard_output_file_size_limit(tmp_path):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    fake_ffmpeg = tmp_path / "ffmpeg"
+    fake_ffmpeg.symlink_to(sys.executable)
+    output_path = media_root / "limited-output"
+    extractor = FFmpegAudioExtractor(
+        str(media_root), timeout_seconds=10, max_bytes=10
+    )
+
+    result = await extractor._run_subprocess(
+        str(fake_ffmpeg),
+        "-c",
+        "import pathlib, sys; pathlib.Path(sys.argv[-1]).write_bytes(b'x' * 11)",
+        "-fs",
+        "10",
+        str(output_path),
+    )
+
+    assert result.returncode != 0
+    assert output_path.stat().st_size <= 10
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_mux_reports_hard_file_limit_as_media_too_large(tmp_path):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    video_path = media_root / "video-track"
+    audio_path = media_root / "audio-track"
+    destination = media_root / "media.bin"
+    video_path.write_bytes(b"video")
+    audio_path.write_bytes(b"audio")
+
+    async def runner(*arguments):
+        if arguments[0] == "ffmpeg":
+            return type(
+                "Result",
+                (),
+                {"returncode": 1, "stdout": "", "stderr": "File too large"},
+            )()
+        return type(
+            "Result",
+            (),
+            {
+                "returncode": 0,
+                "stdout": json.dumps(
+                    {"streams": [{"codec_type": "video", "nb_read_packets": "1"}]}
+                ),
+                "stderr": "",
+            },
+        )()
+
+    extractor = FFmpegAudioExtractor(
+        str(media_root), timeout_seconds=10, max_bytes=10, runner=runner
+    )
+
+    with pytest.raises(AudioExtractionError) as raised:
+        await extractor.mux_tracks(video_path, audio_path, destination)
+
+    assert raised.value.code == "media_too_large"
+    assert not destination.exists()
+    assert not (media_root / ".media.bin.muxing").exists()
 
 
 @pytest.mark.asyncio
