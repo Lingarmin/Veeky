@@ -20,7 +20,6 @@ interface Selection {
 
 interface BoundVideo {
   play: () => void;
-  pause: () => void;
   loadedmetadata: () => void;
 }
 
@@ -80,22 +79,17 @@ export function installXPlayerTracker(options: XPlayerTrackerOptions): () => voi
         playOrder.set(video, playSequence);
         select(video);
       },
-      pause: () => {
-        if (selection?.video === video) clearSelection();
-      },
       loadedmetadata: () => {
-        if (selection?.video === video && !video.paused) select(video);
+        if (selection?.video === video) select(video);
       },
     };
     video.addEventListener("play", listeners.play);
-    video.addEventListener("pause", listeners.pause);
     video.addEventListener("loadedmetadata", listeners.loadedmetadata);
     bindings.set(video, listeners);
   };
 
   const unbind = (video: HTMLVideoElement, listeners: BoundVideo) => {
     video.removeEventListener("play", listeners.play);
-    video.removeEventListener("pause", listeners.pause);
     video.removeEventListener("loadedmetadata", listeners.loadedmetadata);
     bindings.delete(video);
     playOrder.delete(video);
@@ -110,7 +104,7 @@ export function installXPlayerTracker(options: XPlayerTrackerOptions): () => voi
 
     const videos = Array.from(pageDocument.querySelectorAll<HTMLVideoElement>("video"));
     for (const video of videos) bind(video);
-    if (selection && selection.video.isConnected && !selection.video.paused) {
+    if (selection && selection.video.isConnected) {
       const selectedVideo = selection.video;
       const currentRef = contentRefForVideo(selectedVideo, pageRoute(pageWindow));
       if (currentRef) {

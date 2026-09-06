@@ -1684,7 +1684,7 @@ describe("X media candidate capture", () => {
     })] });
   });
 
-  it("uses the current frame URL when an inactive signal races a stale tab URL", async () => {
+  it("clears the selected context when an inactive signal races a stale tab URL", async () => {
     const bareUrl = "https://x.com/owner/status/2075545587093807111";
     const priorUrl = "https://x.com/owner/status/2075545587093807222";
     const chrome = createChrome();
@@ -1697,7 +1697,7 @@ describe("X media candidate capture", () => {
 
     chrome.tabs.query.mockResolvedValue([{ id: 7, url: bareUrl, title: "X status" }]);
     expect(await dispatchMessage(chrome, { type: "GET_ACTIVE_TAB_CONTEXT" })).toEqual(
-      expect.objectContaining({ contentRef, videoId: null }),
+      expect.objectContaining({ contentRef: null, durationMs: null, videoId: null }),
     );
     expect(chrome.sidePanel.setOptions).toHaveBeenLastCalledWith({
       tabId: 7, path: "sidepanel.html", enabled: true,
@@ -1721,6 +1721,30 @@ describe("X media candidate capture", () => {
     });
   });
 
+  it("persists the active X player duration and restores it in tab context", async () => {
+    const bareUrl = "https://x.com/owner/status/2075545587093807111";
+    const original = createChrome();
+    installBackgroundHandlers(original as never);
+    await dispatchMessage(original, {
+      type: "X_PLAYER_ACTIVE", contentRef, durationMs: 1_283_000,
+    }, contentSender(7, bareUrl));
+
+    expect(original.getStored()).toEqual(expect.objectContaining({
+      xLastDetectedContent: {
+        "7": { contentRef, canonicalStatusId: contentRef.sourceContentId, durationMs: 1_283_000 },
+      },
+    }));
+
+    const restarted = createChrome(original.getStored());
+    restarted.tabs.query.mockResolvedValue([{ id: 7, url: bareUrl, title: "X status" }]);
+    installBackgroundHandlers(restarted as never);
+    await flushMicrotasks();
+
+    expect(await dispatchMessage(restarted, { type: "GET_ACTIVE_TAB_CONTEXT" })).toEqual(
+      expect.objectContaining({ contentRef, durationMs: 1_283_000, videoId: null }),
+    );
+  });
+
   it("restores a signaled bare status when its tab becomes active again", async () => {
     const bareUrl = "https://x.com/owner/status/2075545587093807111";
     const chrome = createChrome();
@@ -1738,7 +1762,7 @@ describe("X media candidate capture", () => {
     });
   });
 
-  it("keeps a bare status usable after the player becomes inactive", async () => {
+  it("clears a bare-status selection after its player is removed", async () => {
     const bareUrl = "https://x.com/owner/status/2075545587093807111";
     const chrome = createChrome();
     installBackgroundHandlers(chrome as never);
@@ -1751,7 +1775,7 @@ describe("X media candidate capture", () => {
 
     chrome.tabs.query.mockResolvedValue([{ id: 7, url: bareUrl, title: "X status" }]);
     expect(await dispatchMessage(chrome, { type: "GET_ACTIVE_TAB_CONTEXT" })).toEqual(
-      expect.objectContaining({ contentRef, videoId: null }),
+      expect.objectContaining({ contentRef: null, durationMs: null, videoId: null }),
     );
     chrome.events.actionClicked.listeners[0]({ id: 7, url: bareUrl });
     await flushMicrotasks();
@@ -1770,12 +1794,9 @@ describe("X media candidate capture", () => {
     await dispatchMessage(original, {
       type: "X_PLAYER_ACTIVE", contentRef, durationMs: 0,
     }, contentSender(7, bareUrl));
-    await dispatchMessage(original, {
-      type: "X_PLAYER_INACTIVE", contentRef,
-    }, contentSender(7, bareUrl));
     expect(original.getStored()).toEqual(expect.objectContaining({
       xLastDetectedContent: {
-        "7": { contentRef, canonicalStatusId: contentRef.sourceContentId },
+        "7": { contentRef, canonicalStatusId: contentRef.sourceContentId, durationMs: 0 },
       },
     }));
 
@@ -1803,9 +1824,6 @@ describe("X media candidate capture", () => {
     await dispatchMessage(original, {
       type: "X_PLAYER_ACTIVE", contentRef, durationMs: 0,
     }, contentSender(7, bareUrl));
-    await dispatchMessage(original, {
-      type: "X_PLAYER_INACTIVE", contentRef,
-    }, contentSender(7, bareUrl));
 
     const restarted = createChrome(original.getStored());
     restarted.tabs.query.mockResolvedValue([{ id: 7, url: bareUrl, title: "X status" }]);
@@ -1823,7 +1841,7 @@ describe("X media candidate capture", () => {
     const bareUrl = "https://x.com/owner/status/2075545587093807111";
     const chrome = createChrome({
       xLastDetectedContent: {
-        "7": { contentRef, canonicalStatusId: contentRef.sourceContentId },
+        "7": { contentRef, canonicalStatusId: contentRef.sourceContentId, durationMs: 0 },
       },
     });
     let resolveActiveTab: ((tabs: Array<{ id: number; url: string; title: string }>) => void) | undefined;
@@ -1913,7 +1931,7 @@ describe("X media candidate capture", () => {
 
     expect(chrome.getStored()).toEqual(expect.objectContaining({
       xLastDetectedContent: expect.objectContaining({
-        "7": { contentRef, canonicalStatusId: contentRef.sourceContentId },
+        "7": { contentRef, canonicalStatusId: contentRef.sourceContentId, durationMs: 0 },
       }),
     }));
   });

@@ -34,6 +34,7 @@ export interface ActiveTabContext {
   url: string;
   title: string;
   contentRef?: ContentRef | null;
+  durationMs?: number | null;
   videoId: string | null;
   analysis: AnalyzedTab | null;
 }

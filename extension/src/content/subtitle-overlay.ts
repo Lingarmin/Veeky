@@ -31,6 +31,7 @@ export class SubtitleOverlay {
   private overlay: HTMLDivElement | null = null;
   private segments: readonly SubtitleSegment[] = [];
   private observer: MutationObserver | null = null;
+  private frameId: number | null = null;
 
   constructor(private readonly pageDocument: Document = document) {}
 
@@ -45,11 +46,16 @@ export class SubtitleOverlay {
       if (replacement) this.attach(replacement);
     });
     this.observer.observe(this.container, { childList: true, subtree: true });
+    this.scheduleFrame();
   }
 
   clear(): void {
     this.observer?.disconnect();
     this.observer = null;
+    if (this.frameId !== null) {
+      this.pageDocument.defaultView?.cancelAnimationFrame(this.frameId);
+      this.frameId = null;
+    }
     this.video?.removeEventListener("timeupdate", this.update);
     this.video = null;
     this.overlay?.remove();
@@ -101,6 +107,18 @@ export class SubtitleOverlay {
     this.overlay.textContent = text ?? "";
     this.overlay.style.visibility = text ? "visible" : "hidden";
   };
+
+  private readonly onFrame = (): void => {
+    this.frameId = null;
+    this.update();
+    this.scheduleFrame();
+  };
+
+  private scheduleFrame(): void {
+    const pageWindow = this.pageDocument.defaultView;
+    if (!pageWindow || this.frameId !== null || !this.overlay) return;
+    this.frameId = pageWindow.requestAnimationFrame(this.onFrame);
+  }
 }
 
 function subtitleContainer(video: HTMLVideoElement): HTMLElement {

@@ -27,6 +27,7 @@ describe("side panel helpers", () => {
     expect(errorMessageForCode("quota_service_unavailable")).toBe("服务暂时繁忙，请稍后再试。");
     expect(errorMessageForCode("installation_auth_required")).toBe("插件身份验证失败，请刷新后重试。");
     expect(errorMessageForCode("x_video_play_required")).toBe("请先播放当前视频 1 至 2 秒，再重试");
+    expect(errorMessageForCode("x_video_context_required")).toBe("请先打开并播放要重新分析的 X 视频，然后重试");
     expect(errorMessageForCode("x_media_not_detected")).toBe("未检测到当前视频媒体，请确认视频可以正常播放");
     expect(errorMessageForCode("x_media_url_expired")).toBe("媒体地址已过期，请重新播放视频");
     expect(errorMessageForCode("media_too_large")).toBe("视频文件过大，无法分析");

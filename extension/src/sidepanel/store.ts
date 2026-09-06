@@ -42,6 +42,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   quota_service_unavailable: "服务暂时繁忙，请稍后再试。",
   installation_auth_required: "插件身份验证失败，请刷新后重试。",
   x_video_play_required: "请先播放当前视频 1 至 2 秒，再重试",
+  x_video_context_required: "请先打开并播放要重新分析的 X 视频，然后重试",
   x_media_not_detected: "未检测到当前视频媒体，请确认视频可以正常播放",
   x_media_url_expired: "媒体地址已过期，请重新播放视频",
   media_too_large: "视频文件过大，无法分析",

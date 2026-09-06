@@ -105,45 +105,76 @@ export function App({
   const [uploadPercent, setUploadPercent] = useState<number | null>(null);
   const [processingPlatform, setProcessingPlatform] = useState<ContentRef["platform"]>("youtube");
   const timerRef = useRef<number | null>(null);
+  const pollGenerationRef = useRef(0);
   const activeJobRef = useRef<string | null>(null);
   const activeTabIdRef = useRef<number | null>(null);
+  const activeContentRef = useRef<ContentRef | null>(null);
   const uploadStartedJobsRef = useRef(new Set<string>());
 
   const stopPolling = useCallback(() => {
+    pollGenerationRef.current += 1;
     if (timerRef.current !== null) window.clearTimeout(timerRef.current);
     timerRef.current = null;
+    activeJobRef.current = null;
   }, []);
+
+  const isCurrentGeneration = useCallback((generation: number) => (
+    pollGenerationRef.current === generation
+  ), []);
+
+  const isCurrentPoll = useCallback((jobId: string, generation: number) => (
+    activeJobRef.current === jobId && pollGenerationRef.current === generation
+  ), []);
 
   const showResult = useCallback((analysis: AnalysisResult, fromHistory = false) => {
     setResult(analysis);
     setResultFromHistory(fromHistory);
     setPhase("complete");
     activeJobRef.current = null;
-    if (analysis.contentRef.platform === "x" && activeTabIdRef.current !== null) {
+    if (
+      analysis.contentRef.platform === "x"
+      && activeTabIdRef.current !== null
+      && activeContentRef.current
+      && sameContentRef(activeContentRef.current, analysis.contentRef)
+    ) {
       const translated = analysis.transcript.filter((segment) => Boolean(segment.translated));
       void browser.showSubtitles(activeTabIdRef.current, analysis.contentRef, translated)
         .catch(() => undefined);
     }
   }, [browser]);
 
-  const poll = useCallback(async (jobId: string, contentRef: ContentRef, tabId: number) => {
+  const poll = useCallback(async (
+    jobId: string,
+    contentRef: ContentRef,
+    tabId: number,
+    canUploadFromCurrentTab: boolean,
+    generation: number,
+  ) => {
+    if (!isCurrentPoll(jobId, generation)) return;
     try {
       const status = await api.getStatus(jobId);
+      if (!isCurrentPoll(jobId, generation)) return;
       setJobStatus(status.status);
       if (status.status === "completed") {
         const analysis = await api.getResult(jobId);
+        if (!isCurrentPoll(jobId, generation)) return;
         showResult(analysis);
         return;
       }
       if (status.status === "waiting_for_media" && contentRef.platform === "x") {
+        if (!canUploadFromCurrentTab) {
+          throw Object.assign(new Error("Historical X video is not open"), { code: "x_video_context_required" });
+        }
         if (!uploadStartedJobsRef.current.has(jobId)) {
-          uploadStartedJobsRef.current.add(jobId);
           const candidates = await browser.getMediaCandidates(tabId, contentRef);
+          if (!isCurrentPoll(jobId, generation)) return;
           const candidate = candidates[0];
           if (!candidate) {
             throw Object.assign(new Error("No current X media candidate"), { code: "x_media_not_detected" });
           }
-          await browser.startMediaUpload({ tabId, jobId, contentRef, candidate });
+          const started = await browser.startMediaUpload({ tabId, jobId, contentRef, candidate });
+          if (!isCurrentPoll(jobId, generation)) return;
+          if (started) uploadStartedJobsRef.current.add(jobId);
         }
       }
       if (status.status === "translating") {
@@ -152,6 +183,7 @@ export function App({
         // the completed transcript in the background.
         try {
           const analysis = await api.getResult(jobId);
+          if (!isCurrentPoll(jobId, generation)) return;
           setResult(analysis);
           setSection("overview");
           setPhase("complete");
@@ -162,6 +194,7 @@ export function App({
       if (status.status === "failed") {
         if (status.failureCode === "translation_failed") {
           const analysis = await api.getResult(jobId);
+          if (!isCurrentPoll(jobId, generation)) return;
           setResult(analysis);
           setSection("transcript");
           setPhase("complete");
@@ -171,25 +204,35 @@ export function App({
         setErrorCodeValue(status.failureCode);
         if (contentRef.platform === "youtube") {
           const history = await api.getHistory({ videoId: contentRef.sourceContentId, limit: 1, offset: 0 });
+          if (!isCurrentPoll(jobId, generation)) return;
           if (history.items[0]) {
-            showResult(await api.getResult(history.items[0].jobId));
+            const analysis = await api.getResult(history.items[0].jobId);
+            if (!isCurrentPoll(jobId, generation)) return;
+            showResult(analysis);
             return;
           }
         }
         setPhase("error");
         return;
       }
-      timerRef.current = window.setTimeout(() => void poll(jobId, contentRef, tabId), pollIntervalMs);
+      if (!isCurrentPoll(jobId, generation)) return;
+      timerRef.current = window.setTimeout(
+        () => void poll(jobId, contentRef, tabId, canUploadFromCurrentTab, generation),
+        pollIntervalMs,
+      );
     } catch (requestError) {
+      if (!isCurrentPoll(jobId, generation)) return;
+      uploadStartedJobsRef.current.delete(jobId);
       const code = errorCode(requestError);
       setError(errorMessageForCode(code));
       setErrorCodeValue(code);
       setPhase("error");
     }
-  }, [api, browser, pollIntervalMs, showResult]);
+  }, [api, browser, isCurrentPoll, pollIntervalMs, showResult]);
 
   const prepareVideoChoice = useCallback(async () => {
     stopPolling();
+    const generation = pollGenerationRef.current;
     setPhase("loading");
     setError("");
     setErrorCodeValue(null);
@@ -201,11 +244,13 @@ export function App({
     activeJobRef.current = null;
     try {
       const active = await browser.getActiveContext();
+      if (!isCurrentGeneration(generation)) return;
       activeTabIdRef.current = active.tabId;
       const activeRef = active.contentRef ?? (active.videoId
         ? { platform: "youtube" as const, sourceContentId: active.videoId, mediaIndex: 1 }
         : null);
       const normalized = { ...active, contentRef: activeRef };
+      activeContentRef.current = activeRef;
       setContext(normalized);
       if (!activeRef) {
         const code = isBareXStatusUrl(active.url) ? "x_video_play_required" : null;
@@ -217,8 +262,11 @@ export function App({
       setChoice("current");
       if (active.analysis && analysisMatches(active.analysis, activeRef)) {
         const status = await api.getStatus(active.analysis.jobId);
+        if (!isCurrentGeneration(generation)) return;
         if (status.status === "completed") {
-          showResult(await api.getResult(active.analysis.jobId));
+          const analysis = await api.getResult(active.analysis.jobId);
+          if (!isCurrentGeneration(generation)) return;
+          showResult(analysis);
           return;
         }
         if (status.status !== "failed") {
@@ -226,25 +274,29 @@ export function App({
           setProcessingPlatform(activeRef.platform);
           setPhase("processing");
           activeJobRef.current = active.analysis.jobId;
-          void poll(active.analysis.jobId, activeRef, active.tabId);
+          void poll(active.analysis.jobId, activeRef, active.tabId, true, generation);
           return;
         }
       }
       if (activeRef.platform === "youtube") {
         const history = await api.getHistory({ videoId: activeRef.sourceContentId, limit: 1, offset: 0 });
+        if (!isCurrentGeneration(generation)) return;
         if (history.items[0]) {
-          showResult(await api.getResult(history.items[0].jobId));
+          const analysis = await api.getResult(history.items[0].jobId);
+          if (!isCurrentGeneration(generation)) return;
+          showResult(analysis);
           return;
         }
       }
       setPhase("selecting");
     } catch (requestError) {
+      if (!isCurrentGeneration(generation)) return;
       const code = errorCode(requestError);
       setError(errorMessageForCode(code));
       setErrorCodeValue(code);
       setPhase("error");
     }
-  }, [api, browser, poll, showResult, stopPolling]);
+  }, [api, browser, isCurrentGeneration, poll, showResult, stopPolling]);
 
   useEffect(() => {
     void Promise.all([
@@ -262,10 +314,11 @@ export function App({
         : 0;
       setUploadPercent(percent);
     } else if (message.type === "MEDIA_UPLOAD_FAILED") {
+      uploadStartedJobsRef.current.delete(message.jobId);
+      stopPolling();
       setError(errorMessageForCode(message.code));
       setErrorCodeValue(message.code);
       setPhase("error");
-      stopPolling();
     }
   }), [browser, stopPolling]);
 
@@ -276,6 +329,7 @@ export function App({
       return;
     }
     stopPolling();
+    const generation = pollGenerationRef.current;
     setError("");
     setErrorCodeValue(null);
     setPhase("checking");
@@ -284,11 +338,14 @@ export function App({
       const candidates = context && activeRef?.platform === "x"
         ? await browser.getMediaCandidates(context.tabId, activeRef)
         : [];
+      if (!isCurrentGeneration(generation)) return;
       const inspected = await api.inspect(activeRef?.platform === "x" ? {
         url,
         activeMediaIndex: activeRef.mediaIndex,
+        ...(context?.durationMs != null ? { clientDurationMs: context.durationMs } : {}),
         mediaCandidates: candidates,
       } : url);
+      if (!isCurrentGeneration(generation)) return;
       if (inspected.sourceStatus !== "ready") {
         const code = inspected.sourceStatus === "play_required"
           ? "x_video_play_required"
@@ -304,13 +361,17 @@ export function App({
       setSourceLanguage(inspected.selectedLanguage);
       if (inspected.contentRef.platform === "x") {
         const history = await api.getHistory({ contentId: inspected.contentId, limit: 1, offset: 0 });
+        if (!isCurrentGeneration(generation)) return;
         if (history.items[0]) {
-          showResult(await api.getResult(history.items[0].jobId));
+          const analysis = await api.getResult(history.items[0].jobId);
+          if (!isCurrentGeneration(generation)) return;
+          showResult(analysis);
           return;
         }
       }
       setPhase("ready");
     } catch (requestError) {
+      if (!isCurrentGeneration(generation)) return;
       const code = errorCode(requestError);
       setError(errorMessageForCode(code));
       setErrorCodeValue(code);
@@ -322,42 +383,50 @@ export function App({
     const existing = context?.analysis;
     if (!context?.contentRef || !existing || !analysisMatches(existing, context.contentRef)) return;
     stopPolling();
+    const generation = pollGenerationRef.current;
     setJobStatus("queued");
     setProcessingPlatform(context.contentRef.platform);
     setPhase("processing");
     activeJobRef.current = existing.jobId;
-    void poll(existing.jobId, context.contentRef, context.tabId);
+    void poll(existing.jobId, context.contentRef, context.tabId, true, generation);
   };
 
   const openHistory = async (reset = true) => {
     stopPolling();
+    const generation = pollGenerationRef.current;
     setPhase("history");
     setHistoryLoading(true);
     setHistoryError("");
     const offset = reset ? 0 : historyItems.length;
     try {
       const page = await api.getHistory({ limit: HISTORY_PAGE_SIZE, offset });
+      if (!isCurrentGeneration(generation)) return;
       setHistoryItems((current) => reset ? page.items : [...current, ...page.items]);
       setHistoryHasMore(page.hasMore);
     } catch (requestError) {
+      if (!isCurrentGeneration(generation)) return;
       setHistoryError(errorMessageForCode(errorCode(requestError), "历史记录加载失败，请重试"));
     } finally {
-      setHistoryLoading(false);
+      if (isCurrentGeneration(generation)) setHistoryLoading(false);
     }
   };
 
   const openHistoryResult = async (item: AnalysisHistoryItem) => {
+    stopPolling();
+    const generation = pollGenerationRef.current;
     setHistoryLoading(true);
     setHistoryError("");
     try {
       const analysis = await api.getResult(item.jobId);
+      if (!isCurrentGeneration(generation)) return;
       setSection("overview");
       setQuery("");
       showResult(analysis, true);
     } catch (requestError) {
+      if (!isCurrentGeneration(generation)) return;
       setHistoryError(errorMessageForCode(errorCode(requestError), "这条历史记录暂时无法打开"));
     } finally {
-      setHistoryLoading(false);
+      if (isCurrentGeneration(generation)) setHistoryLoading(false);
     }
   };
 
@@ -369,6 +438,7 @@ export function App({
       return;
     }
     stopPolling();
+    const generation = pollGenerationRef.current;
     setProcessingPlatform(inspection.contentRef.platform);
     setPhase("processing");
     setJobStatus("queued");
@@ -392,18 +462,24 @@ export function App({
         title,
         llmConfig,
       });
+      if (!isCurrentGeneration(generation)) return;
       if (contentRef.platform === "youtube" && contentRef.sourceContentId !== context.videoId) {
         await browser.seek(context.tabId, contentRef, 0);
+        if (!isCurrentGeneration(generation)) return;
       }
       await browser.registerAnalysis(context.tabId, contentRef, created.jobId);
+      if (!isCurrentGeneration(generation)) return;
       activeJobRef.current = created.jobId;
       if (created.status === "completed") {
-        showResult(await api.getResult(created.jobId));
+        const analysis = await api.getResult(created.jobId);
+        if (!isCurrentPoll(created.jobId, generation)) return;
+        showResult(analysis);
         setFailedAnalysis(null);
       } else {
-        void poll(created.jobId, contentRef, context.tabId);
+        void poll(created.jobId, contentRef, context.tabId, true, generation);
       }
     } catch (requestError) {
+      if (!isCurrentGeneration(generation)) return;
       const code = errorCode(requestError);
       setError(errorMessageForCode(code));
       setErrorCodeValue(code);
@@ -420,29 +496,44 @@ export function App({
       return;
     }
     stopPolling();
+    const generation = pollGenerationRef.current;
     setProcessingPlatform(result.contentRef.platform);
     setPhase("processing");
     setJobStatus("queued");
     try {
       const contentRef = result.contentRef;
+      const matchesCurrentTab = Boolean(
+        context.contentRef && sameContentRef(context.contentRef, contentRef),
+      );
+      const currentCandidate = matchesCurrentTab
+        && inspection?.contentRef
+        && sameContentRef(inspection.contentRef, contentRef)
+        ? mediaCandidates[0]
+        : undefined;
       if (contentRef.platform === "youtube" && contentRef.sourceContentId !== context.videoId) {
         await browser.seek(context.tabId, contentRef, 0);
+        if (!isCurrentGeneration(generation)) return;
       }
       const created = await api.createAnalysis({
         ...(contentRef.platform === "youtube"
           ? { videoId: contentRef.sourceContentId }
-          : { contentRef, mediaUrl: mediaCandidates[0]?.url }),
+          : { contentRef, ...(currentCandidate ? { mediaUrl: currentCandidate.url } : {}) }),
         sourceLanguage: result.sourceLanguage,
         targetLanguage: result.targetLanguage,
         title: result.videoTitle,
         llmConfig,
         force: true,
       });
-      await browser.registerAnalysis(context.tabId, contentRef, created.jobId);
+      if (!isCurrentGeneration(generation)) return;
+      if (contentRef.platform === "youtube" || matchesCurrentTab) {
+        await browser.registerAnalysis(context.tabId, contentRef, created.jobId);
+        if (!isCurrentGeneration(generation)) return;
+      }
       activeJobRef.current = created.jobId;
       setResultFromHistory(false);
-      void poll(created.jobId, contentRef, context.tabId);
+      void poll(created.jobId, contentRef, context.tabId, matchesCurrentTab, generation);
     } catch (requestError) {
+      if (!isCurrentGeneration(generation)) return;
       setError(errorMessageForCode(errorCode(requestError)));
       setPhase("error");
     }
@@ -459,29 +550,47 @@ export function App({
       setPhase("settings");
       return;
     }
+    stopPolling();
+    const generation = pollGenerationRef.current;
     setProcessingPlatform(failedAnalysis.contentRef.platform);
     setPhase("processing");
     setJobStatus("queued");
     setErrorCodeValue(null);
     try {
+      const matchesCurrentTab = Boolean(
+        context.contentRef && sameContentRef(context.contentRef, failedAnalysis.contentRef),
+      );
+      const currentCandidate = matchesCurrentTab
+        && inspection?.contentRef
+        && sameContentRef(inspection.contentRef, failedAnalysis.contentRef)
+        ? mediaCandidates[0]
+        : undefined;
       const created = await api.createAnalysis({
         ...(failedAnalysis.contentRef.platform === "youtube"
           ? { videoId: failedAnalysis.contentRef.sourceContentId }
-          : { contentRef: failedAnalysis.contentRef, mediaUrl: mediaCandidates[0]?.url }),
+          : {
+            contentRef: failedAnalysis.contentRef,
+            ...(currentCandidate ? { mediaUrl: currentCandidate.url } : {}),
+          }),
         sourceLanguage: failedAnalysis.sourceLanguage,
         targetLanguage: failedAnalysis.targetLanguage,
         title: failedAnalysis.title,
         llmConfig,
         force: true,
       });
-      await browser.registerAnalysis(
-        context.tabId,
-        failedAnalysis.contentRef,
-        created.jobId,
-      );
+      if (!isCurrentGeneration(generation)) return;
+      if (failedAnalysis.contentRef.platform === "youtube" || matchesCurrentTab) {
+        await browser.registerAnalysis(
+          context.tabId,
+          failedAnalysis.contentRef,
+          created.jobId,
+        );
+        if (!isCurrentGeneration(generation)) return;
+      }
       activeJobRef.current = created.jobId;
-      void poll(created.jobId, failedAnalysis.contentRef, context.tabId);
+      void poll(created.jobId, failedAnalysis.contentRef, context.tabId, matchesCurrentTab, generation);
     } catch (requestError) {
+      if (!isCurrentGeneration(generation)) return;
       const code = errorCode(requestError);
       setError(errorMessageForCode(code));
       setErrorCodeValue(code);
@@ -490,6 +599,7 @@ export function App({
   };
 
   const openSettings = () => {
+    stopPolling();
     setSettingsReturnPhase(phase === "settings" ? "selecting" : phase);
     setSettingsError("");
     setPhase("settings");

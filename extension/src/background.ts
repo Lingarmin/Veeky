@@ -46,6 +46,7 @@ type MediaCaptureState = Record<string, CaptureTabState>;
 interface LastDetectedContent {
   contentRef: ContentRef;
   canonicalStatusId: string;
+  durationMs?: number;
 }
 
 type LastDetectedContentState = Record<string, LastDetectedContent>;
@@ -501,7 +502,13 @@ async function handleMessage(
 
   if (message.type === "X_PLAYER_ACTIVE") {
     const tabId = sender.tab?.id;
-    if (tabId === undefined || !isValidXContentRef(message.contentRef) || !senderMatchesRef(sender, message.contentRef)) {
+    const durationMs = normalizedDurationMs(message.durationMs);
+    if (
+      tabId === undefined
+      || durationMs === null
+      || !isValidXContentRef(message.contentRef)
+      || !senderMatchesRef(sender, message.contentRef)
+    ) {
       return { ok: false };
     }
     const signalAt = Date.now();
@@ -548,6 +555,7 @@ async function handleMessage(
       lastDetectedState[tabKey] = {
         contentRef: message.contentRef,
         canonicalStatusId: message.contentRef.sourceContentId,
+        durationMs,
       };
       state.lastDetectedContentByTab.set(tabId, message.contentRef);
       await chromeApi.storage.session.set({
@@ -566,16 +574,32 @@ async function handleMessage(
       return { ok: false };
     }
     return state.runCaptureTask(async () => {
-      const mediaState = await loadMediaCaptureState(chromeApi);
-      const tabState = mediaState[String(tabId)];
+      const [mediaState, lastDetectedState] = await Promise.all([
+        loadMediaCaptureState(chromeApi),
+        loadLastDetectedContentState(chromeApi),
+      ]);
+      const tabKey = String(tabId);
+      const tabState = mediaState[tabKey];
       if (tabState?.active && sameContentRef(tabState.active.contentRef, message.contentRef)) {
         tabState.active = null;
         tabState.candidates = pruneCandidateMap(tabState.candidates, Date.now());
-        enforceAggregateCandidateLimits(mediaState);
-        await chromeApi.storage.session.set({ [MEDIA_STORAGE_KEY]: mediaState });
-        await scheduleMediaCleanupForState(chromeApi, mediaState);
-        await updatePanelForTab(chromeApi, tabId, sender.url ?? sender.tab?.url);
+        if (Object.keys(tabState.candidates).length === 0) delete mediaState[tabKey];
       }
+      if (
+        lastDetectedState[tabKey]
+        && sameContentRef(lastDetectedState[tabKey].contentRef, message.contentRef)
+      ) delete lastDetectedState[tabKey];
+      const remembered = state.lastDetectedContentByTab.get(tabId);
+      if (remembered && sameContentRef(remembered, message.contentRef)) {
+        state.lastDetectedContentByTab.delete(tabId);
+      }
+      enforceAggregateCandidateLimits(mediaState);
+      await chromeApi.storage.session.set({
+        [MEDIA_STORAGE_KEY]: mediaState,
+        [LAST_DETECTED_STORAGE_KEY]: lastDetectedState,
+      });
+      await scheduleMediaCleanupForState(chromeApi, mediaState);
+      await updatePanelForTab(chromeApi, tabId, sender.url ?? sender.tab?.url);
       return { ok: true };
     });
   }
@@ -648,9 +672,10 @@ async function handleMessage(
   const tabId = tab.id;
   const analyzedTabs = await loadAnalyzedTabs(chromeApi);
   const explicitRef = parseContentRef(tab.url);
-  const rememberedRef = await state.runCaptureTask(
-    () => resolveLastDetectedContent(chromeApi, tabId, tab.url),
+  const remembered = await state.runCaptureTask(
+    () => resolveLastDetectedContext(chromeApi, tabId, tab.url),
   );
+  const rememberedRef = remembered?.contentRef ?? null;
   if (rememberedRef) state.lastDetectedContentByTab.set(tabId, rememberedRef);
   else state.lastDetectedContentByTab.delete(tabId);
   const contentRef = explicitRef ?? rememberedRef;
@@ -659,6 +684,11 @@ async function handleMessage(
     url: tab.url ?? "",
     title: tab.title ?? "YouTube video",
     contentRef,
+    durationMs: contentRef?.platform === "x"
+      && remembered
+      && sameContentRef(remembered.contentRef, contentRef)
+      ? remembered.durationMs ?? null
+      : null,
     videoId: contentRef?.platform === "youtube" ? contentRef.sourceContentId : null,
     analysis: contentRef
       ? analyzedTabs[String(tabId)]?.[contentKey(contentRef)] ?? null
@@ -1400,6 +1430,14 @@ async function resolveLastDetectedContent(
   tabId: number,
   url?: string,
 ): Promise<ContentRef | null> {
+  return (await resolveLastDetectedContext(chromeApi, tabId, url))?.contentRef ?? null;
+}
+
+async function resolveLastDetectedContext(
+  chromeApi: ChromeApi,
+  tabId: number,
+  url?: string,
+): Promise<LastDetectedContent | null> {
   const state = await loadLastDetectedContentState(chromeApi);
   const tabKey = String(tabId);
   const stored = state[tabKey];
@@ -1409,13 +1447,17 @@ async function resolveLastDetectedContent(
     && stored.canonicalStatusId === stored.contentRef.sourceContentId
     && xUrlMatchesRef(url, stored.contentRef)
   ) {
-    return stored.contentRef;
+    return stored;
   }
   if (stored) {
     delete state[tabKey];
     await chromeApi.storage.session.set({ [LAST_DETECTED_STORAGE_KEY]: state });
   }
   return null;
+}
+
+function normalizedDurationMs(value: number): number | null {
+  return Number.isFinite(value) && value >= 0 ? Math.round(value) : null;
 }
 
 async function removeAllTabState(chromeApi: ChromeApi, tabId: number): Promise<void> {

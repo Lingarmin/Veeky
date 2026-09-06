@@ -311,7 +311,7 @@ describe("X active player tracking", () => {
     teardown();
   });
 
-  it("clears the selection on pause and SPA route changes", () => {
+  it("keeps the selection on pause and clears it on SPA route changes", () => {
     window.history.replaceState({}, "", `/owner/status/${STATUS_ID}/video/1`);
     renderStatus();
     const onInactive = vi.fn();
@@ -323,10 +323,8 @@ describe("X active player tracking", () => {
 
     setPlayerState(video, true);
     video.dispatchEvent(new Event("pause"));
-    expect(onInactive).toHaveBeenLastCalledWith(ref);
+    expect(onInactive).not.toHaveBeenCalled();
 
-    setPlayerState(video, false);
-    video.dispatchEvent(new Event("play"));
     window.history.pushState({}, "", "/other/status/2075545587093807333/video/1");
     expect(onInactive).toHaveBeenLastCalledWith(ref);
     teardown();
@@ -577,7 +575,56 @@ describe("X subtitle overlay", () => {
   ];
 
   it("finds the active translated segment with a binary timeline lookup", () => {
+    expect(findActiveSubtitle(0, segments)).toBe("第一句");
+    expect(findActiveSubtitle(999, segments)).toBe("第一句");
+    expect(findActiveSubtitle(1000, segments)).toBe("第二句");
     expect(findActiveSubtitle(1500, segments)).toBe("第二句");
+    expect(findActiveSubtitle(2000, segments)).toBeNull();
+    expect(findActiveSubtitle(2500, [
+      segments[0],
+      { startMs: 3000, durationMs: 1000, translated: "第三句" },
+    ])).toBeNull();
+  });
+
+  it("uses animation frames to follow playback and cancels the loop on destroy", () => {
+    const callbacks = new Map<number, FrameRequestCallback>();
+    let frameId = 0;
+    const request = vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frameId += 1;
+      callbacks.set(frameId, callback);
+      return frameId;
+    });
+    const cancel = vi.spyOn(window, "cancelAnimationFrame").mockImplementation((id) => {
+      callbacks.delete(id);
+    });
+    const runFrame = (id: number, timestamp: number) => {
+      const callback = callbacks.get(id);
+      callbacks.delete(id);
+      callback?.(timestamp);
+    };
+    document.body.innerHTML = '<div data-testid="videoPlayer"><video></video></div>';
+    const video = document.querySelector("video")!;
+    Object.defineProperty(video, "playbackRate", { configurable: true, value: 2 });
+    const overlay = new SubtitleOverlay(document);
+
+    overlay.mount(video, segments);
+    video.currentTime = 0.5;
+    runFrame(1, 16);
+    expect(document.querySelector(".veeky-subtitle-overlay")).toHaveTextContent("第一句");
+
+    video.currentTime = 1.5;
+    runFrame(2, 32);
+    expect(document.querySelector(".veeky-subtitle-overlay")).toHaveTextContent("第二句");
+
+    video.currentTime = 2.5;
+    runFrame(3, 48);
+    expect(document.querySelector(".veeky-subtitle-overlay")).toHaveTextContent("");
+
+    overlay.destroy();
+    expect(cancel).toHaveBeenCalledWith(4);
+    expect(callbacks).toHaveLength(0);
+    request.mockRestore();
+    cancel.mockRestore();
   });
 
   it("updates the mounted overlay from the active video's current time", () => {
@@ -634,7 +681,7 @@ describe("X subtitle overlay", () => {
     teardown();
   });
 
-  it("seeks and plays only the selected X video", () => {
+  it("keeps subtitles and seek capability after the selected X video pauses", () => {
     window.history.replaceState({}, "", `/owner/status/${STATUS_ID}/video/1`);
     renderStatus();
     const listeners: Array<(message: unknown) => void> = [];
@@ -654,11 +701,15 @@ describe("X subtitle overlay", () => {
     });
     const teardown = installContentScript(chromeApi as never);
     video.dispatchEvent(new Event("play"));
+    listeners[0]({ type: "SET_SUBTITLES", contentRef, segments });
+    setPlayerState(video, true);
+    video.dispatchEvent(new Event("pause"));
 
     listeners[0]({ type: "SEEK_CONTENT", contentRef, startMs: 1500 });
 
     expect(video.currentTime).toBe(1.5);
     expect(play).toHaveBeenCalledOnce();
+    expect(document.querySelector(".veeky-subtitle-overlay")).toBeInTheDocument();
     teardown();
   });
 });

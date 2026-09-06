@@ -124,10 +124,17 @@ function createXBrowser() {
       url: "https://x.com/owner/status/2075545587093807111/video/1",
       title: "X video",
       contentRef: xContentRef,
+      durationMs: 30_000,
       videoId: null,
       analysis: null,
     })),
   };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
 }
 
 function xInspection(sourceStatus: "ready" | "play_required" | "media_required" = "ready") {
@@ -216,6 +223,7 @@ describe("Side Panel", () => {
     expect(api.inspect).toHaveBeenCalledWith(expect.objectContaining({
       url: "https://x.com/owner/status/2075545587093807111/video/1",
       activeMediaIndex: 1,
+      clientDurationMs: 30_000,
       mediaCandidates: [xCandidate],
     }));
     expect(await screen.findByText("语音将自动识别")).toBeInTheDocument();
@@ -268,6 +276,162 @@ describe("Side Panel", () => {
 
     api.getStatus.mockResolvedValue({ jobId: "job-x", status: "transcribing", failureCode: null, failureDetail: null });
     await waitFor(() => expect(screen.getByText("正在识别语音")).toBeInTheDocument(), { timeout: 1500 });
+  });
+
+  it("retries START_MEDIA_UPLOAD when the background initially rejects it", async () => {
+    const api = createApi();
+    api.inspect.mockResolvedValueOnce(xInspection());
+    api.createAnalysis.mockResolvedValueOnce({
+      jobId: "job-x", cacheHit: false, status: "queued",
+      contentId: xContentId, contentRef: xContentRef, videoId: null,
+    });
+    api.getStatus.mockResolvedValue({
+      jobId: "job-x", status: "waiting_for_media", failureCode: null, failureDetail: null,
+    });
+    const browser = createXBrowser();
+    browser.startMediaUpload.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    const user = userEvent.setup();
+    render(<App api={api} browser={browser} llmStore={createLlmStore()} pollIntervalMs={1} />);
+
+    await user.click(await screen.findByRole("button", { name: "检查当前视频" }));
+    await user.click(screen.getByRole("button", { name: "分析此视频" }));
+
+    await waitFor(() => expect(browser.startMediaUpload).toHaveBeenCalledTimes(2));
+  });
+
+  it("retries media candidate lookup after no candidate is temporarily available", async () => {
+    const api = createApi();
+    api.inspect.mockResolvedValueOnce(xInspection());
+    api.createAnalysis.mockResolvedValueOnce({
+      jobId: "job-x", cacheHit: false, status: "queued",
+      contentId: xContentId, contentRef: xContentRef, videoId: null,
+    });
+    api.getStatus.mockResolvedValue({
+      jobId: "job-x", status: "waiting_for_media", failureCode: null, failureDetail: null,
+    });
+    const browser = createXBrowser();
+    browser.getMediaCandidates
+      .mockResolvedValueOnce([xCandidate])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([xCandidate]);
+    browser.getActiveContext.mockResolvedValueOnce({
+      tabId: 7,
+      url: "https://x.com/owner/status/2075545587093807111/video/1",
+      title: "X video",
+      contentRef: xContentRef,
+      durationMs: 30_000,
+      videoId: null,
+      analysis: null,
+    }).mockResolvedValueOnce({
+      tabId: 7,
+      url: "https://x.com/owner/status/2075545587093807111/video/1",
+      title: "X video",
+      contentRef: xContentRef,
+      durationMs: 30_000,
+      videoId: null,
+      analysis: { tabId: 7, contentRef: xContentRef, jobId: "job-x" },
+    });
+    const user = userEvent.setup();
+    render(<App api={api} browser={browser} llmStore={createLlmStore()} pollIntervalMs={1} />);
+
+    await user.click(await screen.findByRole("button", { name: "检查当前视频" }));
+    await user.click(screen.getByRole("button", { name: "分析此视频" }));
+    expect(await screen.findByText("未检测到当前视频媒体，请确认视频可以正常播放")).toBeInTheDocument();
+    expect(browser.startMediaUpload).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "重新检查" }));
+
+    await waitFor(() => expect(browser.startMediaUpload).toHaveBeenCalledOnce());
+    expect(browser.getMediaCandidates).toHaveBeenCalledTimes(3);
+  });
+
+  it("retries the same upload after MEDIA_UPLOAD_FAILED", async () => {
+    const api = createApi();
+    api.inspect.mockResolvedValueOnce(xInspection());
+    api.createAnalysis.mockResolvedValueOnce({
+      jobId: "job-x", cacheHit: false, status: "queued",
+      contentId: xContentId, contentRef: xContentRef, videoId: null,
+    });
+    api.getStatus.mockResolvedValue({
+      jobId: "job-x", status: "waiting_for_media", failureCode: null, failureDetail: null,
+    });
+    const browser = createXBrowser();
+    let onUpload: ((message: MediaUploadNotification) => void) | undefined;
+    browser.onMediaUpload.mockImplementation((listener) => { onUpload = listener; return () => undefined; });
+    const user = userEvent.setup();
+    render(<App api={api} browser={browser} llmStore={createLlmStore()} pollIntervalMs={1} />);
+
+    await user.click(await screen.findByRole("button", { name: "检查当前视频" }));
+    await user.click(screen.getByRole("button", { name: "分析此视频" }));
+    await waitFor(() => expect(browser.startMediaUpload).toHaveBeenCalledOnce());
+    onUpload?.({ type: "MEDIA_UPLOAD_FAILED", jobId: "job-x", code: "media_upload_interrupted" });
+    expect(await screen.findByText("视频上传中断，请重新开始")).toBeInTheDocument();
+
+    browser.getActiveContext.mockResolvedValueOnce({
+      ...(await browser.getActiveContext()),
+      analysis: { tabId: 7, contentRef: xContentRef, jobId: "job-x" },
+    });
+    await user.click(screen.getByRole("button", { name: "重新检查" }));
+
+    await waitFor(() => expect(browser.startMediaUpload).toHaveBeenCalledTimes(2));
+  });
+
+  it("ignores a delayed status response after opening history", async () => {
+    const pendingStatus = deferred<Awaited<ReturnType<AnalysisApi["getStatus"]>>>();
+    const api = createApi();
+    api.inspect.mockResolvedValueOnce(xInspection());
+    api.createAnalysis.mockResolvedValueOnce({
+      jobId: "job-x", cacheHit: false, status: "queued",
+      contentId: xContentId, contentRef: xContentRef, videoId: null,
+    });
+    api.getStatus.mockReturnValueOnce(pendingStatus.promise);
+    const browser = createXBrowser();
+    const user = userEvent.setup();
+    render(<App api={api} browser={browser} llmStore={createLlmStore()} pollIntervalMs={1} />);
+
+    await user.click(await screen.findByRole("button", { name: "检查当前视频" }));
+    await user.click(screen.getByRole("button", { name: "分析此视频" }));
+    await waitFor(() => expect(api.getStatus).toHaveBeenCalledWith("job-x"));
+    await user.click(screen.getByRole("button", { name: "历史记录" }));
+    expect(await screen.findByRole("heading", { name: "历史记录" })).toBeInTheDocument();
+
+    pendingStatus.resolve({
+      jobId: "job-x", status: "waiting_for_media", failureCode: null, failureDetail: null,
+    });
+    await Promise.resolve();
+
+    expect(screen.getByRole("heading", { name: "历史记录" })).toBeInTheDocument();
+    expect(browser.startMediaUpload).not.toHaveBeenCalled();
+  });
+
+  it("ignores a delayed candidate response after opening history", async () => {
+    const pendingCandidates = deferred<Array<typeof xCandidate>>();
+    const api = createApi();
+    api.inspect.mockResolvedValueOnce(xInspection());
+    api.createAnalysis.mockResolvedValueOnce({
+      jobId: "job-x", cacheHit: false, status: "queued",
+      contentId: xContentId, contentRef: xContentRef, videoId: null,
+    });
+    api.getStatus.mockResolvedValueOnce({
+      jobId: "job-x", status: "waiting_for_media", failureCode: null, failureDetail: null,
+    });
+    const browser = createXBrowser();
+    browser.getMediaCandidates
+      .mockResolvedValueOnce([xCandidate])
+      .mockReturnValueOnce(pendingCandidates.promise);
+    const user = userEvent.setup();
+    render(<App api={api} browser={browser} llmStore={createLlmStore()} pollIntervalMs={1} />);
+
+    await user.click(await screen.findByRole("button", { name: "检查当前视频" }));
+    await user.click(screen.getByRole("button", { name: "分析此视频" }));
+    await waitFor(() => expect(browser.getMediaCandidates).toHaveBeenCalledTimes(2));
+    await user.click(screen.getByRole("button", { name: "历史记录" }));
+
+    pendingCandidates.resolve([xCandidate]);
+    await Promise.resolve();
+
+    expect(await screen.findByRole("heading", { name: "历史记录" })).toBeInTheDocument();
+    expect(browser.startMediaUpload).not.toHaveBeenCalled();
   });
 
   it("reuses a completed X history result and sends translated subtitles", async () => {
@@ -329,6 +493,49 @@ describe("Side Panel", () => {
       force: true,
     }));
     expect(browser.registerAnalysis).toHaveBeenCalledWith(7, xContentRef, "job-1");
+  });
+
+  it("does not use current video A media while reanalyzing historical video B", async () => {
+    const historicalRef = { ...xContentRef, sourceContentId: "2075545587093807222" };
+    const api = createApi();
+    const historicalResult = {
+      ...(await api.getResult("fixture")),
+      jobId: "job-b-history",
+      contentId: "66666666-6666-4666-8666-666666666666",
+      contentRef: historicalRef,
+      videoId: null,
+      videoTitle: "Historical X video B",
+      sourceLanguage: "auto",
+    };
+    api.inspect.mockResolvedValueOnce(xInspection());
+    api.getHistory
+      .mockResolvedValueOnce({ items: [], hasMore: false })
+      .mockResolvedValueOnce({
+        items: [{ ...historyItem, ...historicalResult, completedAt: "2026-09-05T09:40:00Z" }],
+        hasMore: false,
+      });
+    api.getResult.mockResolvedValueOnce(historicalResult);
+    api.createAnalysis.mockResolvedValueOnce({
+      jobId: "job-b", cacheHit: false, status: "queued",
+      contentId: historicalResult.contentId, contentRef: historicalRef, videoId: null,
+    });
+    api.getStatus.mockResolvedValueOnce({
+      jobId: "job-b", status: "waiting_for_media", failureCode: null, failureDetail: null,
+    });
+    const browser = createXBrowser();
+    const user = userEvent.setup();
+    render(<App api={api} browser={browser} llmStore={createLlmStore()} pollIntervalMs={1} />);
+
+    await user.click(await screen.findByRole("button", { name: "检查当前视频" }));
+    expect(await screen.findByText("当前 X 视频")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "历史记录" }));
+    await user.click(await screen.findByRole("button", { name: "打开 Historical X video B" }));
+    await user.click(await screen.findByRole("button", { name: "重新分析" }));
+
+    expect(api.createAnalysis).toHaveBeenCalledWith(expect.not.objectContaining({ mediaUrl: xCandidate.url }));
+    expect(browser.getMediaCandidates).toHaveBeenCalledTimes(1);
+    expect(browser.registerAnalysis).not.toHaveBeenCalledWith(7, historicalRef, "job-b");
+    expect(await screen.findByText("请先打开并播放要重新分析的 X 视频，然后重试")).toBeInTheDocument();
   });
   it("accepts content references in the analysis API contract", async () => {
     const api = createApi();
