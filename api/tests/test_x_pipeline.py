@@ -18,6 +18,7 @@ from app.db.models import (
     AnalysisJob,
     Base,
     Installation,
+    MediaUploadPart,
     MediaUploadSession,
     TranscriptTrack,
     Video,
@@ -373,6 +374,72 @@ async def test_completed_owned_upload_resumes_waiting_job_once(x_context):
 
 
 @pytest.mark.asyncio
+async def test_completed_hls_upload_reconstructs_and_muxes_separate_tracks(x_context):
+    factory, _, _, media_root = x_context
+    payload = b"videoaudio"
+    upload_dir = media_root / "33333333-3333-4333-8333-333333333333"
+    upload_dir.mkdir()
+    (upload_dir / "part-00000000.bin").write_bytes(payload)
+    observed_tracks = []
+
+    class MuxingExtractor(FakeAudioExtractor):
+        async def mux_tracks(self, video_path, audio_path, destination):
+            observed_tracks.append((video_path.read_bytes(), audio_path.read_bytes()))
+            destination.write_bytes(b"muxed-media")
+            return destination
+
+    async with factory() as session:
+        job = await session.get(AnalysisJob, "job-x")
+        job.status = "waiting_for_media"
+        job.media_url_ciphertext = None
+        upload = MediaUploadSession(
+            id="upload-hls",
+            installation_id=INSTALLATION_ID,
+            content_id=job.content_id,
+            status="complete",
+            expected_bytes=len(payload),
+            received_bytes=len(payload),
+            media_kind="hls",
+            part_count=1,
+            part_size_bytes=len(payload),
+            hls_manifest={
+                "parts": [0],
+                "tracks": [
+                    {
+                        "kind": "video",
+                        "resources": [{"offset": 0, "length": 5}],
+                    },
+                    {
+                        "kind": "audio",
+                        "resources": [{"offset": 5, "length": 5}],
+                    },
+                ],
+            },
+            directory_key=upload_dir.name,
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        upload.parts.append(
+            MediaUploadPart(
+                part_number=0,
+                byte_size=len(payload),
+                sha256=hashlib.sha256(payload).hexdigest(),
+            )
+        )
+        job.media_session_id = upload.id
+        session.add(upload)
+        await session.commit()
+
+    await make_pipeline(x_context, extractor=MuxingExtractor()).run(
+        "job-x", resume=True
+    )
+
+    assert observed_tracks == [(b"video", b"audio")]
+    async with factory() as session:
+        job = await session.get(AnalysisJob, "job-x")
+        assert job.status == "completed"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("dependency", "error", "code"),
     [
@@ -384,7 +451,17 @@ async def test_completed_owned_upload_resumes_waiting_job_once(x_context):
         (
             "transcriber",
             AsrError("asr_transcription_failed", "bad asr"),
-            "asr_transcription_failed",
+            "asr_failed",
+        ),
+        (
+            "transcriber",
+            AsrError("asr_invalid_language", "bad language"),
+            "asr_failed",
+        ),
+        (
+            "transcriber",
+            AsrError("asr_resource_exhausted", "out of memory"),
+            "asr_resource_exhausted",
         ),
     ],
 )
@@ -649,7 +726,10 @@ async def test_ffmpeg_extractor_probes_exact_four_hours_and_extracts_pcm(tmp_pat
             (),
             {
                 "returncode": 0,
-                "stdout": '{"format":{"duration":"14400.000"}}',
+                "stdout": (
+                    '{"format":{"duration":"14400.000","format_name":"mov,mp4"},'
+                    '"streams":[{"codec_type":"video"},{"codec_type":"audio"}]}'
+                ),
                 "stderr": "",
             },
         )()
@@ -683,7 +763,10 @@ async def test_ffmpeg_extractor_preserves_sub_millisecond_duration_precision(tmp
             (),
             {
                 "returncode": 0,
-                "stdout": '{"format":{"duration":"14400.0004"}}',
+                "stdout": (
+                    '{"format":{"duration":"14400.0004","format_name":"mov,mp4"},'
+                    '"streams":[{"codec_type":"video"},{"codec_type":"audio"}]}'
+                ),
                 "stderr": "",
             },
         )()
@@ -695,6 +778,81 @@ async def test_ffmpeg_extractor_preserves_sub_millisecond_duration_precision(tmp
     assert await extractor.probe_duration_ms(media_path) == pytest.approx(
         14_400_000.4, rel=0, abs=1e-6
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "expected_code"),
+    [
+        (
+            '{"format":{"duration":"2","format_name":"avi"},'
+            '"streams":[{"codec_type":"video"},{"codec_type":"audio"}]}',
+            "unsupported_media_container",
+        ),
+        (
+            '{"format":{"duration":"2","format_name":"mov,mp4,m4a,3gp,3g2,mj2"},'
+            '"streams":[{"codec_type":"audio"}]}',
+            "video_track_missing",
+        ),
+        (
+            '{"format":{"duration":"2","format_name":"mov,mp4,m4a,3gp,3g2,mj2"},'
+            '"streams":[{"codec_type":"video"}]}',
+            "audio_track_missing",
+        ),
+    ],
+)
+async def test_ffprobe_rejects_unsupported_container_or_missing_tracks(
+    tmp_path, payload, expected_code
+):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    media_path = media_root / "input.bin"
+    media_path.write_bytes(b"media")
+
+    async def runner(*_arguments):
+        return type(
+            "Result", (), {"returncode": 0, "stdout": payload, "stderr": ""}
+        )()
+
+    extractor = FFmpegAudioExtractor(
+        str(media_root), timeout_seconds=10, max_bytes=100, runner=runner
+    )
+
+    with pytest.raises(AudioExtractionError) as raised:
+        await extractor.probe_duration_ms(media_path)
+
+    assert raised.value.code == expected_code
+
+
+@pytest.mark.asyncio
+async def test_ffmpeg_muxes_separate_hls_tracks_into_an_explicit_mp4_container(
+    tmp_path,
+):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    video_path = media_root / "video-track"
+    audio_path = media_root / "audio-track"
+    destination = media_root / "media.bin"
+    video_path.write_bytes(b"video")
+    audio_path.write_bytes(b"audio")
+    calls = []
+
+    async def runner(*arguments):
+        calls.append(arguments)
+        Path(arguments[-1]).write_bytes(b"muxed")
+        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    extractor = FFmpegAudioExtractor(
+        str(media_root), timeout_seconds=10, max_bytes=100, runner=runner
+    )
+
+    assert await extractor.mux_tracks(video_path, audio_path, destination) == destination
+    assert destination.read_bytes() == b"muxed"
+    first_map = calls[0].index("-map")
+    assert calls[0][first_map : first_map + 2] == ("-map", "0:v:0")
+    second_map = calls[0].index("-map", calls[0].index("-map") + 1)
+    assert calls[0][second_map : second_map + 2] == ("-map", "1:a:0")
+    assert ("-f", "mp4") == calls[0][calls[0].index("-f") : calls[0].index("-f") + 2]
 
 
 @pytest.mark.asyncio
@@ -806,7 +964,10 @@ async def test_ffmpeg_accepts_audio_shorter_than_container_by_over_100ms(tmp_pat
         payload = (
             '{"streams":[{"duration":"1.800"}]}'
             if "-select_streams" in arguments
-            else '{"format":{"duration":"2.000"}}'
+            else (
+                '{"format":{"duration":"2.000","format_name":"mov,mp4"},'
+                '"streams":[{"codec_type":"video"},{"codec_type":"audio"}]}'
+            )
         )
         return type(
             "Result", (), {"returncode": 0, "stdout": payload, "stderr": ""}

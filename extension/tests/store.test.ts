@@ -21,6 +21,7 @@ describe("side panel helpers", () => {
     expect(errorMessageForCode("llm_quota_exhausted")).toBe("LLM 账户余额不足，请充值或更换 API Key/服务商");
     expect(errorMessageForCode("llm_invalid_response")).toBe("LLM 返回格式无效，请检查模型名称和 Chat Completions 地址");
     expect(errorMessageForCode("video_too_long")).toBe("此视频时长过长，无法分析。");
+    expect(errorMessageForCode("media_too_long")).toBe("此视频时长过长，无法分析。");
     expect(errorMessageForCode("analysis_concurrency_limit")).toBe("已有视频正在分析，请等待完成后再试。");
     expect(errorMessageForCode("rate_limit_exceeded")).toBe("操作过于频繁，请稍后再试。");
     expect(errorMessageForCode("llm_credentials_expired")).toBe("任务凭据已过期，请点击重试。");

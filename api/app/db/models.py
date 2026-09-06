@@ -372,7 +372,7 @@ class MediaUploadSession(Base):
     media_kind: Mapped[str] = mapped_column(String(10))
     part_count: Mapped[int] = mapped_column(Integer)
     part_size_bytes: Mapped[int] = mapped_column(BigInteger)
-    hls_manifest: Mapped[dict[str, list[int]] | None] = mapped_column(
+    hls_manifest: Mapped[dict[str, Any] | None] = mapped_column(
         JSON, nullable=True
     )
     directory_key: Mapped[str] = mapped_column(String(36), unique=True)

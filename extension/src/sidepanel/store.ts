@@ -35,6 +35,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   translation_segment_too_large: "字幕段落过长，无法提交给 LLM 翻译",
   analysis_invalid_response: "LLM 摘要返回格式无效，请检查模型是否支持 JSON 输出",
   video_too_long: "此视频时长过长，无法分析。",
+  media_too_long: "此视频时长过长，无法分析。",
   video_metadata_unavailable: "暂时无法读取视频时长，请稍后再试。",
   analysis_concurrency_limit: "已有视频正在分析，请等待完成后再试。",
   rate_limit_exceeded: "操作过于频繁，请稍后再试。",
@@ -48,6 +49,8 @@ const ERROR_MESSAGES: Record<string, string> = {
   media_too_large: "视频文件过大，无法分析",
   media_upload_interrupted: "视频上传中断，请重新开始",
   audio_track_missing: "视频中没有可识别的音轨",
+  video_track_missing: "视频中没有可识别的画面",
+  unsupported_media_container: "暂不支持此视频格式",
   asr_resource_exhausted: "当前设备资源不足，请稍后重试",
   asr_failed: "语音识别失败，请重新分析",
 };

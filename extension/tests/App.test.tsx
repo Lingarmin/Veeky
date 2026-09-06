@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { App } from "../src/sidepanel/App";
 import type { AnalysisApi } from "../src/sidepanel/api";
 import { browserBridge, type BrowserBridge } from "../src/sidepanel/browser";
-import type { MediaUploadNotification } from "../src/shared/types";
+import type { MediaCandidate, MediaUploadNotification } from "../src/shared/types";
 
 const youtubeContentId = "33333333-3333-4333-8333-333333333333";
 const youtubeContentRef = {
@@ -109,7 +109,7 @@ function createBrowser() {
     })),
     registerAnalysis: vi.fn<BrowserBridge["registerAnalysis"]>(async () => undefined),
     seek: vi.fn<BrowserBridge["seek"]>(async () => undefined),
-    getMediaCandidates: vi.fn(async () => [xCandidate]),
+    getMediaCandidates: vi.fn<BrowserBridge["getMediaCandidates"]>(async () => [xCandidate]),
     startMediaUpload: vi.fn(async () => true),
     showSubtitles: vi.fn(async () => undefined),
     onMediaUpload: vi.fn<BrowserBridge["onMediaUpload"]>(() => () => undefined),
@@ -169,6 +169,15 @@ function xInspection(sourceStatus: "ready" | "play_required" | "media_required" 
   };
 }
 
+function mockAutomaticThenManualInspection(
+  api: ReturnType<typeof createApi>,
+  manualInspection = xInspection(),
+) {
+  api.inspect
+    .mockResolvedValueOnce(xInspection("media_required"))
+    .mockResolvedValueOnce(manualInspection);
+}
+
 const historyItem = {
   jobId: "job-history",
   contentId: youtubeContentId,
@@ -203,6 +212,7 @@ describe("Side Panel", () => {
 
   it("asks for playback on a bare X status before a player is selected", async () => {
     const browser = createXBrowser();
+    const api = createApi();
     browser.getActiveContext.mockResolvedValueOnce({
       tabId: 7,
       url: "https://x.com/owner/status/2075545587093807111",
@@ -212,14 +222,50 @@ describe("Side Panel", () => {
       analysis: null,
     });
 
-    render(<App api={createApi()} browser={browser} llmStore={createLlmStore()} pollIntervalMs={1} />);
+    render(<App api={api} browser={browser} llmStore={createLlmStore()} pollIntervalMs={1} />);
 
     expect(await screen.findByText("请先播放当前视频 1 至 2 秒，再重试")).toBeInTheDocument();
+    expect(api.inspect).not.toHaveBeenCalled();
+    expect(api.getHistory).not.toHaveBeenCalled();
+  });
+
+  it("automatically restores completed X history for the active player", async () => {
+    const api = createApi();
+    const browser = createXBrowser();
+    const xResult = {
+      ...(await api.getResult("fixture")),
+      jobId: "job-x-history",
+      contentId: xContentId,
+      contentRef: xContentRef,
+      videoId: null,
+      videoTitle: "X video",
+      sourceLanguage: "en",
+    };
+    api.inspect.mockResolvedValueOnce(xInspection("media_required"));
+    api.getHistory.mockResolvedValueOnce({
+      items: [{ ...historyItem, ...xResult, completedAt: "2026-09-05T09:40:00Z" }],
+      hasMore: false,
+    });
+    api.getResult.mockResolvedValueOnce(xResult);
+
+    render(<App api={api} browser={browser} llmStore={createLlmStore()} pollIntervalMs={1} />);
+
+    expect(await screen.findByText("X video")).toBeInTheDocument();
+    expect(api.inspect).toHaveBeenCalledWith(expect.objectContaining({
+      url: "https://x.com/owner/status/2075545587093807111/video/1",
+      activeMediaIndex: 1,
+      clientDurationMs: 30_000,
+    }));
+    expect(api.getHistory).toHaveBeenCalledWith({ contentId: xContentId, limit: 1, offset: 0 });
+    expect(api.createAnalysis).not.toHaveBeenCalled();
+    expect(browser.showSubtitles).toHaveBeenCalledWith(7, xContentRef, [
+      expect.objectContaining({ translated: "像素" }),
+    ]);
   });
 
   it("asks the user to play an X video when inspection requires playback", async () => {
     const api = createApi();
-    api.inspect.mockResolvedValueOnce(xInspection("play_required"));
+    mockAutomaticThenManualInspection(api, xInspection("play_required"));
     const user = userEvent.setup();
     render(<App api={api} browser={createXBrowser()} llmStore={createLlmStore()} pollIntervalMs={1} />);
 
@@ -231,7 +277,7 @@ describe("Side Panel", () => {
 
   it("shows a ready X inspection with automatic speech recognition", async () => {
     const api = createApi();
-    api.inspect.mockResolvedValueOnce(xInspection());
+    mockAutomaticThenManualInspection(api);
     const browser = createXBrowser();
     const user = userEvent.setup();
     render(<App api={api} browser={browser} llmStore={createLlmStore()} pollIntervalMs={1} />);
@@ -250,7 +296,7 @@ describe("Side Panel", () => {
 
   it("uploads the selected X media after polling reaches waiting_for_media", async () => {
     const api = createApi();
-    api.inspect.mockResolvedValueOnce(xInspection());
+    mockAutomaticThenManualInspection(api);
     api.createAnalysis.mockResolvedValueOnce({
       jobId: "job-x", cacheHit: false, status: "queued",
       contentId: xContentId, contentRef: xContentRef, videoId: null,
@@ -268,13 +314,44 @@ describe("Side Panel", () => {
     expect(await screen.findByText("正在获取 X 视频")).toBeInTheDocument();
     expect(browser.registerAnalysis).toHaveBeenCalledWith(7, xContentRef, "job-x");
     expect(browser.startMediaUpload).toHaveBeenCalledWith({
-      tabId: 7, jobId: "job-x", contentRef: xContentRef, candidate: xCandidate,
+      tabId: 7, jobId: "job-x", contentRef: xContentRef, candidates: [xCandidate],
     });
+  });
+
+  it("passes every ordered X media candidate to the upload fallback", async () => {
+    const api = createApi();
+    mockAutomaticThenManualInspection(api);
+    api.createAnalysis.mockResolvedValueOnce({
+      jobId: "job-x", cacheHit: false, status: "queued",
+      contentId: xContentId, contentRef: xContentRef, videoId: null,
+    });
+    api.getStatus.mockResolvedValue({
+      jobId: "job-x", status: "waiting_for_media", failureCode: null, failureDetail: null,
+    });
+    const browser = createXBrowser();
+    const hlsCandidate = {
+      url: "https://video.twimg.com/amplify_video/123/pl/master_playlist.m3u8",
+      kind: "hls" as const,
+      capturedAt: xCandidate.capturedAt - 1,
+    };
+    browser.getMediaCandidates.mockResolvedValue([xCandidate, hlsCandidate] satisfies MediaCandidate[]);
+    const user = userEvent.setup();
+    render(<App api={api} browser={browser} llmStore={createLlmStore()} pollIntervalMs={1000} />);
+
+    await user.click(await screen.findByRole("button", { name: "检查当前视频" }));
+    await user.click(screen.getByRole("button", { name: "分析此视频" }));
+
+    await waitFor(() => expect(browser.startMediaUpload).toHaveBeenCalledWith({
+      tabId: 7,
+      jobId: "job-x",
+      contentRef: xContentRef,
+      candidates: [xCandidate, hlsCandidate],
+    }));
   });
 
   it("renders X upload progress and transcription status", async () => {
     const api = createApi();
-    api.inspect.mockResolvedValueOnce(xInspection());
+    mockAutomaticThenManualInspection(api);
     api.createAnalysis.mockResolvedValueOnce({
       jobId: "job-x", cacheHit: false, status: "queued",
       contentId: xContentId, contentRef: xContentRef, videoId: null,
@@ -298,7 +375,7 @@ describe("Side Panel", () => {
 
   it("retries START_MEDIA_UPLOAD when the background initially rejects it", async () => {
     const api = createApi();
-    api.inspect.mockResolvedValueOnce(xInspection());
+    mockAutomaticThenManualInspection(api);
     api.createAnalysis.mockResolvedValueOnce({
       jobId: "job-x", cacheHit: false, status: "queued",
       contentId: xContentId, contentRef: xContentRef, videoId: null,
@@ -319,7 +396,7 @@ describe("Side Panel", () => {
 
   it("retries media candidate lookup after no candidate is temporarily available", async () => {
     const api = createApi();
-    api.inspect.mockResolvedValueOnce(xInspection());
+    mockAutomaticThenManualInspection(api);
     api.createAnalysis.mockResolvedValueOnce({
       jobId: "job-x", cacheHit: false, status: "queued",
       contentId: xContentId, contentRef: xContentRef, videoId: null,
@@ -329,6 +406,7 @@ describe("Side Panel", () => {
     });
     const browser = createXBrowser();
     browser.getMediaCandidates
+      .mockResolvedValueOnce([xCandidate])
       .mockResolvedValueOnce([xCandidate])
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([xCandidate]);
@@ -360,12 +438,12 @@ describe("Side Panel", () => {
     await user.click(screen.getByRole("button", { name: "重新检查" }));
 
     await waitFor(() => expect(browser.startMediaUpload).toHaveBeenCalledOnce());
-    expect(browser.getMediaCandidates).toHaveBeenCalledTimes(3);
+    expect(browser.getMediaCandidates).toHaveBeenCalledTimes(4);
   });
 
   it("retries the same upload after MEDIA_UPLOAD_FAILED", async () => {
     const api = createApi();
-    api.inspect.mockResolvedValueOnce(xInspection());
+    mockAutomaticThenManualInspection(api);
     api.createAnalysis.mockResolvedValueOnce({
       jobId: "job-x", cacheHit: false, status: "queued",
       contentId: xContentId, contentRef: xContentRef, videoId: null,
@@ -397,7 +475,7 @@ describe("Side Panel", () => {
   it("ignores a delayed status response after opening history", async () => {
     const pendingStatus = deferred<Awaited<ReturnType<AnalysisApi["getStatus"]>>>();
     const api = createApi();
-    api.inspect.mockResolvedValueOnce(xInspection());
+    mockAutomaticThenManualInspection(api);
     api.createAnalysis.mockResolvedValueOnce({
       jobId: "job-x", cacheHit: false, status: "queued",
       contentId: xContentId, contentRef: xContentRef, videoId: null,
@@ -425,7 +503,7 @@ describe("Side Panel", () => {
   it("ignores a delayed candidate response after opening history", async () => {
     const pendingCandidates = deferred<Array<typeof xCandidate>>();
     const api = createApi();
-    api.inspect.mockResolvedValueOnce(xInspection());
+    mockAutomaticThenManualInspection(api);
     api.createAnalysis.mockResolvedValueOnce({
       jobId: "job-x", cacheHit: false, status: "queued",
       contentId: xContentId, contentRef: xContentRef, videoId: null,
@@ -436,13 +514,14 @@ describe("Side Panel", () => {
     const browser = createXBrowser();
     browser.getMediaCandidates
       .mockResolvedValueOnce([xCandidate])
+      .mockResolvedValueOnce([xCandidate])
       .mockReturnValueOnce(pendingCandidates.promise);
     const user = userEvent.setup();
     render(<App api={api} browser={browser} llmStore={createLlmStore()} pollIntervalMs={1} />);
 
     await user.click(await screen.findByRole("button", { name: "检查当前视频" }));
     await user.click(screen.getByRole("button", { name: "分析此视频" }));
-    await waitFor(() => expect(browser.getMediaCandidates).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(browser.getMediaCandidates).toHaveBeenCalledTimes(3));
     await user.click(screen.getByRole("button", { name: "历史记录" }));
 
     pendingCandidates.resolve([xCandidate]);
@@ -463,7 +542,7 @@ describe("Side Panel", () => {
       videoTitle: "X video",
       sourceLanguage: "auto",
     };
-    api.inspect.mockResolvedValueOnce(xInspection());
+    api.inspect.mockResolvedValueOnce(xInspection("media_required"));
     api.getHistory.mockResolvedValueOnce({
       items: [{ ...historyItem, ...xResult, completedAt: "2026-09-05T09:40:00Z" }],
       hasMore: false,
@@ -472,8 +551,6 @@ describe("Side Panel", () => {
     const browser = createXBrowser();
     const user = userEvent.setup();
     render(<App api={api} browser={browser} llmStore={createLlmStore()} pollIntervalMs={1} />);
-
-    await user.click(await screen.findByRole("button", { name: "检查当前视频" }));
 
     expect(await screen.findByText("视频解释神经网络如何识别手写数字。")).toBeInTheDocument();
     expect(api.createAnalysis).not.toHaveBeenCalled();
@@ -525,8 +602,9 @@ describe("Side Panel", () => {
       videoTitle: "Historical X video B",
       sourceLanguage: "auto",
     };
-    api.inspect.mockResolvedValueOnce(xInspection());
+    mockAutomaticThenManualInspection(api);
     api.getHistory
+      .mockResolvedValueOnce({ items: [], hasMore: false })
       .mockResolvedValueOnce({ items: [], hasMore: false })
       .mockResolvedValueOnce({
         items: [{ ...historyItem, ...historicalResult, completedAt: "2026-09-05T09:40:00Z" }],
@@ -544,7 +622,7 @@ describe("Side Panel", () => {
     await user.click(await screen.findByRole("button", { name: "重新分析" }));
 
     expect(api.createAnalysis).not.toHaveBeenCalled();
-    expect(browser.getMediaCandidates).toHaveBeenCalledTimes(1);
+    expect(browser.getMediaCandidates).toHaveBeenCalledTimes(2);
     expect(browser.registerAnalysis).not.toHaveBeenCalled();
     expect(api.getStatus).not.toHaveBeenCalled();
     expect(await screen.findByText("请先打开并播放要重新分析的 X 视频，然后重试")).toBeInTheDocument();

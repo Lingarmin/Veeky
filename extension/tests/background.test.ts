@@ -226,6 +226,42 @@ describe("background tab isolation", () => {
     expect(chrome.runtime.sendMessage).not.toHaveBeenCalledWith(upload);
   });
 
+  it("authorizes and forwards the complete ordered candidate queue", async () => {
+    const contentRef = {
+      platform: "x" as const,
+      sourceContentId: "2075545587093807111",
+      mediaIndex: 1,
+    };
+    const candidates: MediaCandidate[] = [
+      { url: "https://video.twimg.com/file.mp4", kind: "mp4", capturedAt: Date.now() },
+      { url: "https://video.twimg.com/master.m3u8", kind: "hls", capturedAt: Date.now() - 1 },
+    ];
+    const key = contentKey(contentRef);
+    const chrome = createChrome({
+      analyzedTabs: { "7": { [key]: { tabId: 7, contentRef, jobId: "job-queue" } } },
+      xMediaCapture: { "7": { active: null, candidates: { [key]: candidates } } },
+    });
+    const port = createPort("veeky-offscreen-media", {
+      id: "extension-id",
+      url: "chrome-extension://extension-id/offscreen.html",
+    });
+    installBackgroundHandlers(chrome as never, { identityStore: pendingIdentityStore() });
+    chrome.events.connect.listeners[0](port);
+    const upload = {
+      type: "START_MEDIA_UPLOAD" as const,
+      tabId: 7,
+      jobId: "job-queue",
+      contentRef,
+      candidates,
+    };
+
+    expect(await dispatchMessage(chrome, upload, {
+      id: "extension-id",
+      url: "chrome-extension://extension-id/sidepanel.html",
+    })).toEqual({ ok: true });
+    expect(port.postMessage).toHaveBeenCalledWith(upload);
+  });
+
   it("rejects in-flight and completed upload replays", async () => {
     const contentRef = {
       platform: "x" as const,
@@ -1636,7 +1672,8 @@ describe("X media candidate capture", () => {
 
   it.each([
     ["http://video.twimg.com/path/file.mp4", "media"],
-    ["https://video.twimg.com:444/path/file.mp4", "media"],
+      ["https://video.twimg.com:443/path/file.mp4", "media"],
+      ["https://video.twimg.com:444/path/file.mp4", "media"],
     ["https://user@video.twimg.com/path/file.mp4", "media"],
     ["https://video.twimg.com/path/file.mp4#fragment", "media"],
     ["https://video.twimg.com.evil.example/path/file.mp4", "media"],

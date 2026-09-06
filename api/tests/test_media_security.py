@@ -48,6 +48,7 @@ def streaming_response(content: bytes) -> httpx.Response:
     "url",
     [
         "http://video.twimg.com/file.mp4",
+        "https://video.twimg.com:443/file.mp4",
         "https://video.twimg.com:444/file.mp4",
         "https://user@video.twimg.com/file.mp4",
         "https://user:password@video.twimg.com/file.mp4",
@@ -65,7 +66,6 @@ async def test_x_media_url_rejects_invalid_url_shapes(url: str):
     "url",
     [
         "https://video.twimg.com/file.mp4",
-        "https://video.twimg.com:443/path/file.mp4?tag=1",
         "https://VIDEO.TWIMG.COM/file.mp4",
     ],
 )

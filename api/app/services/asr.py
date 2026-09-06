@@ -155,6 +155,9 @@ class FasterWhisperTranscriber:
                 str(audio_path), **_transcribe_options(self.vad_filter)
             )
             segments = normalize_whisper_segments(raw_segments)
+        except MemoryError:
+            logger.error("ASR transcription exhausted available memory")
+            raise AsrError("asr_resource_exhausted", "语音识别资源不足") from None
         except Exception:
             logger.error("ASR transcription failed")
             raise AsrError("asr_transcription_failed", "语音识别失败") from None

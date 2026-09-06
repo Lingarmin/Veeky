@@ -50,7 +50,8 @@ export interface StartMediaUploadMessage {
   tabId: number;
   jobId: string;
   contentRef: ContentRef;
-  candidate: MediaCandidate;
+  candidate?: MediaCandidate;
+  candidates?: MediaCandidate[];
 }
 
 export interface MediaUploadProgressMessage {

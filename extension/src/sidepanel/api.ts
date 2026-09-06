@@ -88,7 +88,13 @@ export interface MediaSessionCompleteInput {
   kind: "mp4" | "hls";
   partCount: number;
   totalBytes: number;
-  manifest?: { parts: number[] };
+  manifest?: {
+    parts: number[];
+    tracks?: Array<{
+      kind: "video" | "audio";
+      resources: Array<{ offset: number; length: number }>;
+    }>;
+  };
 }
 
 export interface MediaUploadApi {

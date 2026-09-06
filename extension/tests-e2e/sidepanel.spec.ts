@@ -379,3 +379,123 @@ test("renders translated subtitles as an X video advances", async () => {
     rmSync(profilePath, { recursive: true, force: true });
   }
 });
+
+test("restores X history and renders its translated subtitles automatically", async () => {
+  const extensionPath = resolve(process.cwd(), "dist");
+  const executablePath = process.env.PLAYWRIGHT_CHROMIUM_PATH
+    ?? chromium.executablePath();
+  test.skip(
+    !existsSync(executablePath),
+    "Install Playwright Chromium or set PLAYWRIGHT_CHROMIUM_PATH",
+  );
+  const profilePath = mkdtempSync(join(tmpdir(), "veeky-x-history-"));
+  const context = await chromium.launchPersistentContext(profilePath, {
+    executablePath,
+    headless: true,
+    args: [
+      `--disable-extensions-except=${extensionPath}`,
+      `--load-extension=${extensionPath}`,
+    ],
+  });
+
+  const contentRef = {
+    platform: "x" as const,
+    sourceContentId: "2075545587093807111",
+    mediaIndex: 1,
+  };
+  const contentId = "33333333-3333-4333-8333-333333333333";
+  const result = {
+    jobId: "job-x-history",
+    contentId,
+    contentRef,
+    videoId: null,
+    videoTitle: "X video history",
+    durationMs: 10_000,
+    sourceLanguage: "en",
+    targetLanguage: "zh-Hans",
+    isGenerated: true,
+    oneLineSummary: "已经恢复的 X 视频摘要。",
+    summaryPoints: ["历史记录无需重新分析"],
+    chapters: [],
+    highlights: [],
+    transcript: [{
+      id: "segment-1",
+      startMs: 1000,
+      durationMs: 2000,
+      original: "Restored subtitle",
+      translated: "自动恢复的字幕",
+    }],
+    partial: false,
+    failureCode: null,
+    modelName: "kimi-k2.5",
+    modelVersion: "v1",
+  };
+
+  try {
+    await context.route("http://127.0.0.1:8000/v1/videos/inspect", (route) => route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        contentId,
+        contentRef,
+        videoId: null,
+        durationMs: 10_000,
+        sourceStatus: "media_required",
+        transcriptSource: "faster_whisper",
+        availableLanguages: [],
+        tracks: [],
+        selectedLanguage: "auto",
+      }),
+    }));
+    await context.route("http://127.0.0.1:8000/v1/analyses/history**", (route) => route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [{
+          ...result,
+          completedAt: "2026-09-05T09:40:00Z",
+        }],
+        hasMore: false,
+      }),
+    }));
+    await context.route("http://127.0.0.1:8000/v1/analyses/job-x-history/result", (route) => route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(result),
+    }));
+
+    let worker = context.serviceWorkers()[0];
+    if (!worker) worker = await context.waitForEvent("serviceworker");
+    const extensionId = new URL(worker.url()).host;
+    const xPage = await context.newPage();
+    await xPage.route("**/*", (route) => route.fulfill({
+      contentType: "text/html",
+      body: `
+        <title>X video history</title>
+        <article>
+          <a href="/viktoroddy/status/2075545587093807111/video/1">
+            <div data-testid="videoPlayer"><video></video></div>
+          </a>
+        </article>
+      `,
+    }));
+    const xUrl = "https://x.com/viktoroddy/status/2075545587093807111/video/1";
+    await xPage.goto(xUrl);
+    await xPage.locator("video").evaluate((video) => {
+      Object.defineProperty(video, "duration", { configurable: true, value: 10 });
+      video.dispatchEvent(new Event("play"));
+    });
+
+    const extensionPage = await context.newPage();
+    await extensionPage.goto(`chrome-extension://${extensionId}/sidepanel.html`);
+    await xPage.bringToFront();
+    await extensionPage.reload();
+    await expect(extensionPage.getByText("已经恢复的 X 视频摘要。")).toBeVisible();
+
+    await xPage.locator("video").evaluate((video) => {
+      (video as HTMLVideoElement).currentTime = 1.5;
+      video.dispatchEvent(new Event("timeupdate"));
+    });
+    await expect(xPage.locator(".veeky-subtitle-overlay")).toHaveText("自动恢复的字幕");
+  } finally {
+    await context.close();
+    rmSync(profilePath, { recursive: true, force: true });
+  }
+});

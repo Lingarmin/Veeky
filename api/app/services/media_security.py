@@ -45,7 +45,7 @@ async def validate_x_media_url(
     if (
         parsed.scheme != "https"
         or parsed.hostname != "video.twimg.com"
-        or port not in (None, 443)
+        or port is not None
         or username is not None
         or password is not None
         or parsed.fragment

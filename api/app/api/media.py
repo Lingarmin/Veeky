@@ -68,6 +68,21 @@ class HlsManifestRequest(ApiModel):
     parts: list[Annotated[int, Field(strict=True, ge=0)]] = Field(
         max_length=MAX_PART_COUNT
     )
+    tracks: list["HlsTrackRequest"] | None = Field(default=None, max_length=2)
+
+
+class HlsResourceRequest(ApiModel):
+    model_config = ConfigDict(**ApiModel.model_config, extra="forbid")
+
+    offset: int = Field(strict=True, ge=0)
+    length: int = Field(strict=True, gt=0)
+
+
+class HlsTrackRequest(ApiModel):
+    model_config = ConfigDict(**ApiModel.model_config, extra="forbid")
+
+    kind: Literal["video", "audio"]
+    resources: list[HlsResourceRequest] = Field(min_length=1, max_length=MAX_PART_COUNT)
 
 
 class MediaSessionCompleteRequest(ApiModel):

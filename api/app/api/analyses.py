@@ -449,6 +449,7 @@ async def inspect_video(
     request: InspectRequest,
     session: AsyncSession = Depends(get_session),
     source_registry: SourceRegistry = Depends(get_source_registry),
+    settings: Settings = Depends(get_settings),
     _: Installation = Depends(require_installation),
     __: None = Depends(enforce_write_quota),
 ) -> InspectResponse:
@@ -461,6 +462,14 @@ async def inspect_video(
     except SourceRegistryConfigurationError as error:
         raise _source_adapter_unavailable() from error
     _validate_content_ref(ref)
+    if (
+        ref.platform == "x"
+        and request.client_duration_ms is not None
+        and request.client_duration_ms > settings.max_video_duration_seconds * 1000
+    ):
+        raise _api_error(
+            422, "media_too_long", "此视频时长过长，无法分析。"
+        )
     adapter = _source_adapter(source_registry, ref.platform)
     if ref.platform == "x" and isinstance(adapter, XAdapter):
         inspection = await adapter.inspect_media(ref, request.media_candidates)
@@ -1235,6 +1244,7 @@ def _validate_direct_media_url(url: str) -> None:
     if (
         parsed.scheme != "https"
         or parsed.hostname != "video.twimg.com"
+        or parsed.port is not None
         or parsed.username is not None
         or parsed.password is not None
         or parsed.fragment

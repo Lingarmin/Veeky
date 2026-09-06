@@ -205,11 +205,10 @@ export function App({
         if (!uploadStartedJobsRef.current.has(jobId)) {
           const candidates = await browser.getMediaCandidates(tabId, contentRef);
           if (!isCurrentPoll(jobId, generation)) return;
-          const candidate = candidates[0];
-          if (!candidate) {
+          if (!candidates.length) {
             throw Object.assign(new Error("No current X media candidate"), { code: "x_media_not_detected" });
           }
-          const started = await browser.startMediaUpload({ tabId, jobId, contentRef, candidate });
+          const started = await browser.startMediaUpload({ tabId, jobId, contentRef, candidates });
           if (!isCurrentPoll(jobId, generation)) return;
           if (started) uploadStartedJobsRef.current.add(jobId);
         }
@@ -318,6 +317,24 @@ export function App({
       }
       if (activeRef.platform === "youtube") {
         const history = await api.getHistory({ videoId: activeRef.sourceContentId, limit: 1, offset: 0 });
+        if (!isCurrentGeneration(generation)) return;
+        if (history.items[0]) {
+          const analysis = await api.getResult(history.items[0].jobId);
+          if (!isCurrentGeneration(generation)) return;
+          showResult(analysis);
+          return;
+        }
+      } else {
+        const candidates = await browser.getMediaCandidates(active.tabId, activeRef);
+        if (!isCurrentGeneration(generation)) return;
+        const inspected = await api.inspect({
+          url: active.url,
+          activeMediaIndex: activeRef.mediaIndex,
+          ...(active.durationMs != null ? { clientDurationMs: active.durationMs } : {}),
+          mediaCandidates: candidates,
+        });
+        if (!isCurrentGeneration(generation)) return;
+        const history = await api.getHistory({ contentId: inspected.contentId, limit: 1, offset: 0 });
         if (!isCurrentGeneration(generation)) return;
         if (history.items[0]) {
           const analysis = await api.getResult(history.items[0].jobId);

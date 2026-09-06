@@ -472,6 +472,17 @@ def test_transcription_error_is_mapped_without_logging_secrets(
     assert "https://media.invalid" not in formatted
 
 
+def test_transcription_memory_exhaustion_has_a_stable_public_code(tmp_path: Path):
+    model = FakeWhisperModel(error=MemoryError("private allocation details"))
+    transcriber = FasterWhisperTranscriber(factory=FakeWhisperFactory(model))
+
+    with pytest.raises(AsrError) as exc_info:
+        transcriber.transcribe(tmp_path / "audio.wav")
+
+    assert exc_info.value.code == "asr_resource_exhausted"
+    assert str(exc_info.value) == "语音识别资源不足"
+
+
 def test_detected_language_is_canonicalized_to_lowercase(tmp_path: Path):
     model = FakeWhisperModel(
         [raw_segment(0.0, 1.0, "speech")], language="ZH-Hant"

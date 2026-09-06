@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import subprocess
@@ -1063,6 +1064,45 @@ async def test_hls_manifest_can_only_reference_uploaded_numeric_parts(media_cont
         upload = await session.get(MediaUploadSession, session_id)
         manifest_path = media_root / upload.directory_key / "manifest.json"
         assert manifest_path.read_text() == '{"parts":[0,1]}'
+
+
+@pytest.mark.asyncio
+async def test_hls_manifest_preserves_separate_track_resource_order(media_context):
+    client, _, factory, media_root = media_context
+    session_id = (
+        await create_session(client, kind="hls", expected_bytes=8, part_count=1)
+    ).json()["sessionId"]
+    await upload_part(client, session_id, 0, bytes(range(1, 9)))
+    manifest = {
+        "parts": [0],
+        "tracks": [
+            {
+                "kind": "video",
+                "resources": [
+                    {"offset": 0, "length": 2},
+                    {"offset": 2, "length": 3},
+                ],
+            },
+            {
+                "kind": "audio",
+                "resources": [
+                    {"offset": 5, "length": 1},
+                    {"offset": 6, "length": 2},
+                ],
+            },
+        ],
+    }
+
+    completed = await client.post(
+        f"/v1/media-sessions/{session_id}/complete",
+        json={"partCount": 1, "totalBytes": 8, "manifest": manifest},
+    )
+
+    assert completed.status_code == 200
+    async with factory() as session:
+        upload = await session.get(MediaUploadSession, session_id)
+        manifest_path = media_root / upload.directory_key / "manifest.json"
+        assert json.loads(manifest_path.read_text()) == manifest
 
 
 @pytest.mark.asyncio

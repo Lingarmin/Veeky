@@ -88,8 +88,12 @@ export async function uploadMediaCandidate(
     maxPlaylistBytes: DEFAULT_MAX_PLAYLIST_BYTES,
   };
   const timeouts = dependencies.timeouts ?? defaultUploadTimeouts();
-  const mediaUrl = safeMediaUrl(message.candidate.url);
-  if (message.candidate.kind !== "mp4" && message.candidate.kind !== "hls") {
+  const candidate = message.candidate ?? message.candidates?.[0];
+  if (!candidate) {
+    throw new UploadError("unsupported_media_candidate", "No media candidate was provided");
+  }
+  const mediaUrl = safeMediaUrl(candidate.url);
+  if (candidate.kind !== "mp4" && candidate.kind !== "hls") {
     throw new UploadError("unsupported_media_candidate", "The selected media is not an MP4 or HLS playlist");
   }
 
@@ -101,7 +105,7 @@ export async function uploadMediaCandidate(
     throw new UploadError("content_mismatch", "The media does not match the selected X video");
   }
 
-  if (message.candidate.kind === "mp4") {
+  if (candidate.kind === "mp4") {
     return uploadMp4(
       message.jobId,
       inspection.contentId,
@@ -230,7 +234,7 @@ async function uploadHls(
 ): Promise<string> {
   const master = await fetchText(fetchMedia, playlistUrl, limits.maxPlaylistBytes, timeouts, signal);
   validatePlaylistReferences(master.body, master.url);
-  validateSupportedPlaylist(master.body);
+  validateSupportedPlaylist(master.body, true);
   const variants = parseVariants(master.body, master.url);
   let mediaPlaylistUrl = master.url;
   let mediaPlaylist = master.body;
@@ -249,6 +253,44 @@ async function uploadHls(
     validateSupportedPlaylist(mediaPlaylist);
     if (parseVariants(mediaPlaylist, mediaPlaylistUrl).length > 0) {
       throw new UploadError("unsupported_hls_playlist", "Nested HLS master playlists are not supported");
+    }
+    if (selected.audioGroup) {
+      const audioRendition = selectAudioRendition(master.body, master.url, selected.audioGroup);
+      const audio = await fetchText(fetchMedia, audioRendition, limits.maxPlaylistBytes, timeouts, signal);
+      validatePlaylistReferences(audio.body, audio.url);
+      validateSupportedPlaylist(audio.body);
+      if (parseVariants(audio.body, audio.url).length > 0) {
+        throw new UploadError("unsupported_hls_playlist", "Nested HLS master playlists are not supported");
+      }
+      validateFinishedMediaPlaylist(audio.body);
+      const tracks = [
+        { kind: "video" as const, urls: parseMediaResources(mediaPlaylist, mediaPlaylistUrl) },
+        { kind: "audio" as const, urls: parseMediaResources(audio.body, audio.url) },
+      ];
+      const manifestTracks: Array<{
+        kind: "video" | "audio";
+        resources: Array<{ offset: number; length: number }>;
+      }> = tracks.map(({ kind }) => ({ kind, resources: [] }));
+      let offset = 0;
+      return spoolAndUpload(
+        jobId,
+        contentId,
+        "hls",
+        hlsTrackChunks(tracks, fetchMedia, timeouts, (trackIndex, length) => {
+          manifestTracks[trackIndex].resources.push({ offset, length });
+          offset += length;
+        }, signal),
+        api,
+        reportProgress,
+        reportSessionCreated,
+        createPartSpool,
+        limits.maxMediaBytes,
+        signal,
+        (partCount) => ({
+          parts: Array.from({ length: partCount }, (_, index) => index),
+          tracks: manifestTracks,
+        }),
+      );
     }
   }
   validateFinishedMediaPlaylist(mediaPlaylist);
@@ -279,6 +321,7 @@ async function spoolAndUpload(
   createPartSpool: () => Promise<MediaPartSpool>,
   maxMediaBytes: number,
   signal?: AbortSignal,
+  manifestFactory?: (partCount: number) => NonNullable<Parameters<MediaUploadApi["completeMediaSession"]>[1]["manifest"]>,
 ): Promise<string> {
   const spool = await waitForAbort(createPartSpool(), signal);
   let sessionId: string | null = null;
@@ -321,7 +364,9 @@ async function spoolAndUpload(
         partCount,
         totalBytes,
         ...(kind === "hls" ? {
-          manifest: { parts: Array.from({ length: partCount }, (_, index) => index) },
+          manifest: manifestFactory
+            ? manifestFactory(partCount)
+            : { parts: Array.from({ length: partCount }, (_, index) => index) },
         } : {}),
       });
       completed = true;
@@ -552,6 +597,27 @@ async function* hlsChunks(
   }
 }
 
+async function* hlsTrackChunks(
+  tracks: Array<{ kind: "video" | "audio"; urls: URL[] }>,
+  fetchMedia: FetchMedia,
+  timeouts: UploadTimeouts,
+  recordLength: (trackIndex: number, length: number) => void,
+  signal?: AbortSignal,
+): AsyncGenerator<Uint8Array> {
+  for (let trackIndex = 0; trackIndex < tracks.length; trackIndex += 1) {
+    for (const url of tracks[trackIndex].urls) {
+      let length = 0;
+      const fetched = await fetchWithBrowserCredentials(fetchMedia, url, timeouts.mediaFetchMs, signal);
+      for await (const chunk of responseChunks(fetched, timeouts.streamStallMs)) {
+        length += chunk.byteLength;
+        yield chunk;
+      }
+      if (length <= 0) throw new UploadError("empty_media", "An HLS resource is empty");
+      recordLength(trackIndex, length);
+    }
+  }
+}
+
 async function* fixedSizeParts(
   response: MediaResponse,
   partSize: number,
@@ -642,7 +708,7 @@ function validatePlaylistReferences(playlist: string, baseUrl: URL): void {
   }
 }
 
-function validateSupportedPlaylist(playlist: string): void {
+function validateSupportedPlaylist(playlist: string, allowAudioRenditions = false): void {
   const lines = playlist.split(/\r?\n/).map((line) => line.trim().toUpperCase());
   if (lines.filter((line) => line.startsWith("#EXT-X-MAP:")).length > 1) {
     throw new UploadError("unsupported_hls_playlist", "Multiple HLS init-map transitions are not supported");
@@ -659,11 +725,18 @@ function validateSupportedPlaylist(playlist: string): void {
     "#EXT-X-GAP",
     "#EXT-X-I-FRAMES-ONLY",
     "#EXT-X-I-FRAME-STREAM-INF:",
-    "#EXT-X-MEDIA:",
     "#EXT-X-CONTENT-STEERING:",
     "#EXT-X-DEFINE:",
   ];
   for (const line of lines) {
+    if (line.startsWith("#EXT-X-MEDIA:")) {
+      const type = new Map(
+        parseAttributeList(line.slice(line.indexOf(":") + 1)),
+      ).get("TYPE");
+      if (!allowAudioRenditions || type !== "AUDIO") {
+        throw new UploadError("unsupported_hls_playlist", "Only audio HLS renditions are supported");
+      }
+    }
     if (unsupportedTags.some((tag) => line.startsWith(tag))) {
       throw new UploadError("unsupported_hls_playlist", "The HLS playlist requires unsupported assembly features");
     }
@@ -726,9 +799,10 @@ function parseVariants(playlist: string, baseUrl: URL): Array<{
   url: URL;
   bandwidth: number;
   height: number;
+  audioGroup: string | null;
 }> {
   const lines = playlist.split(/\r?\n/).map((line) => line.trim());
-  const variants: Array<{ url: URL; bandwidth: number; height: number }> = [];
+  const variants: Array<{ url: URL; bandwidth: number; height: number; audioGroup: string | null }> = [];
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
     if (!line.toUpperCase().startsWith("#EXT-X-STREAM-INF:")) continue;
@@ -759,9 +833,33 @@ function parseVariants(playlist: string, baseUrl: URL): Array<{
     if (!uri) {
       throw new UploadError("unsupported_hls_playlist", "Every HLS master variant needs a media playlist URI");
     }
-    variants.push({ url: resolveMediaUrl(uri, baseUrl), bandwidth, height });
+    variants.push({
+      url: resolveMediaUrl(uri, baseUrl),
+      bandwidth,
+      height,
+      audioGroup: parsedAttributes.get("AUDIO") ?? null,
+    });
   }
   return variants;
+}
+
+function selectAudioRendition(playlist: string, baseUrl: URL, groupId: string): URL {
+  const renditions = playlist.split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.toUpperCase().startsWith("#EXT-X-MEDIA:"))
+    .map((line) => new Map(parseAttributeList(line.slice(line.indexOf(":") + 1))))
+    .filter((attributes) => (
+      attributes.get("TYPE")?.toUpperCase() === "AUDIO"
+      && attributes.get("GROUP-ID") === groupId
+    ));
+  const selected = renditions.find((attributes) => attributes.get("DEFAULT")?.toUpperCase() === "YES")
+    ?? renditions.find((attributes) => attributes.get("AUTOSELECT")?.toUpperCase() === "YES")
+    ?? renditions[0];
+  const uri = selected?.get("URI");
+  if (!uri) {
+    throw new UploadError("unsupported_hls_playlist", "The selected HLS audio group has no usable rendition URI");
+  }
+  return resolveMediaUrl(uri, baseUrl);
 }
 
 function parseMediaResources(playlist: string, baseUrl: URL): URL[] {
@@ -795,6 +893,9 @@ function resolveMediaUrl(reference: string, baseUrl: URL): URL {
 }
 
 function safeMediaUrl(value: string): URL {
+  if (/^https:\/\/[^/?#]*:\d+(?:[/?#]|$)/i.test(value)) {
+    throw new UploadError("invalid_media_url", "Media URLs must not specify a port");
+  }
   let url: URL;
   try {
     url = new URL(value);
@@ -1023,21 +1124,33 @@ export function installOffscreenHandlers(
       dependencies.timeouts.configMs,
       new UploadError("media_api_config_timeout", "The media API configuration did not arrive"),
     );
-    void waitForAbort(Promise.all([cleanup, configuredApi]), controller.signal).then(([, api]) => uploadMediaCandidate(message, {
-      ...dependencies,
-      api,
-      signal: controller.signal,
-      reportSessionCreated: async (jobId, session) => {
-        activeSession = {
-          type: "MEDIA_SESSION_CREATED",
-          jobId,
-          mediaSessionId: session.sessionId,
-          contentId: session.contentId,
-          contentRef: message.contentRef,
-        };
-        safePost(activeSession);
-      },
-    }))
+    void waitForAbort(Promise.all([cleanup, configuredApi]), controller.signal).then(async ([, api]) => {
+      const candidates = (message.candidates ?? (message.candidate ? [message.candidate] : [])).slice(0, 5);
+      let lastError: unknown;
+      for (const candidate of candidates) {
+        try {
+          return await uploadMediaCandidate({ ...message, candidate, candidates: undefined }, {
+            ...dependencies,
+            api,
+            signal: controller.signal,
+            reportSessionCreated: async (jobId, session) => {
+              activeSession = {
+                type: "MEDIA_SESSION_CREATED",
+                jobId,
+                mediaSessionId: session.sessionId,
+                contentId: session.contentId,
+                contentRef: message.contentRef,
+              };
+              safePost(activeSession);
+            },
+          });
+        } catch (error) {
+          lastError = error;
+          activeSession = null;
+        }
+      }
+      throw lastError ?? new UploadError("unsupported_media_candidate", "No media candidate was provided");
+    })
       .then(
         (mediaSessionId) => {
           pendingProgress = null;
@@ -1079,8 +1192,10 @@ function isStartMediaUploadMessage(message: unknown): message is StartMediaUploa
     && typeof candidate.jobId === "string"
     && typeof candidate.contentRef === "object"
     && candidate.contentRef !== null
-    && typeof candidate.candidate === "object"
-    && candidate.candidate !== null;
+    && (
+      (typeof candidate.candidate === "object" && candidate.candidate !== null)
+      || (Array.isArray(candidate.candidates) && candidate.candidates.length > 0)
+    );
 }
 
 function isMediaUploadConfigMessage(message: unknown): message is MediaUploadConfigMessage {

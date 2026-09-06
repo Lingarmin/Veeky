@@ -625,8 +625,68 @@ describe("offscreen X media upload", () => {
     });
   });
 
+  it("uploads separate HLS video and default audio renditions in manifest order", async () => {
+    const masterUrl = "https://video.twimg.com/path/master.m3u8";
+    const videoUrl = "https://video.twimg.com/path/video/playlist.m3u8";
+    const audioUrl = "https://video.twimg.com/path/audio/en/playlist.m3u8";
+    const resources = new Map<string, Response>([
+      [masterUrl, textResponse([
+        "#EXTM3U",
+        "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud-1\",NAME=\"English\",DEFAULT=YES,AUTOSELECT=YES,LANGUAGE=\"en\",URI=\"audio/en/playlist.m3u8\"",
+        "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud-1\",NAME=\"Spanish\",DEFAULT=NO,AUTOSELECT=YES,LANGUAGE=\"es\",URI=\"audio/es/playlist.m3u8\"",
+        "#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080,AUDIO=\"aud-1\"",
+        "video/playlist.m3u8",
+      ].join("\n"), masterUrl)],
+      [videoUrl, textResponse([
+        "#EXTM3U", "#EXT-X-MAP:URI=\"video-init.mp4\"", "#EXTINF:2.0,", "video-1.m4s", "#EXT-X-ENDLIST",
+      ].join("\n"), videoUrl)],
+      [audioUrl, textResponse([
+        "#EXTM3U", "#EXT-X-MAP:URI=\"audio-init.mp4\"", "#EXTINF:2.0,", "audio-1.m4s", "#EXT-X-ENDLIST",
+      ].join("\n"), audioUrl)],
+      ["https://video.twimg.com/path/video/video-init.mp4", responseFromChunks([new Uint8Array([1, 2])])],
+      ["https://video.twimg.com/path/video/video-1.m4s", responseFromChunks([new Uint8Array([3, 4, 5])])],
+      ["https://video.twimg.com/path/audio/en/audio-init.mp4", responseFromChunks([new Uint8Array([6])])],
+      ["https://video.twimg.com/path/audio/en/audio-1.m4s", responseFromChunks([new Uint8Array([7, 8])])],
+    ]);
+    const fetchMedia = vi.fn(async (url: RequestInfo | URL) => {
+      const response = resources.get(String(url));
+      if (!response) throw new Error(`unexpected fetch ${String(url)}`);
+      return response;
+    });
+    const api = createApi();
+
+    await uploadMediaCandidate({
+      type: "START_MEDIA_UPLOAD", tabId: 7, jobId: "job-split-hls", contentRef,
+      candidate: { url: masterUrl, kind: "hls", capturedAt: 1 },
+    }, { fetchMedia, api, reportProgress: async () => undefined, createPartSpool: async () => createSpool() });
+
+    expect(fetchMedia.mock.calls.map(([url]) => String(url))).toEqual([
+      masterUrl,
+      videoUrl,
+      audioUrl,
+      "https://video.twimg.com/path/video/video-init.mp4",
+      "https://video.twimg.com/path/video/video-1.m4s",
+      "https://video.twimg.com/path/audio/en/audio-init.mp4",
+      "https://video.twimg.com/path/audio/en/audio-1.m4s",
+    ]);
+    expect(Array.from(vi.mocked(api.uploadPart).mock.calls[0][2])).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(api.completeMediaSession).toHaveBeenCalledWith("session-1", {
+      kind: "hls",
+      partCount: 1,
+      totalBytes: 8,
+      manifest: {
+        parts: [0],
+        tracks: [
+          { kind: "video", resources: [{ offset: 0, length: 2 }, { offset: 2, length: 3 }] },
+          { kind: "audio", resources: [{ offset: 5, length: 1 }, { offset: 6, length: 2 }] },
+        ],
+      },
+    });
+  });
+
   it.each([
     "http://video.twimg.com/path/master.m3u8",
+    "https://video.twimg.com:443/path/master.m3u8",
     "https://example.com/path/master.m3u8",
   ])("rejects an unsafe HLS playlist URL: %s", async (url) => {
     await expect(uploadMediaCandidate({
@@ -641,6 +701,38 @@ describe("offscreen X media upload", () => {
       reportProgress: async () => undefined,
       createPartSpool: async () => createSpool(),
     })).rejects.toMatchObject({ code: "invalid_media_url" });
+  });
+
+  it("rejects non-audio HLS rendition declarations", async () => {
+    const playlistUrl = "https://video.twimg.com/path/master.m3u8";
+    const mediaPlaylistUrl = "https://video.twimg.com/path/video.m3u8";
+    await expect(uploadMediaCandidate({
+      type: "START_MEDIA_UPLOAD",
+      tabId: 7,
+      jobId: "job-unsupported-rendition",
+      contentRef,
+      candidate: { url: playlistUrl, kind: "hls", capturedAt: 1 },
+    }, {
+      fetchMedia: vi.fn(async (url) => {
+        if (String(url) === playlistUrl) {
+          return textResponse([
+            "#EXTM3U",
+            "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"English\",URI=\"subs.m3u8\"",
+            "#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080",
+            "video.m3u8",
+          ].join("\n"), playlistUrl);
+        }
+        if (String(url) === mediaPlaylistUrl) {
+          return textResponse([
+            "#EXTM3U", "#EXTINF:2.0,", "segment.m4s", "#EXT-X-ENDLIST",
+          ].join("\n"), mediaPlaylistUrl);
+        }
+        return responseFromChunks([new Uint8Array([1])], {}, String(url));
+      }),
+      api: createApi(),
+      reportProgress: async () => undefined,
+      createPartSpool: async () => createSpool(),
+    })).rejects.toMatchObject({ code: "unsupported_hls_playlist" });
   });
 
   it("rejects HLS references outside video.twimg.com", async () => {
@@ -1021,6 +1113,43 @@ describe("offscreen message handling", () => {
       contentId: "33333333-3333-4333-8333-333333333333",
       contentRef,
     });
+  });
+
+  it("tries the next bounded candidate after an expired candidate fails", async () => {
+    const port = createRuntimePort();
+    const fetchMedia = vi.fn(async (url: RequestInfo | URL) => {
+      if (String(url).includes("expired")) return new Response(null, { status: 403 });
+      return responseFromChunks([new Uint8Array([9])], { "Content-Length": "1" });
+    });
+    const api = createApi();
+    installOffscreenHandlers(port as never, {
+      fetchMedia,
+      api,
+      reportProgress: async () => undefined,
+    });
+
+    port.dispatch({
+      type: "START_MEDIA_UPLOAD",
+      tabId: 7,
+      jobId: "job-fallback",
+      contentRef,
+      candidates: [
+        { url: "https://video.twimg.com/expired.mp4", kind: "mp4", capturedAt: 2 },
+        { url: "https://video.twimg.com/working.mp4", kind: "mp4", capturedAt: 1 },
+      ],
+    });
+
+    await vi.waitFor(() => expect(port.postMessage).toHaveBeenCalledWith({
+      type: "MEDIA_UPLOAD_COMPLETE",
+      jobId: "job-fallback",
+      mediaSessionId: "session-1",
+    }));
+    expect(fetchMedia.mock.calls.map(([url]) => String(url))).toEqual([
+      "https://video.twimg.com/expired.mp4",
+      "https://video.twimg.com/working.mp4",
+    ]);
+    expect(api.createMediaSession).toHaveBeenCalledOnce();
+    expect(api.cancelMediaSession).not.toHaveBeenCalled();
   });
 
   it("continues uploading when progress cannot cross a disconnected Port and replays the latest value", async () => {

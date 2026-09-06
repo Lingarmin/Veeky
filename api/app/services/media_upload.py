@@ -409,7 +409,9 @@ async def complete_upload(
                     locked.parts,
                 )
         else:
-            canonical_manifest = _validate_hls_manifest(manifest, locked.part_count)
+            canonical_manifest = _validate_hls_manifest(
+                manifest, locked.part_count, locked.expected_bytes
+            )
             await _to_thread_uninterruptibly(
                 _verify_parts_sync, directory, locked.parts
             )
@@ -1108,9 +1110,13 @@ def _validate_declaration(
 
 
 def _validate_hls_manifest(
-    manifest: dict[str, Any] | None, part_count: int
-) -> dict[str, list[int]]:
-    if not isinstance(manifest, dict) or set(manifest) != {"parts"}:
+    manifest: dict[str, Any] | None, part_count: int, total_bytes: int
+) -> dict[str, Any]:
+    if (
+        not isinstance(manifest, dict)
+        or not set(manifest).issubset({"parts", "tracks"})
+        or "parts" not in manifest
+    ):
         raise _error(422, "invalid_hls_manifest", "HLS manifest must contain parts")
     parts = manifest["parts"]
     if (
@@ -1124,7 +1130,55 @@ def _validate_hls_manifest(
             "invalid_hls_manifest",
             "HLS manifest parts must be all uploaded numeric part IDs in order",
         )
-    return {"parts": parts}
+    if manifest.get("tracks") is None:
+        return {"parts": parts}
+    tracks = manifest["tracks"]
+    if (
+        not isinstance(tracks, list)
+        or len(tracks) != 2
+        or {track.get("kind") for track in tracks if isinstance(track, dict)}
+        != {"video", "audio"}
+    ):
+        raise _error(
+            422,
+            "invalid_hls_manifest",
+            "HLS manifest must contain one video track and one audio track",
+        )
+    expected_offset = 0
+    canonical_tracks = []
+    for track in tracks:
+        resources = track.get("resources") if isinstance(track, dict) else None
+        if not isinstance(resources, list) or not resources:
+            raise _error(422, "invalid_hls_manifest", "HLS tracks need resources")
+        canonical_resources = []
+        for resource in resources:
+            if (
+                not isinstance(resource, dict)
+                or set(resource) != {"offset", "length"}
+                or type(resource["offset"]) is not int
+                or type(resource["length"]) is not int
+                or resource["offset"] != expected_offset
+                or resource["length"] <= 0
+            ):
+                raise _error(
+                    422,
+                    "invalid_hls_manifest",
+                    "HLS resource ranges must cover uploaded bytes in order",
+                )
+            canonical_resources.append(
+                {"offset": resource["offset"], "length": resource["length"]}
+            )
+            expected_offset += resource["length"]
+        canonical_tracks.append(
+            {"kind": track["kind"], "resources": canonical_resources}
+        )
+    if expected_offset != total_bytes:
+        raise _error(
+            422,
+            "invalid_hls_manifest",
+            "HLS resource ranges must cover uploaded bytes in order",
+        )
+    return {"parts": parts, "tracks": canonical_tracks}
 
 
 def _artifact(upload: MediaUploadSession, path: Path) -> MediaArtifact:

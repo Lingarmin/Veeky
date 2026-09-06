@@ -582,6 +582,47 @@ async def test_x_provisional_duration_cannot_overwrite_existing_content(api_cont
 
 
 @pytest.mark.asyncio
+async def test_x_inspect_rejects_client_duration_over_four_hours_before_source_or_storage(
+    api_context,
+):
+    client, app, factory, _ = api_context
+
+    class UnexpectedXInspection(FakeXAdapter):
+        async def inspect_media(self, ref, media_candidates):
+            raise AssertionError("over-limit X media must not be inspected")
+
+    app.dependency_overrides[get_source_registry] = lambda: SourceRegistry(
+        [UnexpectedXInspection()]
+    )
+
+    response = await client.post(
+        "/v1/videos/inspect",
+        json={
+            "url": "https://x.com/viktoroddy/status/2075545587093807111/video/1",
+            "clientDurationMs": 14_400_001,
+            "mediaCandidates": [{
+                "url": "https://video.twimg.com/file.mp4",
+                "kind": "mp4",
+                "capturedAt": 1,
+            }],
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "code": "media_too_long",
+        "message": "此视频时长过长，无法分析。",
+    }
+    async with factory() as session:
+        assert await session.scalar(
+            select(Video).where(
+                Video.platform == "x",
+                Video.source_content_id == "2075545587093807111",
+            )
+        ) is None
+
+
+@pytest.mark.asyncio
 async def test_inspect_stores_only_canonical_source_url(api_context):
     client, app, factory, _ = api_context
     app.dependency_overrides[get_source_registry] = lambda: SourceRegistry(
@@ -1589,6 +1630,35 @@ async def test_x_create_uses_pending_identity_and_encrypts_direct_media_url(
         assert media_url not in job.media_url_ciphertext
         assert job.force_run is False
     assert dispatched == [job_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("port", [443, 444])
+async def test_x_create_rejects_direct_media_urls_with_explicit_ports(
+    api_context, port
+):
+    client, app, _, dispatched = api_context
+    app.dependency_overrides[get_source_registry] = lambda: SourceRegistry(
+        [FakeXAdapter()]
+    )
+
+    response = await client.post(
+        "/v1/analyses",
+        json={
+            "contentRef": {
+                "platform": "x",
+                "sourceContentId": "2075545587093807111",
+                "mediaIndex": 1,
+            },
+            "targetLanguage": "zh-Hans",
+            "mediaUrl": f"https://video.twimg.com:{port}/file.mp4",
+            "llmConfig": LLM_CONFIG,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "invalid_media_url"
+    assert dispatched == []
 
 
 async def _store_history_job(

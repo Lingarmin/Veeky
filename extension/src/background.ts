@@ -24,6 +24,7 @@ const MEDIA_UPLOAD_JOBS_KEY = "mediaUploadJobs";
 const ACTIVE_MEDIA_SESSION_KEY = "activeMediaUploadSession";
 const LAST_DETECTED_STORAGE_KEY = "xLastDetectedContent";
 const MEDIA_CLEANUP_ALARM = "xMediaCandidateCleanup";
+const MAX_UPLOAD_CANDIDATES = 5;
 const CAPTURE_WINDOW_MS = 15_000;
 const CANDIDATE_TTL_MS = 10 * 60_000;
 const MAX_CANDIDATES = 50;
@@ -384,18 +385,28 @@ async function handleMessage(
   state: BackgroundState,
 ): Promise<unknown> {
   if (message.type === "START_MEDIA_UPLOAD") {
+    const requestedCandidates = (
+      Array.isArray(message.candidates) ? message.candidates : [message.candidate]
+    ).slice(0, MAX_UPLOAD_CANDIDATES);
     if (
       !isTrustedSidePanelSender(chromeApi, sender)
       || !Number.isInteger(message.tabId)
       || message.tabId < 0
       || !message.jobId
       || !isValidXContentRef(message.contentRef)
-      || !message.candidate
-      || typeof message.candidate.url !== "string"
-      || typeof message.candidate.capturedAt !== "number"
+      || requestedCandidates.length === 0
+      || requestedCandidates.some((item) => (
+        !item
+        || typeof item.url !== "string"
+        || typeof item.capturedAt !== "number"
+      ))
     ) return { ok: false };
-    const candidate = mediaCandidateFromRequest(message.candidate.url, message.candidate.capturedAt);
-    if (!candidate || candidate.kind !== message.candidate.kind) return { ok: false };
+    const candidates = requestedCandidates.map((item) => (
+      mediaCandidateFromRequest(item!.url, item!.capturedAt)
+    ));
+    if (candidates.some((candidate, index) => (
+      !candidate || candidate.kind !== requestedCandidates[index]!.kind
+    ))) return { ok: false };
     const authorized = await state.runCaptureTask(async () => {
       if (
         state.activeUploadJobId !== null
@@ -418,7 +429,9 @@ async function handleMessage(
         mediaState[String(message.tabId)]?.candidates[key] ?? [],
         Date.now(),
       );
-      if (!storedCandidates.some((stored) => sameMediaCandidate(stored, message.candidate))) return false;
+      if (!requestedCandidates.every((requested) => (
+        storedCandidates.some((stored) => sameMediaCandidate(stored, requested!))
+      ))) return false;
       state.activeUploadJobId = message.jobId;
       await saveMediaUploadJobsState(chromeApi, state);
       return true;
@@ -427,7 +440,9 @@ async function handleMessage(
     try {
       await ensureOffscreenDocument(chromeApi, state);
       const port = state.offscreenPort ?? await waitForOffscreenPort(state);
-      port.postMessage(message);
+      port.postMessage(Array.isArray(message.candidates)
+        ? { ...message, candidates: requestedCandidates }
+        : message);
       return { ok: true };
     } catch (_error) {
       await state.runCaptureTask(async () => {
@@ -1204,6 +1219,7 @@ function enforceAggregateCandidateLimits(state: MediaCaptureState): void {
 }
 
 function mediaCandidateFromRequest(urlValue: string, capturedAt: number): MediaCandidate | null {
+  if (/^https:\/\/[^/?#]*:\d+(?:[/?#]|$)/i.test(urlValue)) return null;
   let url: URL;
   try {
     url = new URL(urlValue);
