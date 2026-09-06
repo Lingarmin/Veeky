@@ -445,6 +445,19 @@ def test_model_factory_error_is_mapped_without_logging_secrets(
     assert "https://models.invalid" not in formatted
 
 
+def test_model_factory_memory_exhaustion_has_a_stable_public_code(tmp_path: Path):
+    def factory(**_: Any) -> FakeWhisperModel:
+        raise MemoryError("private model allocation details")
+
+    transcriber = FasterWhisperTranscriber(factory=factory)
+
+    with pytest.raises(AsrError) as exc_info:
+        transcriber.transcribe(tmp_path / "audio.wav")
+
+    assert exc_info.value.code == "asr_resource_exhausted"
+    assert str(exc_info.value) == "语音识别资源不足"
+
+
 def test_transcription_error_is_mapped_without_logging_secrets(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ):

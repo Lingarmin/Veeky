@@ -74,6 +74,8 @@ MEDIA_CHUNK_BYTES=8388608
 
 首次处理 X 视频时，Worker 会把 Whisper small 模型下载到 `whisper_models` volume，之后重复使用。CPU 识别时间取决于视频长度和机器性能，长视频可能需要等待较久。请给 Docker 留出足够的磁盘空间和内存。
 
+Worker 的媒体处理依赖 Linux/POSIX 运行环境，正式部署必须使用本项目的 Docker Linux 容器。ffmpeg 输出同时受 `-fs` 和 POSIX `RLIMIT_FSIZE` 限制，以确保单任务临时文件不突破配置的硬上限。直接在非 POSIX 系统运行 Worker 不保证这层硬文件限制，不能作为正式部署方式。
+
 构建扩展：
 
 ```bash

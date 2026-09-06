@@ -26,7 +26,7 @@ from app.db.models import (
 )
 from app.security.credentials import JobCredentialCipher
 from app.services.analysis import AnalysisResult, Highlight, TimedSummary
-from app.services.asr import AsrError
+from app.services.asr import AsrError, FasterWhisperTranscriber
 from app.services.media_download import MediaDownloadError
 from app.services.media_upload import create_upload_session
 from app.services.transcripts import TranscriptSegment
@@ -657,6 +657,27 @@ async def test_x_media_or_asr_failure_is_terminal_and_cleans_temp(
         job = await session.get(AnalysisJob, "job-x")
         assert job.status == "failed"
         assert job.failure_code == code
+        assert job.llm_credential_ciphertext is None
+        assert job.media_url_ciphertext is None
+    assert not any(media_root.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_x_pipeline_preserves_model_factory_memory_exhaustion(x_context):
+    factory, _, _, media_root = x_context
+
+    def exhausted_factory(**_kwargs):
+        raise MemoryError("private model allocation details")
+
+    await make_pipeline(
+        x_context,
+        transcriber=FasterWhisperTranscriber(factory=exhausted_factory),
+    ).run("job-x")
+
+    async with factory() as session:
+        job = await session.get(AnalysisJob, "job-x")
+        assert job.status == "failed"
+        assert job.failure_code == "asr_resource_exhausted"
         assert job.llm_credential_ciphertext is None
         assert job.media_url_ciphertext is None
     assert not any(media_root.iterdir())

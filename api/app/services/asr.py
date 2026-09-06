@@ -184,6 +184,11 @@ class FasterWhisperTranscriber:
                     compute_type=self.compute_type,
                     download_root=self.model_dir,
                 )
+            except MemoryError:
+                logger.error("ASR model initialization exhausted available memory")
+                raise AsrError(
+                    "asr_resource_exhausted", "语音识别资源不足"
+                ) from None
             except Exception:
                 logger.error("ASR model initialization failed")
                 raise AsrError(
