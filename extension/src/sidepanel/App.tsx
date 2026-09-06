@@ -106,10 +106,14 @@ export function App({
   const [processingPlatform, setProcessingPlatform] = useState<ContentRef["platform"]>("youtube");
   const timerRef = useRef<number | null>(null);
   const pollGenerationRef = useRef(0);
+  const analysisOperationGenerationRef = useRef(0);
+  const pendingAnalysisOperationRef = useRef<number | null>(null);
   const activeJobRef = useRef<string | null>(null);
   const activeTabIdRef = useRef<number | null>(null);
   const activeContentRef = useRef<ContentRef | null>(null);
   const uploadStartedJobsRef = useRef(new Set<string>());
+  const settingsOpenRef = useRef(false);
+  const completedResultRef = useRef<AnalysisResult | null>(null);
 
   const stopPolling = useCallback(() => {
     pollGenerationRef.current += 1;
@@ -126,10 +130,34 @@ export function App({
     activeJobRef.current === jobId && pollGenerationRef.current === generation
   ), []);
 
+  const cancelAnalysisOperation = useCallback(() => {
+    analysisOperationGenerationRef.current += 1;
+    pendingAnalysisOperationRef.current = null;
+  }, []);
+
+  const beginAnalysisOperation = useCallback(() => {
+    cancelAnalysisOperation();
+    stopPolling();
+    const generation = analysisOperationGenerationRef.current;
+    pendingAnalysisOperationRef.current = generation;
+    return generation;
+  }, [cancelAnalysisOperation, stopPolling]);
+
+  const isCurrentAnalysisOperation = useCallback((generation: number) => (
+    analysisOperationGenerationRef.current === generation
+  ), []);
+
+  const finishAnalysisOperation = useCallback((generation: number) => {
+    if (pendingAnalysisOperationRef.current === generation) {
+      pendingAnalysisOperationRef.current = null;
+    }
+  }, []);
+
   const showResult = useCallback((analysis: AnalysisResult, fromHistory = false) => {
+    completedResultRef.current = analysis;
     setResult(analysis);
     setResultFromHistory(fromHistory);
-    setPhase("complete");
+    if (!settingsOpenRef.current) setPhase("complete");
     activeJobRef.current = null;
     if (
       analysis.contentRef.platform === "x"
@@ -231,6 +259,7 @@ export function App({
   }, [api, browser, isCurrentPoll, pollIntervalMs, showResult]);
 
   const prepareVideoChoice = useCallback(async () => {
+    cancelAnalysisOperation();
     stopPolling();
     const generation = pollGenerationRef.current;
     setPhase("loading");
@@ -296,15 +325,18 @@ export function App({
       setErrorCodeValue(code);
       setPhase("error");
     }
-  }, [api, browser, isCurrentGeneration, poll, showResult, stopPolling]);
+  }, [api, browser, cancelAnalysisOperation, isCurrentGeneration, poll, showResult, stopPolling]);
 
   useEffect(() => {
     void Promise.all([
       prepareVideoChoice(),
       llmStore.load().then(setLlmConfig),
     ]);
-    return stopPolling;
-  }, [llmStore, prepareVideoChoice, stopPolling]);
+    return () => {
+      cancelAnalysisOperation();
+      stopPolling();
+    };
+  }, [cancelAnalysisOperation, llmStore, prepareVideoChoice, stopPolling]);
 
   useEffect(() => browser.onMediaUpload((message) => {
     if (message.jobId !== activeJobRef.current) return;
@@ -315,12 +347,13 @@ export function App({
       setUploadPercent(percent);
     } else if (message.type === "MEDIA_UPLOAD_FAILED") {
       uploadStartedJobsRef.current.delete(message.jobId);
+      cancelAnalysisOperation();
       stopPolling();
       setError(errorMessageForCode(message.code));
       setErrorCodeValue(message.code);
       setPhase("error");
     }
-  }), [browser, stopPolling]);
+  }), [browser, cancelAnalysisOperation, stopPolling]);
 
   const checkCaptions = async () => {
     const url = choice === "current" ? context?.url ?? "" : replacementUrl.trim();
@@ -328,6 +361,7 @@ export function App({
       setError("请输入要检查的 YouTube 视频链接");
       return;
     }
+    cancelAnalysisOperation();
     stopPolling();
     const generation = pollGenerationRef.current;
     setError("");
@@ -382,6 +416,7 @@ export function App({
   const viewExistingAnalysis = () => {
     const existing = context?.analysis;
     if (!context?.contentRef || !existing || !analysisMatches(existing, context.contentRef)) return;
+    cancelAnalysisOperation();
     stopPolling();
     const generation = pollGenerationRef.current;
     setJobStatus("queued");
@@ -392,6 +427,7 @@ export function App({
   };
 
   const openHistory = async (reset = true) => {
+    cancelAnalysisOperation();
     stopPolling();
     const generation = pollGenerationRef.current;
     setPhase("history");
@@ -412,6 +448,7 @@ export function App({
   };
 
   const openHistoryResult = async (item: AnalysisHistoryItem) => {
+    cancelAnalysisOperation();
     stopPolling();
     const generation = pollGenerationRef.current;
     setHistoryLoading(true);
@@ -437,8 +474,7 @@ export function App({
       setPhase("settings");
       return;
     }
-    stopPolling();
-    const generation = pollGenerationRef.current;
+    const operationGeneration = beginAnalysisOperation();
     setProcessingPlatform(inspection.contentRef.platform);
     setPhase("processing");
     setJobStatus("queued");
@@ -462,24 +498,27 @@ export function App({
         title,
         llmConfig,
       });
-      if (!isCurrentGeneration(generation)) return;
+      if (!isCurrentAnalysisOperation(operationGeneration)) return;
       if (contentRef.platform === "youtube" && contentRef.sourceContentId !== context.videoId) {
         await browser.seek(context.tabId, contentRef, 0);
-        if (!isCurrentGeneration(generation)) return;
+        if (!isCurrentAnalysisOperation(operationGeneration)) return;
       }
       await browser.registerAnalysis(context.tabId, contentRef, created.jobId);
-      if (!isCurrentGeneration(generation)) return;
+      if (!isCurrentAnalysisOperation(operationGeneration)) return;
       activeJobRef.current = created.jobId;
+      finishAnalysisOperation(operationGeneration);
+      const pollGeneration = pollGenerationRef.current;
       if (created.status === "completed") {
         const analysis = await api.getResult(created.jobId);
-        if (!isCurrentPoll(created.jobId, generation)) return;
+        if (!isCurrentPoll(created.jobId, pollGeneration)) return;
         showResult(analysis);
         setFailedAnalysis(null);
       } else {
-        void poll(created.jobId, contentRef, context.tabId, true, generation);
+        void poll(created.jobId, contentRef, context.tabId, true, pollGeneration);
       }
     } catch (requestError) {
-      if (!isCurrentGeneration(generation)) return;
+      if (!isCurrentAnalysisOperation(operationGeneration)) return;
+      finishAnalysisOperation(operationGeneration);
       const code = errorCode(requestError);
       setError(errorMessageForCode(code));
       setErrorCodeValue(code);
@@ -505,8 +544,7 @@ export function App({
       setPhase("error");
       return;
     }
-    stopPolling();
-    const generation = pollGenerationRef.current;
+    const operationGeneration = beginAnalysisOperation();
     setProcessingPlatform(result.contentRef.platform);
     setPhase("processing");
     setJobStatus("queued");
@@ -518,7 +556,7 @@ export function App({
         : undefined;
       if (contentRef.platform === "youtube" && contentRef.sourceContentId !== context.videoId) {
         await browser.seek(context.tabId, contentRef, 0);
-        if (!isCurrentGeneration(generation)) return;
+        if (!isCurrentAnalysisOperation(operationGeneration)) return;
       }
       const created = await api.createAnalysis({
         ...(contentRef.platform === "youtube"
@@ -530,16 +568,18 @@ export function App({
         llmConfig,
         force: true,
       });
-      if (!isCurrentGeneration(generation)) return;
+      if (!isCurrentAnalysisOperation(operationGeneration)) return;
       if (contentRef.platform === "youtube" || matchesCurrentTab) {
         await browser.registerAnalysis(context.tabId, contentRef, created.jobId);
-        if (!isCurrentGeneration(generation)) return;
+        if (!isCurrentAnalysisOperation(operationGeneration)) return;
       }
       activeJobRef.current = created.jobId;
+      finishAnalysisOperation(operationGeneration);
       setResultFromHistory(false);
-      void poll(created.jobId, contentRef, context.tabId, matchesCurrentTab, generation);
+      void poll(created.jobId, contentRef, context.tabId, matchesCurrentTab, pollGenerationRef.current);
     } catch (requestError) {
-      if (!isCurrentGeneration(generation)) return;
+      if (!isCurrentAnalysisOperation(operationGeneration)) return;
+      finishAnalysisOperation(operationGeneration);
       setError(errorMessageForCode(errorCode(requestError)));
       setPhase("error");
     }
@@ -556,8 +596,7 @@ export function App({
       setPhase("settings");
       return;
     }
-    stopPolling();
-    const generation = pollGenerationRef.current;
+    const operationGeneration = beginAnalysisOperation();
     setProcessingPlatform(failedAnalysis.contentRef.platform);
     setPhase("processing");
     setJobStatus("queued");
@@ -584,19 +623,21 @@ export function App({
         llmConfig,
         force: true,
       });
-      if (!isCurrentGeneration(generation)) return;
+      if (!isCurrentAnalysisOperation(operationGeneration)) return;
       if (failedAnalysis.contentRef.platform === "youtube" || matchesCurrentTab) {
         await browser.registerAnalysis(
           context.tabId,
           failedAnalysis.contentRef,
           created.jobId,
         );
-        if (!isCurrentGeneration(generation)) return;
+        if (!isCurrentAnalysisOperation(operationGeneration)) return;
       }
       activeJobRef.current = created.jobId;
-      void poll(created.jobId, failedAnalysis.contentRef, context.tabId, matchesCurrentTab, generation);
+      finishAnalysisOperation(operationGeneration);
+      void poll(created.jobId, failedAnalysis.contentRef, context.tabId, matchesCurrentTab, pollGenerationRef.current);
     } catch (requestError) {
-      if (!isCurrentGeneration(generation)) return;
+      if (!isCurrentAnalysisOperation(operationGeneration)) return;
+      finishAnalysisOperation(operationGeneration);
       const code = errorCode(requestError);
       setError(errorMessageForCode(code));
       setErrorCodeValue(code);
@@ -605,10 +646,24 @@ export function App({
   };
 
   const openSettings = () => {
-    if (activeJobRef.current === null) stopPolling();
+    settingsOpenRef.current = true;
     setSettingsReturnPhase(phase === "settings" ? "selecting" : phase);
     setSettingsError("");
     setPhase("settings");
+  };
+
+  const closeSettings = () => {
+    settingsOpenRef.current = false;
+    if (
+      settingsReturnPhase === "processing"
+      && activeJobRef.current === null
+      && pendingAnalysisOperationRef.current === null
+      && completedResultRef.current
+    ) {
+      setPhase("complete");
+      return;
+    }
+    setPhase(settingsReturnPhase);
   };
 
   const seek = (startMs: number) => {
@@ -691,7 +746,7 @@ export function App({
             setLlmConfig(await llmStore.load(provider));
             setSettingsError("");
           }}
-          onSave={async () => { await llmStore.save(llmConfig); setSettingsError(""); setPhase(settingsReturnPhase); }}
+          onSave={async () => { await llmStore.save(llmConfig); setSettingsError(""); closeSettings(); }}
           onTest={async () => {
             if (!isLlmConfigured(llmConfig)) { setSettingsError("请填写 API URL 和 API Key"); return; }
             setTestingLlm(true); setSettingsError("");
@@ -704,7 +759,7 @@ export function App({
             }
             finally { setTestingLlm(false); }
           }}
-          onBack={() => setPhase(settingsReturnPhase)}
+          onBack={closeSettings}
         />
       )}
       {phase === "history" && (

@@ -922,6 +922,84 @@ describe("Side Panel", () => {
     },
   );
 
+  it("continues creating an analysis after settings are opened and closed", async () => {
+    const pendingCreate = deferred<Awaited<ReturnType<AnalysisApi["createAnalysis"]>>>();
+    const api = createApi();
+    api.createAnalysis.mockReturnValueOnce(pendingCreate.promise);
+    const browser = createBrowser();
+    const user = userEvent.setup();
+    render(<App api={api} browser={browser} llmStore={createLlmStore()} pollIntervalMs={1} />);
+
+    await user.click(await screen.findByRole("button", { name: "检查当前视频字幕" }));
+    await user.click(screen.getByRole("button", { name: "分析此视频" }));
+    await waitFor(() => expect(api.createAnalysis).toHaveBeenCalledOnce());
+
+    await user.click(screen.getByRole("button", { name: "LLM 设置" }));
+    await user.click(await screen.findByRole("button", { name: "返回" }));
+    pendingCreate.resolve({
+      jobId: "job-1",
+      cacheHit: false,
+      status: "queued",
+      contentId: youtubeContentId,
+      contentRef: youtubeContentRef,
+      videoId: "aircAruvnKk",
+    });
+
+    expect(await screen.findByText("视频解释神经网络如何识别手写数字。")).toBeInTheDocument();
+    expect(browser.registerAnalysis).toHaveBeenCalledWith(7, youtubeContentRef, "job-1");
+  });
+
+  it("continues registering an analysis after settings are opened and closed", async () => {
+    const pendingRegistration = deferred<void>();
+    const api = createApi();
+    const browser = createBrowser();
+    browser.registerAnalysis.mockReturnValueOnce(pendingRegistration.promise);
+    const user = userEvent.setup();
+    render(<App api={api} browser={browser} llmStore={createLlmStore()} pollIntervalMs={1} />);
+
+    await user.click(await screen.findByRole("button", { name: "检查当前视频字幕" }));
+    await user.click(screen.getByRole("button", { name: "分析此视频" }));
+    await waitFor(() => expect(browser.registerAnalysis).toHaveBeenCalledWith(7, youtubeContentRef, "job-1"));
+
+    await user.click(screen.getByRole("button", { name: "LLM 设置" }));
+    await user.click(await screen.findByRole("button", { name: "返回" }));
+    pendingRegistration.resolve();
+
+    expect(await screen.findByText("视频解释神经网络如何识别手写数字。")).toBeInTheDocument();
+    expect(api.getStatus).toHaveBeenCalledWith("job-1");
+  });
+
+  it("returns to a result that completes while settings are being saved", async () => {
+    const pendingCreate = deferred<Awaited<ReturnType<AnalysisApi["createAnalysis"]>>>();
+    const pendingSave = deferred<undefined>();
+    const api = createApi();
+    api.createAnalysis.mockReturnValueOnce(pendingCreate.promise);
+    const store = createLlmStore();
+    store.save.mockReturnValueOnce(pendingSave.promise);
+    const user = userEvent.setup();
+    render(<App api={api} browser={createBrowser()} llmStore={store} pollIntervalMs={1} />);
+
+    await user.click(await screen.findByRole("button", { name: "检查当前视频字幕" }));
+    await user.click(screen.getByRole("button", { name: "分析此视频" }));
+    await waitFor(() => expect(api.createAnalysis).toHaveBeenCalledOnce());
+    await user.click(screen.getByRole("button", { name: "LLM 设置" }));
+    await user.click(screen.getByRole("button", { name: "保存配置" }));
+    await waitFor(() => expect(store.save).toHaveBeenCalledOnce());
+
+    pendingCreate.resolve({
+      jobId: "job-1",
+      cacheHit: false,
+      status: "queued",
+      contentId: youtubeContentId,
+      contentRef: youtubeContentRef,
+      videoId: "aircAruvnKk",
+    });
+    await waitFor(() => expect(api.getResult).toHaveBeenCalledWith("job-1"));
+    pendingSave.resolve(undefined);
+
+    expect(await screen.findByText("视频解释神经网络如何识别手写数字。")).toBeInTheDocument();
+  });
+
   it("resumes an unfinished registered analysis before checking history", async () => {
     const api = createApi();
     api.getStatus.mockResolvedValue({

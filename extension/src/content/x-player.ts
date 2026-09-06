@@ -31,6 +31,14 @@ interface Selection {
   video: HTMLVideoElement;
   contentRef: ContentRef;
   durationMs: number;
+  slot: PlayerSlot;
+}
+
+interface PlayerSlot {
+  scope: Element;
+  container: Element;
+  containerVideoIndex: number;
+  scopeVideoIndex: number;
 }
 
 interface BoundVideo {
@@ -82,7 +90,7 @@ export function installXPlayerTracker(options: XPlayerTrackerOptions): () => voi
     ) {
       clearSelection();
     }
-    selection = { video, contentRef, durationMs };
+    selection = { video, contentRef, durationMs, slot: playerSlot(video, contentRef) };
     options.onActive(contentRef, durationMs);
   };
 
@@ -122,6 +130,7 @@ export function installXPlayerTracker(options: XPlayerTrackerOptions): () => voi
       const previous = selection;
       const route = pageRoute(pageWindow);
       const replacement = matchingVideos(videos, route, previous.contentRef)
+        .filter((video) => matchesPlayerSlot(video, previous.slot, previous.contentRef))
         .sort((left, right) => (
           Number(left.paused) - Number(right.paused)
           || playerPriority(right) - playerPriority(left)
@@ -203,11 +212,12 @@ function contentRefForVideo(video: HTMLVideoElement, pageUrl: string): ContentRe
   const scope = playerScope(video);
   if (!scope || owningStatusId(video, scope) !== route.sourceContentId) return null;
 
-  let mediaIndex = route.mediaIndex
-    ?? mediaIndexFromContainedLink(video, scope, route.sourceContentId);
-  if (!mediaIndex) {
-    mediaIndex = mediaIndexFromTiles(video, scope, route.sourceContentId);
-  }
+  const containedIndex = mediaIndexFromContainedLink(video, scope, route.sourceContentId);
+  const tileIndex = mediaIndexFromTiles(video, scope, route.sourceContentId);
+  const visibleMediaCount = mediaElementsInScope(scope, route.sourceContentId).length;
+  const mediaIndex = route.mediaIndex && visibleMediaCount <= 1
+    ? route.mediaIndex
+    : containedIndex ?? tileIndex ?? route.mediaIndex;
   if (!mediaIndex || mediaIndex < 1) return null;
   return { platform: "x", sourceContentId: route.sourceContentId, mediaIndex };
 }
@@ -217,26 +227,73 @@ function mediaIndexFromTiles(
   scope: Element,
   statusId: string,
 ): number | null {
+  const index = mediaElementsInScope(scope, statusId)
+    .findIndex((candidate) => candidate === video || candidate.contains(video));
+  return index >= 0 ? index + 1 : null;
+}
+
+function mediaElementsInScope(scope: Element, statusId: string): Element[] {
   const recognizedTiles = Array.from(scope.querySelectorAll<HTMLElement>(
     '[data-testid="tweetPhoto"], [data-testid="videoPlayer"]',
   )).filter((candidate) => (
     playerScope(candidate) === scope
     && owningStatusId(candidate, scope) === statusId
   ));
-  const topLevelTiles = recognizedTiles.filter((candidate) => (
-    !recognizedTiles.some((other) => other !== candidate && other.contains(candidate))
-  ));
-  const tileIndex = topLevelTiles.findIndex((candidate) => candidate.contains(video));
-  if (tileIndex >= 0) return tileIndex + 1;
-
-  if (recognizedTiles.length > 0) return null;
-  const scopedMedia = Array.from(scope.querySelectorAll<HTMLElement>("video, img"))
+  if (recognizedTiles.length > 0) {
+    return recognizedTiles.filter((candidate) => (
+      !recognizedTiles.some((other) => other !== candidate && other.contains(candidate))
+    ));
+  }
+  return Array.from(scope.querySelectorAll<HTMLElement>("video, img"))
     .filter((candidate) => (
       playerScope(candidate) === scope
       && owningStatusId(candidate, scope) === statusId
     ));
-  const index = scopedMedia.indexOf(video);
-  return index >= 0 ? index + 1 : null;
+}
+
+function playerSlot(video: HTMLVideoElement, contentRef: ContentRef): PlayerSlot {
+  const scope = playerScope(video) ?? video.parentElement ?? video;
+  const tile = video.closest<HTMLElement>(
+    '[data-testid="tweetPhoto"], [data-testid="videoPlayer"]',
+  );
+  const container = tile && playerScope(tile) === scope
+    ? tile
+    : video.parentElement ?? scope;
+  return {
+    scope,
+    container,
+    containerVideoIndex: videoIndex(container, video, scope, contentRef.sourceContentId),
+    scopeVideoIndex: videoIndex(scope, video, scope, contentRef.sourceContentId),
+  };
+}
+
+function matchesPlayerSlot(
+  video: HTMLVideoElement,
+  slot: PlayerSlot,
+  contentRef: ContentRef,
+): boolean {
+  const scope = playerScope(video);
+  if (scope !== slot.scope) return false;
+  if (!slot.container.isConnected) {
+    return videoIndex(scope, video, scope, contentRef.sourceContentId) === slot.scopeVideoIndex;
+  }
+  const candidateSlot = playerSlot(video, contentRef);
+  return candidateSlot.container === slot.container
+    && candidateSlot.containerVideoIndex === slot.containerVideoIndex;
+}
+
+function videoIndex(
+  container: Element,
+  video: HTMLVideoElement,
+  scope: Element,
+  statusId: string,
+): number {
+  return Array.from(container.querySelectorAll<HTMLVideoElement>("video"))
+    .filter((candidate) => (
+      playerScope(candidate) === scope
+      && owningStatusId(candidate, scope) === statusId
+    ))
+    .indexOf(video);
 }
 
 function playerScope(element: Element): Element | null {

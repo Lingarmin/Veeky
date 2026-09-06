@@ -390,6 +390,33 @@ describe("X active player tracking", () => {
     teardown();
   });
 
+  it("keeps explicit video 2 selected when its paused player is replaced", async () => {
+    window.history.replaceState({}, "", `/owner/status/${STATUS_ID}/video/2`);
+    renderStatus({ mediaCount: 2 });
+    const onActive = vi.fn();
+    const onInactive = vi.fn();
+    const teardown = installXPlayerTracker({ onActive, onInactive });
+    const first = document.querySelector<HTMLVideoElement>("#main-1")!;
+    const second = document.querySelector<HTMLVideoElement>("#main-2")!;
+    setPlayerState(first, true, 10);
+    setPlayerState(second, true, 20);
+    second.dispatchEvent(new Event("play"));
+
+    const replacement = document.createElement("video");
+    replacement.id = "second-replacement";
+    setPlayerState(replacement, true, 30);
+    second.replaceWith(replacement);
+    await flushMutations();
+
+    expect(onInactive).not.toHaveBeenCalled();
+    expect(onActive).toHaveBeenLastCalledWith({
+      platform: "x",
+      sourceContentId: STATUS_ID,
+      mediaIndex: 2,
+    }, 30_000);
+    teardown();
+  });
+
   it("keeps the most recently played valid video selected during mutation scans", async () => {
     window.history.replaceState({}, "", `/owner/status/${STATUS_ID}`);
     renderStatus({ mediaCount: 2, reply: true, modal: true });
