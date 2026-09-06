@@ -1,8 +1,12 @@
 export type JobStatus =
   | "queued"
   | "fetching_transcript"
-  | "translating"
+  | "waiting_for_media"
+  | "downloading_media"
+  | "extracting_audio"
+  | "transcribing"
   | "analyzing"
+  | "translating"
   | "completed"
   | "failed";
 
@@ -92,6 +96,8 @@ export type MediaUploadMessage =
   | MediaUploadCompleteMessage
   | MediaUploadFailedMessage;
 
+export type MediaUploadNotification = Exclude<MediaUploadMessage, StartMediaUploadMessage>;
+
 export const OFFSCREEN_MEDIA_PORT = "veeky-offscreen-media";
 
 export interface MediaUploadConfigMessage {
@@ -113,6 +119,8 @@ export type ExtensionMessage =
   | { type: "REGISTER_ANALYSIS"; tabId: number; videoId: string; jobId: string }
   | { type: "REGISTER_ANALYSIS"; tabId: number; contentRef: ContentRef; jobId: string }
   | { type: "SEEK_VIDEO"; tabId: number; videoId: string; startMs: number }
+  | { type: "SEEK_CONTENT"; tabId?: number; contentRef: ContentRef; startMs: number }
+  | { type: "SET_SUBTITLES"; tabId?: number; contentRef: ContentRef; segments: TranscriptSegment[] }
   | { type: "X_PLAYER_ACTIVE"; contentRef: ContentRef; durationMs: number }
   | { type: "X_PLAYER_INACTIVE"; contentRef: ContentRef }
   | { type: "GET_MEDIA_CANDIDATES"; tabId: number; contentRef: ContentRef }

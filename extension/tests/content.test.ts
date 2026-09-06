@@ -4,6 +4,8 @@ import { resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { installXPlayerTracker } from "../src/content/x-player";
+import { installContentScript } from "../src/content/index";
+import { findActiveSubtitle, SubtitleOverlay } from "../src/content/subtitle-overlay";
 import { contentKey, parseContentRef } from "../src/shared/content";
 import type { ContentRef } from "../src/shared/types";
 
@@ -560,5 +562,103 @@ describe("X active player tracking", () => {
 
     expect(onActive).not.toHaveBeenCalled();
     expect(onInactive).not.toHaveBeenCalled();
+  });
+});
+
+describe("X subtitle overlay", () => {
+  const contentRef: ContentRef = {
+    platform: "x",
+    sourceContentId: STATUS_ID,
+    mediaIndex: 1,
+  };
+  const segments = [
+    { startMs: 0, durationMs: 1000, translated: "第一句" },
+    { startMs: 1000, durationMs: 1000, translated: "第二句" },
+  ];
+
+  it("finds the active translated segment with a binary timeline lookup", () => {
+    expect(findActiveSubtitle(1500, segments)).toBe("第二句");
+  });
+
+  it("updates the mounted overlay from the active video's current time", () => {
+    document.body.innerHTML = '<div data-testid="videoPlayer"><video></video></div>';
+    const video = document.querySelector("video")!;
+    const overlay = new SubtitleOverlay(document);
+
+    overlay.mount(video, segments);
+    video.currentTime = 1.5;
+    video.dispatchEvent(new Event("timeupdate"));
+
+    expect(document.querySelector(".veeky-subtitle-overlay")).toHaveTextContent("第二句");
+    overlay.destroy();
+  });
+
+  it("reattaches when X replaces the active video element", async () => {
+    document.body.innerHTML = '<div data-testid="videoPlayer"><video id="old"></video></div>';
+    const oldVideo = document.querySelector<HTMLVideoElement>("#old")!;
+    const overlay = new SubtitleOverlay(document);
+    overlay.mount(oldVideo, segments);
+    const replacement = document.createElement("video");
+    oldVideo.replaceWith(replacement);
+    await flushMutations();
+
+    replacement.currentTime = 1.5;
+    replacement.dispatchEvent(new Event("timeupdate"));
+
+    expect(document.querySelectorAll(".veeky-subtitle-overlay")).toHaveLength(1);
+    expect(document.querySelector(".veeky-subtitle-overlay")).toHaveTextContent("第二句");
+    overlay.destroy();
+  });
+
+  it("removes subtitles on an X route change", () => {
+    window.history.replaceState({}, "", `/owner/status/${STATUS_ID}/video/1`);
+    renderStatus();
+    const listeners: Array<(message: unknown) => void> = [];
+    const chromeApi = {
+      runtime: {
+        lastError: undefined,
+        sendMessage: vi.fn((_message, callback?: () => void) => callback?.()),
+        onMessage: { addListener: vi.fn((listener) => listeners.push(listener)), removeListener: vi.fn() },
+      },
+    };
+    const video = document.querySelector<HTMLVideoElement>("#main-1")!;
+    setPlayerState(video, false);
+    const teardown = installContentScript(chromeApi as never);
+    video.dispatchEvent(new Event("play"));
+    listeners[0]({ type: "SET_SUBTITLES", contentRef, segments });
+    expect(document.querySelector(".veeky-subtitle-overlay")).toBeInTheDocument();
+
+    window.history.pushState({}, "", "/other/status/2075545587093807333/video/1");
+
+    expect(document.querySelector(".veeky-subtitle-overlay")).not.toBeInTheDocument();
+    teardown();
+  });
+
+  it("seeks and plays only the selected X video", () => {
+    window.history.replaceState({}, "", `/owner/status/${STATUS_ID}/video/1`);
+    renderStatus();
+    const listeners: Array<(message: unknown) => void> = [];
+    const chromeApi = {
+      runtime: {
+        lastError: undefined,
+        sendMessage: vi.fn((_message, callback?: () => void) => callback?.()),
+        onMessage: { addListener: vi.fn((listener) => listeners.push(listener)), removeListener: vi.fn() },
+      },
+    };
+    const video = document.querySelector<HTMLVideoElement>("#main-1")!;
+    const play = vi.fn(async () => undefined);
+    Object.defineProperties(video, {
+      paused: { configurable: true, value: false },
+      duration: { configurable: true, value: 12.5 },
+      play: { configurable: true, value: play },
+    });
+    const teardown = installContentScript(chromeApi as never);
+    video.dispatchEvent(new Event("play"));
+
+    listeners[0]({ type: "SEEK_CONTENT", contentRef, startMs: 1500 });
+
+    expect(video.currentTime).toBe(1.5);
+    expect(play).toHaveBeenCalledOnce();
+    teardown();
   });
 });

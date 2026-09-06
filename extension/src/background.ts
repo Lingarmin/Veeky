@@ -446,6 +446,59 @@ async function handleMessage(
     return undefined;
   }
 
+  if (message.type === "SEEK_CONTENT") {
+    if (
+      !isTrustedSidePanelSender(chromeApi, sender)
+      || message.tabId === undefined
+      || !Number.isInteger(message.tabId)
+      || message.tabId < 0
+    ) return { ok: false };
+    const tab = await chromeApi.tabs.get(message.tabId);
+    if (message.contentRef.platform === "x") {
+      if (!isValidXContentRef(message.contentRef) || !xUrlMatchesRef(tab.url, message.contentRef)) {
+        return { ok: false };
+      }
+      await chromeApi.tabs.sendMessage(message.tabId, {
+        type: "SEEK_CONTENT",
+        contentRef: message.contentRef,
+        startMs: message.startMs,
+      } satisfies ExtensionMessage);
+      return { ok: true };
+    }
+    const seconds = Math.max(0, message.startMs / 1000);
+    const currentRef = parseContentRef(tab.url);
+    if (currentRef?.platform === "youtube" && sameContentRef(currentRef, message.contentRef)) {
+      await chromeApi.scripting.executeScript({
+        target: { tabId: message.tabId },
+        func: seekCurrentYouTubePlayer,
+        args: [seconds],
+      });
+    } else {
+      await chromeApi.tabs.update(message.tabId, {
+        url: `https://www.youtube.com/watch?v=${message.contentRef.sourceContentId}&t=${seconds}s`,
+      });
+    }
+    return { ok: true };
+  }
+
+  if (message.type === "SET_SUBTITLES") {
+    if (
+      !isTrustedSidePanelSender(chromeApi, sender)
+      || message.tabId === undefined
+      || !Number.isInteger(message.tabId)
+      || message.tabId < 0
+      || !isValidXContentRef(message.contentRef)
+    ) return { ok: false };
+    const tab = await chromeApi.tabs.get(message.tabId);
+    if (!xUrlMatchesRef(tab.url, message.contentRef)) return { ok: false };
+    await chromeApi.tabs.sendMessage(message.tabId, {
+      type: "SET_SUBTITLES",
+      contentRef: message.contentRef,
+      segments: message.segments,
+    } satisfies ExtensionMessage);
+    return { ok: true };
+  }
+
   if (message.type === "X_PLAYER_ACTIVE") {
     const tabId = sender.tab?.id;
     if (tabId === undefined || !isValidXContentRef(message.contentRef) || !senderMatchesRef(sender, message.contentRef)) {

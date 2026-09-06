@@ -53,6 +53,7 @@ function createChrome(
       onUpdated: tabUpdated,
       onRemoved: tabRemoved,
       get: vi.fn(async (tabId: number) => ({ id: tabId, url: "https://www.youtube.com/watch?v=aircAruvnKk" })),
+      sendMessage: vi.fn(async () => ({ ok: true })),
       update: vi.fn(async () => undefined),
       query: vi.fn(async () => [{ id: 7, url: "https://www.youtube.com/watch?v=aircAruvnKk", title: "Neural networks" }]),
     },
@@ -1062,6 +1063,42 @@ describe("background tab isolation", () => {
       url: "https://www.youtube.com/watch?v=BpOsHF5Oj_I&t=0s",
     });
     expect(chrome.scripting.executeScript).not.toHaveBeenCalled();
+  });
+
+  it("forwards X seek and subtitle messages to the content script without navigating", async () => {
+    const chrome = createChrome();
+    const contentRef = {
+      platform: "x" as const,
+      sourceContentId: "2075545587093807111",
+      mediaIndex: 1,
+    };
+    chrome.tabs.get.mockResolvedValue({
+      id: 7,
+      url: "https://x.com/owner/status/2075545587093807111/video/1",
+    });
+    installBackgroundHandlers(chrome as never);
+    const sender = {
+      id: "extension-id",
+      url: "chrome-extension://extension-id/sidepanel.html",
+    };
+
+    await dispatchMessage(chrome, {
+      type: "SEEK_CONTENT", tabId: 7, contentRef, startMs: 1_500,
+    }, sender);
+    await dispatchMessage(chrome, {
+      type: "SET_SUBTITLES",
+      tabId: 7,
+      contentRef,
+      segments: [{ id: "one", startMs: 0, durationMs: 2_000, original: "First", translated: "第一句" }],
+    }, sender);
+
+    expect(chrome.tabs.sendMessage).toHaveBeenNthCalledWith(1, 7, {
+      type: "SEEK_CONTENT", contentRef, startMs: 1_500,
+    });
+    expect(chrome.tabs.sendMessage).toHaveBeenNthCalledWith(2, 7, expect.objectContaining({
+      type: "SET_SUBTITLES", contentRef,
+    }));
+    expect(chrome.tabs.update).not.toHaveBeenCalled();
   });
 
   it("removes stored analysis state when the tab closes", async () => {

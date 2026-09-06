@@ -19,7 +19,9 @@ import type {
   ActiveTabContext,
   AnalysisHistoryItem,
   AnalysisResult,
+  ContentRef,
   JobStatus,
+  MediaCandidate,
   VideoInspection,
 } from "../shared/types";
 import type { AnalysisApi } from "./api";
@@ -43,7 +45,7 @@ interface AppProps {
 }
 
 interface RetryAnalysisInput {
-  videoId: string;
+  contentRef: ContentRef;
   sourceLanguage: string;
   targetLanguage: string;
   title: string;
@@ -99,23 +101,50 @@ export function App({
   const [settingsReturnPhase, setSettingsReturnPhase] = useState<Phase>("selecting");
   const [failedAnalysis, setFailedAnalysis] = useState<RetryAnalysisInput | null>(null);
   const [errorCodeValue, setErrorCodeValue] = useState<string | null>(null);
+  const [mediaCandidates, setMediaCandidates] = useState<MediaCandidate[]>([]);
+  const [uploadPercent, setUploadPercent] = useState<number | null>(null);
+  const [processingPlatform, setProcessingPlatform] = useState<ContentRef["platform"]>("youtube");
   const timerRef = useRef<number | null>(null);
+  const activeJobRef = useRef<string | null>(null);
+  const activeTabIdRef = useRef<number | null>(null);
+  const uploadStartedJobsRef = useRef(new Set<string>());
 
   const stopPolling = useCallback(() => {
     if (timerRef.current !== null) window.clearTimeout(timerRef.current);
     timerRef.current = null;
   }, []);
 
-  const poll = useCallback(async (jobId: string, videoId?: string) => {
+  const showResult = useCallback((analysis: AnalysisResult, fromHistory = false) => {
+    setResult(analysis);
+    setResultFromHistory(fromHistory);
+    setPhase("complete");
+    activeJobRef.current = null;
+    if (analysis.contentRef.platform === "x" && activeTabIdRef.current !== null) {
+      const translated = analysis.transcript.filter((segment) => Boolean(segment.translated));
+      void browser.showSubtitles(activeTabIdRef.current, analysis.contentRef, translated)
+        .catch(() => undefined);
+    }
+  }, [browser]);
+
+  const poll = useCallback(async (jobId: string, contentRef: ContentRef, tabId: number) => {
     try {
       const status = await api.getStatus(jobId);
       setJobStatus(status.status);
       if (status.status === "completed") {
         const analysis = await api.getResult(jobId);
-        setResult(analysis);
-        setResultFromHistory(false);
-        setPhase("complete");
+        showResult(analysis);
         return;
+      }
+      if (status.status === "waiting_for_media" && contentRef.platform === "x") {
+        if (!uploadStartedJobsRef.current.has(jobId)) {
+          uploadStartedJobsRef.current.add(jobId);
+          const candidates = await browser.getMediaCandidates(tabId, contentRef);
+          const candidate = candidates[0];
+          if (!candidate) {
+            throw Object.assign(new Error("No current X media candidate"), { code: "x_media_not_detected" });
+          }
+          await browser.startMediaUpload({ tabId, jobId, contentRef, candidate });
+        }
       }
       if (status.status === "translating") {
         // The worker stores the overview before starting the long subtitle
@@ -140,26 +169,24 @@ export function App({
         }
         setError(errorMessageForCode(status.failureCode));
         setErrorCodeValue(status.failureCode);
-        if (videoId) {
-          const history = await api.getHistory({ videoId, limit: 1, offset: 0 });
+        if (contentRef.platform === "youtube") {
+          const history = await api.getHistory({ videoId: contentRef.sourceContentId, limit: 1, offset: 0 });
           if (history.items[0]) {
-            setResult(await api.getResult(history.items[0].jobId));
-            setResultFromHistory(false);
-            setPhase("complete");
+            showResult(await api.getResult(history.items[0].jobId));
             return;
           }
         }
         setPhase("error");
         return;
       }
-      timerRef.current = window.setTimeout(() => void poll(jobId, videoId), pollIntervalMs);
+      timerRef.current = window.setTimeout(() => void poll(jobId, contentRef, tabId), pollIntervalMs);
     } catch (requestError) {
       const code = errorCode(requestError);
       setError(errorMessageForCode(code));
       setErrorCodeValue(code);
       setPhase("error");
     }
-  }, [api, pollIntervalMs]);
+  }, [api, browser, pollIntervalMs, showResult]);
 
   const prepareVideoChoice = useCallback(async () => {
     stopPolling();
@@ -169,36 +196,46 @@ export function App({
     setFailedAnalysis(null);
     setInspection(null);
     setInspectionUrl("");
+    setMediaCandidates([]);
+    setUploadPercent(null);
+    activeJobRef.current = null;
     try {
       const active = await browser.getActiveContext();
-      setContext(active);
-      if (!active.videoId) {
-        setError("请先打开一个 YouTube 视频");
+      activeTabIdRef.current = active.tabId;
+      const activeRef = active.contentRef ?? (active.videoId
+        ? { platform: "youtube" as const, sourceContentId: active.videoId, mediaIndex: 1 }
+        : null);
+      const normalized = { ...active, contentRef: activeRef };
+      setContext(normalized);
+      if (!activeRef) {
+        const code = isBareXStatusUrl(active.url) ? "x_video_play_required" : null;
+        setError(code ? errorMessageForCode(code) : "请先打开一个 YouTube 或 X 视频");
+        setErrorCodeValue(code);
         setPhase("error");
         return;
       }
       setChoice("current");
-      if (active.analysis?.videoId === active.videoId) {
+      if (active.analysis && analysisMatches(active.analysis, activeRef)) {
         const status = await api.getStatus(active.analysis.jobId);
         if (status.status === "completed") {
-          setResult(await api.getResult(active.analysis.jobId));
-          setResultFromHistory(false);
-          setPhase("complete");
+          showResult(await api.getResult(active.analysis.jobId));
           return;
         }
         if (status.status !== "failed") {
           setJobStatus(status.status);
+          setProcessingPlatform(activeRef.platform);
           setPhase("processing");
-          void poll(active.analysis.jobId, active.videoId);
+          activeJobRef.current = active.analysis.jobId;
+          void poll(active.analysis.jobId, activeRef, active.tabId);
           return;
         }
       }
-      const history = await api.getHistory({ videoId: active.videoId, limit: 1, offset: 0 });
-      if (history.items[0]) {
-        setResult(await api.getResult(history.items[0].jobId));
-        setResultFromHistory(false);
-        setPhase("complete");
-        return;
+      if (activeRef.platform === "youtube") {
+        const history = await api.getHistory({ videoId: activeRef.sourceContentId, limit: 1, offset: 0 });
+        if (history.items[0]) {
+          showResult(await api.getResult(history.items[0].jobId));
+          return;
+        }
       }
       setPhase("selecting");
     } catch (requestError) {
@@ -207,7 +244,7 @@ export function App({
       setErrorCodeValue(code);
       setPhase("error");
     }
-  }, [api, browser, poll, stopPolling]);
+  }, [api, browser, poll, showResult, stopPolling]);
 
   useEffect(() => {
     void Promise.all([
@@ -216,6 +253,21 @@ export function App({
     ]);
     return stopPolling;
   }, [llmStore, prepareVideoChoice, stopPolling]);
+
+  useEffect(() => browser.onMediaUpload((message) => {
+    if (message.jobId !== activeJobRef.current) return;
+    if (message.type === "MEDIA_UPLOAD_PROGRESS") {
+      const percent = message.totalBytes && message.totalBytes > 0
+        ? Math.min(100, Math.round((message.uploadedBytes / message.totalBytes) * 100))
+        : 0;
+      setUploadPercent(percent);
+    } else if (message.type === "MEDIA_UPLOAD_FAILED") {
+      setError(errorMessageForCode(message.code));
+      setErrorCodeValue(message.code);
+      setPhase("error");
+      stopPolling();
+    }
+  }), [browser, stopPolling]);
 
   const checkCaptions = async () => {
     const url = choice === "current" ? context?.url ?? "" : replacementUrl.trim();
@@ -228,10 +280,35 @@ export function App({
     setErrorCodeValue(null);
     setPhase("checking");
     try {
-      const inspected = await api.inspect(url);
+      const activeRef = choice === "current" ? context?.contentRef : null;
+      const candidates = context && activeRef?.platform === "x"
+        ? await browser.getMediaCandidates(context.tabId, activeRef)
+        : [];
+      const inspected = await api.inspect(activeRef?.platform === "x" ? {
+        url,
+        activeMediaIndex: activeRef.mediaIndex,
+        mediaCandidates: candidates,
+      } : url);
+      if (inspected.sourceStatus !== "ready") {
+        const code = inspected.sourceStatus === "play_required"
+          ? "x_video_play_required"
+          : "x_media_not_detected";
+        setError(errorMessageForCode(code));
+        setErrorCodeValue(code);
+        setPhase("selecting");
+        return;
+      }
       setInspection(inspected);
+      setMediaCandidates(candidates);
       setInspectionUrl(url);
       setSourceLanguage(inspected.selectedLanguage);
+      if (inspected.contentRef.platform === "x") {
+        const history = await api.getHistory({ contentId: inspected.contentId, limit: 1, offset: 0 });
+        if (history.items[0]) {
+          showResult(await api.getResult(history.items[0].jobId));
+          return;
+        }
+      }
       setPhase("ready");
     } catch (requestError) {
       const code = errorCode(requestError);
@@ -243,11 +320,13 @@ export function App({
 
   const viewExistingAnalysis = () => {
     const existing = context?.analysis;
-    if (!context || !existing || existing.videoId !== context.videoId) return;
+    if (!context?.contentRef || !existing || !analysisMatches(existing, context.contentRef)) return;
     stopPolling();
     setJobStatus("queued");
+    setProcessingPlatform(context.contentRef.platform);
     setPhase("processing");
-    void poll(existing.jobId, existing.videoId);
+    activeJobRef.current = existing.jobId;
+    void poll(existing.jobId, context.contentRef, context.tabId);
   };
 
   const openHistory = async (reset = true) => {
@@ -271,11 +350,10 @@ export function App({
     setHistoryLoading(true);
     setHistoryError("");
     try {
-      setResult(await api.getResult(item.jobId));
-      setResultFromHistory(true);
+      const analysis = await api.getResult(item.jobId);
       setSection("overview");
       setQuery("");
-      setPhase("complete");
+      showResult(analysis, true);
     } catch (requestError) {
       setHistoryError(errorMessageForCode(errorCode(requestError), "这条历史记录暂时无法打开"));
     } finally {
@@ -291,34 +369,39 @@ export function App({
       return;
     }
     stopPolling();
+    setProcessingPlatform(inspection.contentRef.platform);
     setPhase("processing");
     setJobStatus("queued");
     try {
-      const videoId = inspection.videoId;
-      if (!videoId) throw new Error("X content controls are not available yet");
+      const contentRef = inspection.contentRef;
+      const title = contentRef.platform === "youtube" && contentRef.sourceContentId !== context.videoId
+        ? `YouTube video ${contentRef.sourceContentId}`
+        : context.title;
       setFailedAnalysis({
-        videoId,
+        contentRef,
         sourceLanguage,
         targetLanguage,
-        title: videoId === context.videoId ? context.title : `YouTube video ${videoId}`,
+        title,
       });
       const created = await api.createAnalysis({
-        videoId,
+        ...(contentRef.platform === "youtube"
+          ? { videoId: contentRef.sourceContentId }
+          : { contentRef, mediaUrl: mediaCandidates[0]?.url }),
         sourceLanguage,
         targetLanguage,
-        title: videoId === context.videoId ? context.title : `YouTube video ${videoId}`,
+        title,
         llmConfig,
       });
-      if (videoId !== context.videoId) {
-        await browser.seek(context.tabId, videoId, 0);
+      if (contentRef.platform === "youtube" && contentRef.sourceContentId !== context.videoId) {
+        await browser.seek(context.tabId, contentRef, 0);
       }
-      await browser.registerAnalysis(context.tabId, videoId, created.jobId);
+      await browser.registerAnalysis(context.tabId, contentRef, created.jobId);
+      activeJobRef.current = created.jobId;
       if (created.status === "completed") {
-        setResult(await api.getResult(created.jobId));
-        setPhase("complete");
+        showResult(await api.getResult(created.jobId));
         setFailedAnalysis(null);
       } else {
-        void poll(created.jobId, videoId);
+        void poll(created.jobId, contentRef, context.tabId);
       }
     } catch (requestError) {
       const code = errorCode(requestError);
@@ -337,25 +420,28 @@ export function App({
       return;
     }
     stopPolling();
+    setProcessingPlatform(result.contentRef.platform);
     setPhase("processing");
     setJobStatus("queued");
     try {
-      const videoId = result.videoId;
-      if (!videoId) throw new Error("X content controls are not available yet");
-      if (videoId !== context.videoId) {
-        await browser.seek(context.tabId, videoId, 0);
+      const contentRef = result.contentRef;
+      if (contentRef.platform === "youtube" && contentRef.sourceContentId !== context.videoId) {
+        await browser.seek(context.tabId, contentRef, 0);
       }
       const created = await api.createAnalysis({
-        videoId,
+        ...(contentRef.platform === "youtube"
+          ? { videoId: contentRef.sourceContentId }
+          : { contentRef, mediaUrl: mediaCandidates[0]?.url }),
         sourceLanguage: result.sourceLanguage,
         targetLanguage: result.targetLanguage,
         title: result.videoTitle,
         llmConfig,
         force: true,
       });
-      await browser.registerAnalysis(context.tabId, videoId, created.jobId);
+      await browser.registerAnalysis(context.tabId, contentRef, created.jobId);
+      activeJobRef.current = created.jobId;
       setResultFromHistory(false);
-      void poll(created.jobId, videoId);
+      void poll(created.jobId, contentRef, context.tabId);
     } catch (requestError) {
       setError(errorMessageForCode(errorCode(requestError)));
       setPhase("error");
@@ -373,21 +459,28 @@ export function App({
       setPhase("settings");
       return;
     }
+    setProcessingPlatform(failedAnalysis.contentRef.platform);
     setPhase("processing");
     setJobStatus("queued");
     setErrorCodeValue(null);
     try {
       const created = await api.createAnalysis({
-        ...failedAnalysis,
+        ...(failedAnalysis.contentRef.platform === "youtube"
+          ? { videoId: failedAnalysis.contentRef.sourceContentId }
+          : { contentRef: failedAnalysis.contentRef, mediaUrl: mediaCandidates[0]?.url }),
+        sourceLanguage: failedAnalysis.sourceLanguage,
+        targetLanguage: failedAnalysis.targetLanguage,
+        title: failedAnalysis.title,
         llmConfig,
         force: true,
       });
       await browser.registerAnalysis(
         context.tabId,
-        failedAnalysis.videoId,
+        failedAnalysis.contentRef,
         created.jobId,
       );
-      void poll(created.jobId, failedAnalysis.videoId);
+      activeJobRef.current = created.jobId;
+      void poll(created.jobId, failedAnalysis.contentRef, context.tabId);
     } catch (requestError) {
       const code = errorCode(requestError);
       setError(errorMessageForCode(code));
@@ -403,8 +496,8 @@ export function App({
   };
 
   const seek = (startMs: number) => {
-    const videoId = result?.videoId ?? context?.videoId;
-    if (context && videoId) void browser.seek(context.tabId, videoId, startMs);
+    const contentRef = result?.contentRef ?? context?.contentRef;
+    if (context && contentRef) void browser.seek(context.tabId, contentRef, startMs);
   };
 
   const transcript = useMemo(() => {
@@ -415,7 +508,7 @@ export function App({
       `${item.original} ${item.translated ?? ""}`.toLocaleLowerCase().includes(normalized),
     );
   }, [query, result]);
-  const existingJobId = context?.analysis && context.analysis.videoId === context.videoId
+  const existingJobId = context?.analysis && context.contentRef && analysisMatches(context.analysis, context.contentRef)
     ? context.analysis.jobId
     : null;
 
@@ -456,9 +549,11 @@ export function App({
       {phase === "checking" && <CheckingView />}
       {phase === "ready" && inspection && (
         <ReadyView
-          title={inspection.videoId === context?.videoId ? context?.title ?? "YouTube video" : `YouTube 视频 ${inspection.videoId}`}
+          title={inspection.contentRef.platform === "x"
+            ? context?.title ?? "X video"
+            : inspection.videoId === context?.videoId ? context?.title ?? "YouTube video" : `YouTube 视频 ${inspection.videoId}`}
           inspection={inspection}
-          isCurrentVideo={inspection.videoId === context?.videoId}
+          isCurrentVideo={Boolean(context?.contentRef && sameContentRef(inspection.contentRef, context.contentRef))}
           inspectionUrl={inspectionUrl}
           sourceLanguage={sourceLanguage}
           targetLanguage={targetLanguage}
@@ -508,7 +603,7 @@ export function App({
           onBack={() => void prepareVideoChoice()}
         />
       )}
-      {phase === "processing" && <ProcessingView status={jobStatus} />}
+      {phase === "processing" && <ProcessingView platform={processingPlatform} status={jobStatus} uploadPercent={uploadPercent} />}
       {phase === "error" && <ErrorView
         message={error}
         retryLabel={errorCodeValue === "llm_credentials_expired" ? "重试" : "重新检查"}
@@ -549,14 +644,15 @@ function SelectionView({
   onSettings(): void;
 }) {
   const usingCurrentVideo = choice === "current";
+  const isX = context?.contentRef?.platform === "x";
   return (
     <main className="selection-view">
       <p className="section-label">开始前</p>
       <h1>选择要分析的视频</h1>
-      <div className="choice-switch" role="tablist" aria-label="视频来源">
+      {!isX && <div className="choice-switch" role="tablist" aria-label="视频来源">
         <button type="button" role="tab" aria-selected={usingCurrentVideo} className={usingCurrentVideo ? "active" : ""} onClick={() => onChoiceChange("current")}>当前视频</button>
         <button type="button" role="tab" aria-selected={!usingCurrentVideo} className={!usingCurrentVideo ? "active" : ""} onClick={() => onChoiceChange("replacement")}>输入其他 YouTube 链接</button>
-      </div>
+      </div>}
       {usingCurrentVideo ? (
         <div className="current-video">
           <FileVideo2 size={17} />
@@ -569,10 +665,10 @@ function SelectionView({
         </label>
       )}
       {error && <p className="inline-error" role="alert"><AlertCircle size={15} />{error}</p>}
-      <button className="primary-button" type="button" onClick={onCheck}>{usingCurrentVideo ? "检查当前视频字幕" : "检查此链接字幕"}</button>
+      <button className="primary-button" type="button" onClick={onCheck}>{usingCurrentVideo ? (isX ? "检查当前视频" : "检查当前视频字幕") : "检查此链接字幕"}</button>
       {usingCurrentVideo && existingJobId && <button className="secondary-button" type="button" onClick={onViewExisting}>查看当前分析</button>}
       {!llmConfigured && <button className="setup-link" type="button" onClick={onSettings}><Settings size={14} />先配置 LLM，再生成翻译和概览</button>}
-      <p className="privacy-note">先确认公开字幕是否可读，再决定是否开始分析。</p>
+      <p className="privacy-note">{isX ? "视频会在本机提取音频并识别语音。" : "先确认公开字幕是否可读，再决定是否开始分析。"}</p>
     </main>
   );
 }
@@ -603,15 +699,17 @@ function ReadyView({
     return result;
   }, []);
   const selected = tracks.find((track) => track.languageCode === sourceLanguage);
+  const isX = inspection.contentRef.platform === "x";
   return (
     <main className="ready-view">
-      <p className="section-label">{isCurrentVideo ? "当前视频字幕" : "已检测替换视频"}</p>
+      <p className="section-label">{isX ? "当前 X 视频" : isCurrentVideo ? "当前视频字幕" : "已检测替换视频"}</p>
       <h1>{title}</h1>
       <p className="inspection-url">{inspectionUrl}</p>
-      <div className="caption-status"><Check size={14} /><span>检测到可读取字幕</span></div>
+      <div className="caption-status"><Check size={14} /><span>{isX ? "语音将自动识别" : "检测到可读取字幕"}</span></div>
       <div className="form-row">
         <label htmlFor="source-language">源字幕</label>
         <select id="source-language" value={sourceLanguage} onChange={(event) => onSourceChange(event.target.value)}>
+          {isX && <option value="auto">自动检测</option>}
           {tracks.map((track) => (
             <option key={`${track.languageCode}-${track.isGenerated}`} value={track.languageCode}>
               {track.languageName}{track.isGenerated ? "（自动生成）" : ""}
@@ -626,13 +724,13 @@ function ReadyView({
         </select>
       </div>
       <div className="ready-meta">
-        <Languages size={16} /><span>{selected?.isGenerated ? "YouTube 自动字幕" : "提供者字幕"}</span>
+        <Languages size={16} /><span>{isX ? "自动识别语音" : selected?.isGenerated ? "YouTube 自动字幕" : "提供者字幕"}</span>
         <Clock3 size={16} /><span>{formatTime(inspection.durationMs)}</span>
       </div>
       <button className="primary-button" type="button" onClick={onStart}>{isCurrentVideo ? "分析此视频" : "分析并打开此视频"}</button>
       {!llmConfigured && <button className="setup-link" type="button" onClick={onSettings}><Settings size={14} />配置 LLM 后开始</button>}
       <button className="secondary-button" type="button" onClick={onBack}>更换视频</button>
-      <p className="privacy-note">只处理公开提供的字幕。</p>
+      <p className="privacy-note">{isX ? "媒体只上传到你的本地 Veeky 服务。" : "只处理公开提供的字幕。"}</p>
     </main>
   );
 }
@@ -670,19 +768,48 @@ function SettingsView({
   );
 }
 
-function ProcessingView({ status }: { status: JobStatus }) {
-  const stages: Array<[JobStatus, string]> = [
-    ["fetching_transcript", "读取字幕"],
-    ["analyzing", "整理章节与重点"],
-    ["translating", "翻译字幕"],
-  ];
-  const activeIndex = status === "queued" ? 0 : stages.findIndex(([key]) => key === status);
+function ProcessingView({
+  platform,
+  status,
+  uploadPercent,
+}: {
+  platform: ContentRef["platform"];
+  status: JobStatus;
+  uploadPercent: number | null;
+}) {
+  const stages: Array<[JobStatus, string]> = platform === "x"
+    ? [
+      ["downloading_media", "获取视频"],
+      ["extracting_audio", "提取音频"],
+      ["transcribing", "识别语音"],
+      ["analyzing", "整理章节与重点"],
+      ["translating", "翻译字幕"],
+    ]
+    : [
+      ["fetching_transcript", "读取字幕"],
+      ["analyzing", "整理章节与重点"],
+      ["translating", "翻译字幕"],
+    ];
+  const activeIndex = status === "queued" || status === "waiting_for_media"
+    ? 0
+    : stages.findIndex(([key]) => key === status);
+  const title = platform === "youtube"
+    ? "正在读这条视频"
+    : uploadPercent !== null && status === "waiting_for_media"
+    ? `正在上传视频 ${uploadPercent}%`
+    : status === "waiting_for_media" || status === "downloading_media"
+      ? "正在获取 X 视频"
+      : status === "extracting_audio"
+        ? "正在提取音频"
+        : status === "transcribing"
+          ? "正在识别语音"
+          : "正在读这条视频";
   return (
     <main className="processing-view">
       <div className="processing-mark"><span></span><span></span><span></span></div>
       <p className="section-label">后台处理中</p>
-      <h1>正在读这条视频</h1>
-      <p>切换网页不会中断任务。回到这个 YouTube 标签页后，结果仍会保留。</p>
+      <h1>{title}</h1>
+      <p>切换网页不会中断任务。回到{platform === "youtube" ? "这个 YouTube" : "原视频"}标签页后，结果仍会保留。</p>
       <div className="stage-list">
         {stages.map(([key, label], index) => (
           <div className={`stage ${index < activeIndex ? "done" : ""} ${index === activeIndex ? "active" : ""}`} key={key}>
@@ -840,6 +967,28 @@ function errorCode(error: unknown): string | null {
   return typeof error === "object" && error !== null && "code" in error
     ? String(error.code)
     : null;
+}
+
+function sameContentRef(left: ContentRef, right: ContentRef): boolean {
+  return left.platform === right.platform
+    && left.sourceContentId === right.sourceContentId
+    && left.mediaIndex === right.mediaIndex;
+}
+
+function analysisMatches(analysis: NonNullable<ActiveTabContext["analysis"]>, contentRef: ContentRef): boolean {
+  if (analysis.contentRef) return sameContentRef(analysis.contentRef, contentRef);
+  return contentRef.platform === "youtube" && analysis.videoId === contentRef.sourceContentId;
+}
+
+function isBareXStatusUrl(candidate: string): boolean {
+  try {
+    const url = new URL(candidate);
+    return url.protocol === "https:"
+      && (url.hostname === "x.com" || url.hostname === "www.x.com")
+      && /^\/[^/]+\/status\/[0-9]+\/?$/.test(url.pathname);
+  } catch {
+    return false;
+  }
 }
 
 function formatCompletedAt(value: string): string {

@@ -1,5 +1,6 @@
 import { installXPlayerTracker } from "./x-player";
-import type { ExtensionMessage } from "../shared/types";
+import { SubtitleOverlay } from "./subtitle-overlay";
+import type { ContentRef, ExtensionMessage, TranscriptSegment } from "../shared/types";
 
 type ContentChromeApi = Pick<typeof chrome, "runtime">;
 
@@ -23,18 +24,83 @@ export function installContentScript(
       // The extension can reload while an X page remains open.
     }
   };
+  const overlay = new SubtitleOverlay(pageDocument);
+  let activeRef: ContentRef | null = null;
+  let activeVideo: HTMLVideoElement | null = null;
+  const subtitles = new Map<string, TranscriptSegment[]>();
+
+  const mountSubtitles = () => {
+    if (!activeRef || !activeVideo) return;
+    const segments = subtitles.get(contentRefKey(activeRef));
+    if (segments) overlay.mount(activeVideo, segments);
+  };
+  const onMessage = (message: ExtensionMessage) => {
+    if (message.type === "SET_SUBTITLES") {
+      subtitles.set(contentRefKey(message.contentRef), message.segments.filter((item) => item.translated));
+      if (activeRef && sameContentRef(activeRef, message.contentRef)) mountSubtitles();
+      return;
+    }
+    if (message.type !== "SEEK_CONTENT" || !activeRef || !activeVideo) return;
+    if (!sameContentRef(activeRef, message.contentRef) || !activeVideo.isConnected) return;
+    activeVideo.currentTime = Math.max(0, message.startMs / 1000);
+    void activeVideo.play().catch(() => undefined);
+  };
+  chromeApi.runtime.onMessage.addListener(onMessage);
   const stopTracker = installXPlayerTracker({
     window: pageWindow,
     document: pageDocument,
-    onActive: (contentRef, durationMs) => send({ type: "X_PLAYER_ACTIVE", contentRef, durationMs }),
-    onInactive: (contentRef) => send({ type: "X_PLAYER_INACTIVE", contentRef }),
+    onActive: (contentRef, durationMs) => {
+      activeRef = contentRef;
+      activeVideo = findActiveVideo(pageDocument, contentRef);
+      mountSubtitles();
+      send({ type: "X_PLAYER_ACTIVE", contentRef, durationMs });
+    },
+    onInactive: (contentRef) => {
+      if (activeRef && sameContentRef(activeRef, contentRef)) {
+        activeRef = null;
+        activeVideo = null;
+        overlay.clear();
+      }
+      send({ type: "X_PLAYER_INACTIVE", contentRef });
+    },
   });
   const teardown = () => {
     stopTracker();
+    chromeApi.runtime.onMessage.removeListener(onMessage);
+    overlay.destroy();
     if (installations.get(pageDocument) === teardown) installations.delete(pageDocument);
   };
   installations.set(pageDocument, teardown);
   return teardown;
+}
+
+function findActiveVideo(pageDocument: Document, contentRef: ContentRef): HTMLVideoElement | null {
+  const videos = Array.from(pageDocument.querySelectorAll<HTMLVideoElement>("video"));
+  const playing = videos.filter((video) => !video.paused);
+  const candidates = playing.length > 0 ? playing : videos;
+  const explicit = candidates.find((video) => {
+    const anchor = video.closest<HTMLAnchorElement>('a[href*="/status/"]');
+    return anchor?.getAttribute("href")?.includes(
+      `/status/${contentRef.sourceContentId}/video/${contentRef.mediaIndex}`,
+    );
+  });
+  if (explicit) return explicit;
+  const scoped = candidates.filter((video) => (
+    video.closest("article, [role=dialog]")?.querySelector<HTMLAnchorElement>(
+      `a[href*="/status/${contentRef.sourceContentId}"]`,
+    )
+  ));
+  return scoped[contentRef.mediaIndex - 1] ?? scoped[0] ?? null;
+}
+
+function sameContentRef(left: ContentRef, right: ContentRef): boolean {
+  return left.platform === right.platform
+    && left.sourceContentId === right.sourceContentId
+    && left.mediaIndex === right.mediaIndex;
+}
+
+function contentRefKey(contentRef: ContentRef): string {
+  return `${contentRef.platform}:${contentRef.sourceContentId}:${contentRef.mediaIndex}`;
 }
 
 function isPromiseLike(value: unknown): value is { catch: (handler: () => undefined) => unknown } {

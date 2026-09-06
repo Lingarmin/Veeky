@@ -26,6 +26,14 @@ describe("side panel helpers", () => {
     expect(errorMessageForCode("llm_credentials_expired")).toBe("任务凭据已过期，请点击重试。");
     expect(errorMessageForCode("quota_service_unavailable")).toBe("服务暂时繁忙，请稍后再试。");
     expect(errorMessageForCode("installation_auth_required")).toBe("插件身份验证失败，请刷新后重试。");
+    expect(errorMessageForCode("x_video_play_required")).toBe("请先播放当前视频 1 至 2 秒，再重试");
+    expect(errorMessageForCode("x_media_not_detected")).toBe("未检测到当前视频媒体，请确认视频可以正常播放");
+    expect(errorMessageForCode("x_media_url_expired")).toBe("媒体地址已过期，请重新播放视频");
+    expect(errorMessageForCode("media_too_large")).toBe("视频文件过大，无法分析");
+    expect(errorMessageForCode("media_upload_interrupted")).toBe("视频上传中断，请重新开始");
+    expect(errorMessageForCode("audio_track_missing")).toBe("视频中没有可识别的音轨");
+    expect(errorMessageForCode("asr_resource_exhausted")).toBe("当前设备资源不足，请稍后重试");
+    expect(errorMessageForCode("asr_failed")).toBe("语音识别失败，请重新分析");
     expect(errorMessageForCode("unexpected")).toBe("分析没有完成，请稍后重试");
     expect(errorMessageForCode("unexpected", "LLM 连接测试失败")).toBe("LLM 连接测试失败");
   });

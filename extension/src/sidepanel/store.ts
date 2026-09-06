@@ -41,6 +41,14 @@ const ERROR_MESSAGES: Record<string, string> = {
   llm_credentials_expired: "任务凭据已过期，请点击重试。",
   quota_service_unavailable: "服务暂时繁忙，请稍后再试。",
   installation_auth_required: "插件身份验证失败，请刷新后重试。",
+  x_video_play_required: "请先播放当前视频 1 至 2 秒，再重试",
+  x_media_not_detected: "未检测到当前视频媒体，请确认视频可以正常播放",
+  x_media_url_expired: "媒体地址已过期，请重新播放视频",
+  media_too_large: "视频文件过大，无法分析",
+  media_upload_interrupted: "视频上传中断，请重新开始",
+  audio_track_missing: "视频中没有可识别的音轨",
+  asr_resource_exhausted: "当前设备资源不足，请稍后重试",
+  asr_failed: "语音识别失败，请重新分析",
 };
 
 export function errorMessageForCode(
