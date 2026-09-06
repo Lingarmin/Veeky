@@ -7,7 +7,7 @@ import { installXPlayerTracker } from "../src/content/x-player";
 import { installContentScript } from "../src/content/index";
 import { findActiveSubtitle, SubtitleOverlay } from "../src/content/subtitle-overlay";
 import { contentKey, parseContentRef } from "../src/shared/content";
-import type { ContentRef } from "../src/shared/types";
+import type { ContentRef, ExtensionMessage } from "../src/shared/types";
 
 const STATUS_ID = "2075545587093807111";
 
@@ -348,7 +348,7 @@ describe("X active player tracking", () => {
     article.append(replacement);
     await flushMutations();
 
-    expect(onInactive).toHaveBeenCalledOnce();
+    expect(onInactive).not.toHaveBeenCalled();
     expect(onActive).toHaveBeenCalledTimes(2);
     expect(onActive).toHaveBeenLastCalledWith(expect.objectContaining({ mediaIndex: 1 }), 30_000);
 
@@ -356,6 +356,37 @@ describe("X active player tracking", () => {
     await flushMutations();
     replacement.dispatchEvent(new Event("play"));
     expect(onActive).toHaveBeenCalledTimes(2);
+    teardown();
+  });
+
+  it("keeps the same media selected when X replaces a paused player", async () => {
+    window.history.replaceState({}, "", `/owner/status/${STATUS_ID}`);
+    renderStatus({ mediaCount: 2, reply: true });
+    const onActive = vi.fn();
+    const onInactive = vi.fn();
+    const teardown = installXPlayerTracker({ onActive, onInactive });
+    const oldVideo = document.querySelector<HTMLVideoElement>("#main-1")!;
+    const otherMedia = document.querySelector<HTMLVideoElement>("#main-2")!;
+    const reply = document.querySelector<HTMLVideoElement>("#reply-video")!;
+    setPlayerState(oldVideo, false);
+    setPlayerState(otherMedia, false, 60);
+    setPlayerState(reply, false, 45);
+    oldVideo.dispatchEvent(new Event("play"));
+    reply.dispatchEvent(new Event("play"));
+    setPlayerState(oldVideo, true);
+
+    const replacement = document.createElement("video");
+    replacement.id = "paused-replacement";
+    setPlayerState(replacement, true, 30);
+    oldVideo.replaceWith(replacement);
+    await flushMutations();
+
+    expect(onInactive).not.toHaveBeenCalled();
+    expect(onActive).toHaveBeenCalledTimes(2);
+    expect(onActive).toHaveBeenLastCalledWith(expect.objectContaining({
+      sourceContentId: STATUS_ID,
+      mediaIndex: 1,
+    }), 30_000);
     teardown();
   });
 
@@ -570,8 +601,8 @@ describe("X subtitle overlay", () => {
     mediaIndex: 1,
   };
   const segments = [
-    { startMs: 0, durationMs: 1000, translated: "第一句" },
-    { startMs: 1000, durationMs: 1000, translated: "第二句" },
+    { id: "one", startMs: 0, durationMs: 1000, original: "First", translated: "第一句" },
+    { id: "two", startMs: 1000, durationMs: 1000, original: "Second", translated: "第二句" },
   ];
 
   it("finds the active translated segment with a binary timeline lookup", () => {
@@ -710,6 +741,51 @@ describe("X subtitle overlay", () => {
     expect(video.currentTime).toBe(1.5);
     expect(play).toHaveBeenCalledOnce();
     expect(document.querySelector(".veeky-subtitle-overlay")).toBeInTheDocument();
+    teardown();
+  });
+
+  it("rebinds subtitles and seek when X replaces a paused video", async () => {
+    window.history.replaceState({}, "", `/owner/status/${STATUS_ID}`);
+    renderStatus({ mediaCount: 2, reply: true });
+    const listeners: Array<(message: ExtensionMessage) => void> = [];
+    const sendMessage = vi.fn((_message, callback?: () => void) => callback?.());
+    const chromeApi = {
+      runtime: {
+        lastError: undefined,
+        sendMessage,
+        onMessage: { addListener: vi.fn((listener) => listeners.push(listener)), removeListener: vi.fn() },
+      },
+    };
+    const oldVideo = document.querySelector<HTMLVideoElement>("#main-1")!;
+    const otherMedia = document.querySelector<HTMLVideoElement>("#main-2")!;
+    const reply = document.querySelector<HTMLVideoElement>("#reply-video")!;
+    setPlayerState(oldVideo, false);
+    setPlayerState(otherMedia, false, 60);
+    setPlayerState(reply, false, 45);
+    const teardown = installContentScript(chromeApi as never);
+    oldVideo.dispatchEvent(new Event("play"));
+    listeners[0]({ type: "SET_SUBTITLES", contentRef, segments });
+    reply.dispatchEvent(new Event("play"));
+    setPlayerState(oldVideo, true);
+
+    const replacement = document.createElement("video");
+    const play = vi.fn(async () => undefined);
+    Object.defineProperties(replacement, {
+      paused: { configurable: true, value: true },
+      duration: { configurable: true, value: 30 },
+      play: { configurable: true, value: play },
+    });
+    oldVideo.replaceWith(replacement);
+    await flushMutations();
+
+    listeners[0]({ type: "SEEK_CONTENT", contentRef, startMs: 1500 });
+
+    expect(replacement.currentTime).toBe(1.5);
+    expect(play).toHaveBeenCalledOnce();
+    expect(document.querySelectorAll(".veeky-subtitle-overlay")).toHaveLength(1);
+    expect(sendMessage).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: "X_PLAYER_INACTIVE",
+    }), expect.anything());
     teardown();
   });
 });

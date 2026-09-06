@@ -495,16 +495,22 @@ export function App({
       setPhase("settings");
       return;
     }
+    const contentRef = result.contentRef;
+    const matchesCurrentTab = Boolean(
+      context.contentRef && sameContentRef(context.contentRef, contentRef),
+    );
+    if (contentRef.platform === "x" && !matchesCurrentTab) {
+      setError(errorMessageForCode("x_video_context_required"));
+      setErrorCodeValue("x_video_context_required");
+      setPhase("error");
+      return;
+    }
     stopPolling();
     const generation = pollGenerationRef.current;
     setProcessingPlatform(result.contentRef.platform);
     setPhase("processing");
     setJobStatus("queued");
     try {
-      const contentRef = result.contentRef;
-      const matchesCurrentTab = Boolean(
-        context.contentRef && sameContentRef(context.contentRef, contentRef),
-      );
       const currentCandidate = matchesCurrentTab
         && inspection?.contentRef
         && sameContentRef(inspection.contentRef, contentRef)
@@ -599,7 +605,7 @@ export function App({
   };
 
   const openSettings = () => {
-    stopPolling();
+    if (activeJobRef.current === null) stopPolling();
     setSettingsReturnPhase(phase === "settings" ? "selecting" : phase);
     setSettingsError("");
     setPhase("settings");

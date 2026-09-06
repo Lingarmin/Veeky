@@ -1,4 +1,4 @@
-import { installXPlayerTracker } from "./x-player";
+import { findXVideoForContentRef, installXPlayerTracker } from "./x-player";
 import { SubtitleOverlay } from "./subtitle-overlay";
 import type { ContentRef, ExtensionMessage, TranscriptSegment } from "../shared/types";
 
@@ -51,7 +51,7 @@ export function installContentScript(
     document: pageDocument,
     onActive: (contentRef, durationMs) => {
       activeRef = contentRef;
-      activeVideo = findActiveVideo(pageDocument, contentRef);
+      activeVideo = findXVideoForContentRef(pageDocument, pageWindow, contentRef);
       mountSubtitles();
       send({ type: "X_PLAYER_ACTIVE", contentRef, durationMs });
     },
@@ -72,25 +72,6 @@ export function installContentScript(
   };
   installations.set(pageDocument, teardown);
   return teardown;
-}
-
-function findActiveVideo(pageDocument: Document, contentRef: ContentRef): HTMLVideoElement | null {
-  const videos = Array.from(pageDocument.querySelectorAll<HTMLVideoElement>("video"));
-  const playing = videos.filter((video) => !video.paused);
-  const candidates = playing.length > 0 ? playing : videos;
-  const explicit = candidates.find((video) => {
-    const anchor = video.closest<HTMLAnchorElement>('a[href*="/status/"]');
-    return anchor?.getAttribute("href")?.includes(
-      `/status/${contentRef.sourceContentId}/video/${contentRef.mediaIndex}`,
-    );
-  });
-  if (explicit) return explicit;
-  const scoped = candidates.filter((video) => (
-    video.closest("article, [role=dialog]")?.querySelector<HTMLAnchorElement>(
-      `a[href*="/status/${contentRef.sourceContentId}"]`,
-    )
-  ));
-  return scoped[contentRef.mediaIndex - 1] ?? scoped[0] ?? null;
 }
 
 function sameContentRef(left: ContentRef, right: ContentRef): boolean {

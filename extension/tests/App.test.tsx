@@ -495,7 +495,7 @@ describe("Side Panel", () => {
     expect(browser.registerAnalysis).toHaveBeenCalledWith(7, xContentRef, "job-1");
   });
 
-  it("does not use current video A media while reanalyzing historical video B", async () => {
+  it("blocks historical X video B before creating a job for current video A", async () => {
     const historicalRef = { ...xContentRef, sourceContentId: "2075545587093807222" };
     const api = createApi();
     const historicalResult = {
@@ -515,13 +515,6 @@ describe("Side Panel", () => {
         hasMore: false,
       });
     api.getResult.mockResolvedValueOnce(historicalResult);
-    api.createAnalysis.mockResolvedValueOnce({
-      jobId: "job-b", cacheHit: false, status: "queued",
-      contentId: historicalResult.contentId, contentRef: historicalRef, videoId: null,
-    });
-    api.getStatus.mockResolvedValueOnce({
-      jobId: "job-b", status: "waiting_for_media", failureCode: null, failureDetail: null,
-    });
     const browser = createXBrowser();
     const user = userEvent.setup();
     render(<App api={api} browser={browser} llmStore={createLlmStore()} pollIntervalMs={1} />);
@@ -532,9 +525,10 @@ describe("Side Panel", () => {
     await user.click(await screen.findByRole("button", { name: "打开 Historical X video B" }));
     await user.click(await screen.findByRole("button", { name: "重新分析" }));
 
-    expect(api.createAnalysis).toHaveBeenCalledWith(expect.not.objectContaining({ mediaUrl: xCandidate.url }));
+    expect(api.createAnalysis).not.toHaveBeenCalled();
     expect(browser.getMediaCandidates).toHaveBeenCalledTimes(1);
-    expect(browser.registerAnalysis).not.toHaveBeenCalledWith(7, historicalRef, "job-b");
+    expect(browser.registerAnalysis).not.toHaveBeenCalled();
+    expect(api.getStatus).not.toHaveBeenCalled();
     expect(await screen.findByText("请先打开并播放要重新分析的 X 视频，然后重试")).toBeInTheDocument();
   });
   it("accepts content references in the analysis API contract", async () => {
@@ -865,6 +859,68 @@ describe("Side Panel", () => {
     expect(await screen.findByText("读取字幕")).toBeInTheDocument();
     expect(screen.queryByText("获取视频")).not.toBeInTheDocument();
   });
+
+  it.each(["youtube", "x"] as const)(
+    "keeps %s polling active while settings are opened and closed",
+    async (platform) => {
+      const pendingStatus = deferred<Awaited<ReturnType<AnalysisApi["getStatus"]>>>();
+      const api = createApi();
+      const completedResult = {
+        ...(await api.getResult("fixture")),
+        ...(platform === "x" ? {
+          contentId: xContentId,
+          contentRef: xContentRef,
+          videoId: null,
+          videoTitle: "X video",
+          sourceLanguage: "auto",
+        } : {}),
+      };
+      api.getResult.mockClear();
+      api.getResult.mockResolvedValue(completedResult);
+      api.getStatus
+        .mockResolvedValueOnce({
+          jobId: "job-processing", status: "analyzing", failureCode: null, failureDetail: null,
+        })
+        .mockReturnValueOnce(pendingStatus.promise);
+      const browser = platform === "x" ? createXBrowser() : createBrowser();
+      browser.getActiveContext.mockResolvedValueOnce(platform === "x" ? {
+        tabId: 7,
+        url: "https://x.com/owner/status/2075545587093807111/video/1",
+        title: "X video",
+        contentRef: xContentRef,
+        durationMs: 30_000,
+        videoId: null,
+        analysis: { tabId: 7, contentRef: xContentRef, jobId: "job-processing" },
+      } : {
+        tabId: 7,
+        url: "https://www.youtube.com/watch?v=aircAruvnKk",
+        title: "But what is a neural network?",
+        contentRef: youtubeContentRef,
+        videoId: "aircAruvnKk",
+        analysis: {
+          tabId: 7,
+          contentRef: youtubeContentRef,
+          videoId: "aircAruvnKk",
+          jobId: "job-processing",
+        },
+      });
+      const user = userEvent.setup();
+      render(<App api={api} browser={browser} llmStore={createLlmStore()} pollIntervalMs={1} />);
+
+      expect(await screen.findByText(platform === "x" ? "获取视频" : "读取字幕")).toBeInTheDocument();
+      await waitFor(() => expect(api.getStatus).toHaveBeenCalledTimes(2));
+      await user.click(screen.getByRole("button", { name: "LLM 设置" }));
+      expect(await screen.findByRole("heading", { name: "配置 LLM" })).toBeInTheDocument();
+      await user.click(screen.getByRole("button", { name: "返回" }));
+
+      pendingStatus.resolve({
+        jobId: "job-processing", status: "completed", failureCode: null, failureDetail: null,
+      });
+
+      expect(await screen.findByText("视频解释神经网络如何识别手写数字。", {}, { timeout: 500 })).toBeInTheDocument();
+      expect(api.getResult).toHaveBeenCalledWith("job-processing");
+    },
+  );
 
   it("resumes an unfinished registered analysis before checking history", async () => {
     const api = createApi();

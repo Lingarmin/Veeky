@@ -12,6 +12,21 @@ export interface XPlayerTrackerOptions {
   window?: Window;
 }
 
+export function findXVideoForContentRef(
+  pageDocument: Document,
+  pageWindow: Window,
+  contentRef: ContentRef,
+): HTMLVideoElement | null {
+  return matchingVideos(
+    Array.from(pageDocument.querySelectorAll<HTMLVideoElement>("video")),
+    pageRoute(pageWindow),
+    contentRef,
+  ).sort((left, right) => (
+    Number(left.paused) - Number(right.paused)
+    || playerPriority(right) - playerPriority(left)
+  ))[0] ?? null;
+}
+
 interface Selection {
   video: HTMLVideoElement;
   contentRef: ContentRef;
@@ -100,10 +115,24 @@ export function installXPlayerTracker(options: XPlayerTrackerOptions): () => voi
     for (const [video, listeners] of bindings) {
       if (!video.isConnected) unbind(video, listeners);
     }
-    if (selection && !selection.video.isConnected) clearSelection();
 
     const videos = Array.from(pageDocument.querySelectorAll<HTMLVideoElement>("video"));
     for (const video of videos) bind(video);
+    if (selection && !selection.video.isConnected) {
+      const previous = selection;
+      const route = pageRoute(pageWindow);
+      const replacement = matchingVideos(videos, route, previous.contentRef)
+        .sort((left, right) => (
+          Number(left.paused) - Number(right.paused)
+          || playerPriority(right) - playerPriority(left)
+        ))[0];
+      if (replacement) {
+        selection = null;
+        select(replacement);
+        return;
+      }
+      clearSelection();
+    }
     if (selection && selection.video.isConnected) {
       const selectedVideo = selection.video;
       const currentRef = contentRefForVideo(selectedVideo, pageRoute(pageWindow));
@@ -155,6 +184,17 @@ export function installXPlayerTracker(options: XPlayerTrackerOptions): () => voi
 
 function pageRoute(pageWindow: Window): string {
   return `${pageWindow.location.pathname}${pageWindow.location.search}${pageWindow.location.hash}`;
+}
+
+function matchingVideos(
+  videos: HTMLVideoElement[],
+  pageUrl: string,
+  contentRef: ContentRef,
+): HTMLVideoElement[] {
+  return videos.filter((video) => {
+    const candidateRef = contentRefForVideo(video, pageUrl);
+    return candidateRef && sameContentRef(candidateRef, contentRef);
+  });
 }
 
 function contentRefForVideo(video: HTMLVideoElement, pageUrl: string): ContentRef | null {
