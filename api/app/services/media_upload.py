@@ -625,7 +625,7 @@ async def cleanup_expired_uploads(
             select(MediaUploadSession.id)
             .where(
                 MediaUploadSession.expires_at <= utc_now(),
-                MediaUploadSession.status != "expired",
+                MediaUploadSession.status.not_in(("consumed", "expired")),
             )
             .order_by(MediaUploadSession.expires_at, MediaUploadSession.id)
             .limit(bounded_limit)
@@ -641,7 +641,11 @@ async def cleanup_expired_uploads(
             .where(MediaUploadSession.id == session_id)
             .with_for_update()
         )
-        if upload is not None and _is_expired(upload):
+        if (
+            upload is not None
+            and upload.status != "consumed"
+            and _is_expired(upload)
+        ):
             await _expire_locked(database, settings, upload)
             cleaned += 1
         else:

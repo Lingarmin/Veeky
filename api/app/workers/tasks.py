@@ -58,6 +58,7 @@ from app.services.job_lease import (
     update_owned_job,
 )
 from app.services.media_upload import (
+    cleanup_expired_uploads,
     expire_complete_upload_if_unreferenced,
     expire_consumed_upload_for_terminal_job,
 )
@@ -348,7 +349,11 @@ celery_app.conf.update(
         "clear-expired-llm-credentials": {
             "task": "maintenance.clear_expired_llm_credentials",
             "schedule": 600.0,
-        }
+        },
+        "cleanup-expired-media-sessions": {
+            "task": "maintenance.cleanup_expired_media_sessions",
+            "schedule": 900.0,
+        },
     },
 )
 
@@ -1785,6 +1790,29 @@ async def run_expired_credential_cleanup() -> int:
         await engine.dispose()
 
 
+async def cleanup_expired_media_sessions_async(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    settings=None,
+) -> int:
+    current = settings or get_settings()
+    async with session_factory() as session:
+        return await cleanup_expired_uploads(session, current, limit=100)
+
+
+async def run_expired_media_cleanup() -> int:
+    current = get_settings()
+    engine = create_async_engine(current.database_url, pool_pre_ping=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        return await cleanup_expired_media_sessions_async(
+            session_factory,
+            settings=current,
+        )
+    finally:
+        await engine.dispose()
+
+
 def terminate_worker_child() -> None:
     raise WorkerTerminate()
 
@@ -1839,3 +1867,8 @@ def analyze_video(task, job_id: str, *, resume: bool = False) -> None:
 @celery_app.task(name="maintenance.clear_expired_llm_credentials")
 def clear_expired_llm_credentials() -> int:
     return asyncio.run(run_expired_credential_cleanup())
+
+
+@celery_app.task(name="maintenance.cleanup_expired_media_sessions")
+def cleanup_expired_media_sessions() -> int:
+    return asyncio.run(run_expired_media_cleanup())

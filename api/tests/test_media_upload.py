@@ -21,10 +21,13 @@ import app.workers.tasks as worker_tasks
 from app.core.settings import Settings
 from app.db.models import (
     AnalysisJob,
+    AnalysisResult as StoredAnalysisResult,
     Base,
     Installation,
     MediaUploadPart,
     MediaUploadSession,
+    TranscriptSegment as StoredTranscriptSegment,
+    TranscriptTrack,
     Video,
 )
 from app.db.session import get_session
@@ -1185,6 +1188,145 @@ async def test_cleanup_primitive_expires_only_due_sessions(media_context):
         assert future.status == "uploading"
     assert not due_directory.exists()
     assert future_directory.exists()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_does_not_expire_a_session_consumed_after_selection(
+    media_context,
+    monkeypatch,
+):
+    client, _, factory, media_root = media_context
+    session_id = (await create_session(client)).json()["sessionId"]
+    await upload_part(client, session_id, 0, b"0123456789abcdef")
+    async with factory() as session:
+        upload = await session.get(MediaUploadSession, session_id)
+        upload.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        directory = media_root / upload.directory_key
+        await session.commit()
+
+    async def consume_before_lock(_database):
+        async with factory() as session:
+            upload = await session.get(MediaUploadSession, session_id)
+            upload.status = "consumed"
+            await session.commit()
+
+    monkeypatch.setattr(
+        media_upload,
+        "_serialize_sqlite_write",
+        consume_before_lock,
+    )
+    async with factory() as session:
+        cleaned = await cleanup_expired_uploads(session, media_settings(media_root))
+
+    assert cleaned == 0
+    assert directory.is_dir()
+    async with factory() as session:
+        upload = await session.get(MediaUploadSession, session_id)
+        assert upload.status == "consumed"
+
+
+@pytest.mark.asyncio
+async def test_celery_cleanup_expires_abandoned_media_without_deleting_results(
+    media_context,
+):
+    client, _, factory, media_root = media_context
+    abandoned_id = (await create_session(client)).json()["sessionId"]
+    await upload_part(client, abandoned_id, 0, b"0123456789abcdef")
+    now = datetime.now(timezone.utc)
+
+    async with factory() as session:
+        abandoned = await session.get(MediaUploadSession, abandoned_id)
+        abandoned.expires_at = now - timedelta(seconds=1)
+        abandoned_directory = media_root / abandoned.directory_key
+        consumed_directory_key = "99999999-9999-4999-8999-999999999999"
+        consumed_directory = media_root / consumed_directory_key
+        consumed_directory.mkdir()
+        (consumed_directory / "media.mp4").write_bytes(b"completed media")
+        consumed = MediaUploadSession(
+            id="completed-upload",
+            installation_id=INSTALLATION_ID,
+            content_id=CONTENT_ID,
+            status="consumed",
+            expected_bytes=15,
+            received_bytes=15,
+            media_kind="mp4",
+            part_count=1,
+            part_size_bytes=15,
+            directory_key=consumed_directory_key,
+            expires_at=now - timedelta(seconds=1),
+        )
+
+        track = TranscriptTrack(
+            id="completed-track",
+            video_id="x:2075545587093807111:1",
+            content_id=CONTENT_ID,
+            language_code="en",
+            language_name="English",
+            is_generated=True,
+            is_translatable=False,
+            transcript_version="completed-transcript-v1",
+            transcript_source="faster_whisper",
+            asr_model="small",
+        )
+        segment = StoredTranscriptSegment(
+            id="completed-segment",
+            track=track,
+            sequence=0,
+            start_ms=0,
+            duration_ms=1000,
+            text="Already transcribed.",
+        )
+        job = AnalysisJob(
+            id="completed-job",
+            installation_id=INSTALLATION_ID,
+            video_id="x:2075545587093807111:1",
+            content_id=CONTENT_ID,
+            source_language="en",
+            target_language="zh-Hans",
+            transcript_version=track.transcript_version,
+            cache_key="completed-cleanup-fixture",
+            media_session_id=consumed.id,
+            status="completed",
+            completed_at=now,
+        )
+        result = StoredAnalysisResult(
+            id="completed-result",
+            job=job,
+            one_line_summary="Completed result",
+            summary_points=[],
+            chapters=[],
+            highlights=[],
+            model_name="fake-analysis",
+            model_version="v1",
+        )
+        session.add_all([consumed, track, segment, job, result])
+        await session.commit()
+
+    schedule = worker_tasks.celery_app.conf.beat_schedule[
+        "cleanup-expired-media-sessions"
+    ]
+    assert schedule == {
+        "task": "maintenance.cleanup_expired_media_sessions",
+        "schedule": 900.0,
+    }
+
+    cleaned = await worker_tasks.cleanup_expired_media_sessions_async(
+        factory,
+        settings=media_settings(media_root),
+    )
+
+    assert cleaned == 1
+    assert not abandoned_directory.exists()
+    async with factory() as session:
+        abandoned = await session.get(MediaUploadSession, abandoned_id)
+        assert abandoned.status == "expired"
+        consumed = await session.get(MediaUploadSession, consumed.id)
+        assert consumed.status == "consumed"
+        assert consumed_directory.is_dir()
+        assert await session.get(TranscriptTrack, track.id) is not None
+        assert await session.get(StoredTranscriptSegment, segment.id) is not None
+        assert await session.get(AnalysisJob, job.id) is not None
+        assert await session.get(StoredAnalysisResult, result.id) is not None
 
 
 @pytest.mark.asyncio

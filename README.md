@@ -1,9 +1,9 @@
-# Veeky YouTube 视频内容解析
+# Veeky 视频内容解析
 
-Veeky是一款chrome插件，启用后常驻Chrome Side Panel，扩展会读取 YouTube 的公开字幕，用 LibreTranslate 生成译文，再通过LLM服务生成概览、章节和重点片段。
-任务由 FastAPI 和 Celery 在后台执行，切换标签页不会中断处理。面板只在发起分析的 YouTube 视频标签页启用。
+Veeky 是一款 Chrome 插件，启用后常驻 Chrome Side Panel。扩展会读取 YouTube 的公开字幕，也能从 X 视频生成语音逐字稿，再通过 LLM 服务生成中文译文、概览、章节和重点片段。
+任务由 FastAPI 和 Celery 在后台执行，切换标签页不会中断处理。面板只在对应的 YouTube 或 X 视频标签页启用。
 
-当前版本不下载视频，不执行语音识别，也不生成关键帧。目前不支持无字幕视频的翻译和LLM总结。
+YouTube 分析不会下载视频。X 视频没有可读取的字幕轨道，因此 Worker 会临时获取媒体、提取音频并使用 `faster-whisper small` 识别语音。当前版本不生成关键帧。
 
 已支持功能：
 1.支持识别YouTube视频链接，检查视频字幕并进行分析；
@@ -11,6 +11,7 @@ Veeky是一款chrome插件，启用后常驻Chrome Side Panel，扩展会读取 
 3.支持视频概览总结、章节重点、精华片段解析，可点击时间戳视频直接跳转到对应部分；
 4.已分析过的视频会保存在本地，并在历史记录中可回溯，只要不清缓存会一直在；
 5.支持配置LLM模型，使用LLM服务需要用户自己提供API KEY，目前支持kimi和deepseek两家，其他模型供应商暂未集成。
+6.支持已登录用户可正常播放的 X 公开视频，并在当前播放器上同步显示中文字幕。
 
 功能截图：
 <img width="1413" height="750" alt="概览" src="https://github.com/user-attachments/assets/60d8e336-b3b1-4783-abb4-f4534a791bf0" />
@@ -58,6 +59,21 @@ curl http://127.0.0.1:8000/health
 
 当 `api` 和 `worker` 均显示 `healthy`，插件才能创建分析任务。`scheduler` 负责清理过期的临时 LLM 凭据，Redis 同时负责请求限流和任务创建锁。如果本机需要通过 `127.0.0.1:7890` 代理访问 YouTube，保持 `api/.env` 中的 `YOUTUBE_TRANSCRIPT_PROXY_URL=http://127.0.0.1:7890` 即可；容器内会自动使用 `host.docker.internal` 访问它。
 
+X 语音识别使用以下默认配置。`api/.env.example` 已包含这些值：
+
+```dotenv
+ASR_MODEL_SIZE=small
+ASR_DEVICE=cpu
+ASR_COMPUTE_TYPE=int8
+ASR_MODEL_DIR=/models/whisper
+MEDIA_TEMP_ROOT=/var/lib/veeky/media
+MAX_MEDIA_BYTES=4294967296
+MAX_TEMP_BYTES_PER_JOB=6442450944
+MEDIA_CHUNK_BYTES=8388608
+```
+
+首次处理 X 视频时，Worker 会把 Whisper small 模型下载到 `whisper_models` volume，之后重复使用。CPU 识别时间取决于视频长度和机器性能，长视频可能需要等待较久。请给 Docker 留出足够的磁盘空间和内存。
+
 构建扩展：
 
 ```bash
@@ -66,9 +82,13 @@ pnpm install
 pnpm build
 ```
 
-打开 `chrome://extensions`，启用开发者模式，选择 `加载已解压的扩展程序`，目录使用 `extension/dist`。每次重新构建后，在扩展详情页点击刷新，并重新打开侧边栏。本地 `ENVIRONMENT=development` 会接受合法的 Chrome 扩展来源，便于内部测试。需要收紧访问范围时，将 `api/.env` 中的 `ALLOWED_CHROME_EXTENSION_ORIGINS` 改为对应的 `chrome-extension://<扩展ID>`，然后重启 API。
+打开 `chrome://extensions`，启用开发者模式，选择 `加载已解压的扩展程序`，目录使用 `extension/dist`。安装时 Chrome 会显示新增的 X 和媒体访问权限，包括 `x.com`、`video.twimg.com`、`webRequest` 和 `offscreen`。这些权限用于识别当前 X 播放器、捕获媒体地址，以及在需要时上传媒体字节。每次重新构建后，在扩展详情页点击刷新，并重新打开侧边栏。本地 `ENVIRONMENT=development` 会接受合法的 Chrome 扩展来源，便于内部测试。需要收紧访问范围时，将 `api/.env` 中的 `ALLOWED_CHROME_EXTENSION_ORIGINS` 改为对应的 `chrome-extension://<扩展ID>`，然后重启 API。
 
 在 YouTube 视频页点击扩展图标即可打开面板。先选择当前视频或粘贴另一个 YouTube 链接，点击“检查字幕”确认可读字幕后再开始分析。输入其他链接并开始分析时，当前 YouTube 标签页会切换到该视频。API 地址默认为 `http://127.0.0.1:8000`。
+
+在 X 视频页使用扩展前，请先登录 X 并播放目标视频 1 至 2 秒，让扩展识别当前播放器和媒体资源，然后点击检查并开始分析。如果 Worker 无法匿名下载媒体，扩展会在浏览器登录态下读取媒体并分片上传。扩展不会把 X Cookie、认证请求头或访问令牌上传给 API。
+
+服务端只把 X 媒体保存在 `MEDIA_TEMP_ROOT` 管理的目录中。任务成功、失败或取消后会删除对应的临时媒体；未完成的上传会话过期后，`scheduler` 每 15 分钟分批清理一次。逐字稿、译文和分析结果不会随临时媒体一起删除。
 
 如果浏览器通过本地代理访问 YouTube，API 和 Worker 也需要使用同一代理。将 `YOUTUBE_TRANSCRIPT_PROXY_URL` 写入 `api/.env`，例如 `http://127.0.0.1:7890`，然后执行 `docker compose up -d --build`。未配置时服务会直接连接 YouTube。
 

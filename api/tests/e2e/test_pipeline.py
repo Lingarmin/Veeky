@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import base64
+import shutil
+import wave
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -18,6 +21,7 @@ from app.api.analyses import (
 from app.core.settings import Settings
 from app.db.models import Base
 from app.main import create_app
+from app.security.credentials import JobCredentialCipher
 from app.services.analysis import AnalysisResult, Highlight, TimedSummary
 from app.services.transcripts import (
     TranscriptInspection,
@@ -109,6 +113,56 @@ class FixedAnalysisService:
             model_version="test-1",
             generated_at=datetime.now(timezone.utc),
         )
+
+
+class WavFixtureDownloader:
+    def __init__(self, fixture: Path):
+        self.fixture = fixture
+
+    async def download(self, _url: str, destination: Path) -> Path:
+        shutil.copyfile(self.fixture, destination)
+        return destination
+
+
+class WavFixtureExtractor:
+    @staticmethod
+    def _duration_ms(path: Path) -> float:
+        with wave.open(str(path), "rb") as audio:
+            return audio.getnframes() * 1000 / audio.getframerate()
+
+    async def probe_duration_ms(self, media_path: Path) -> float:
+        return self._duration_ms(media_path)
+
+    async def probe_audio_duration_ms(self, media_path: Path) -> float:
+        return self._duration_ms(media_path)
+
+    async def extract(
+        self,
+        media_path: Path,
+        audio_path: Path,
+        *,
+        expected_duration_ms: float | None = None,
+    ) -> Path:
+        assert self._duration_ms(media_path) == expected_duration_ms
+        shutil.copyfile(media_path, audio_path)
+        return audio_path
+
+
+class FakeWavTranscriber:
+    model_size = "small"
+    version = "fake-wav-asr-v1"
+
+    def __init__(self):
+        self.paths: list[Path] = []
+
+    def transcribe(self, audio_path: Path):
+        with wave.open(str(audio_path), "rb") as audio:
+            assert audio.getnchannels() == 1
+            assert audio.getsampwidth() == 2
+            assert audio.getframerate() == 16_000
+            assert audio.getnframes() == 1_600
+        self.paths.append(audio_path)
+        return [TranscriptSegment(0, 0, 100, "Hello from X.")], "en"
 
 
 @pytest.mark.asyncio
@@ -203,4 +257,106 @@ async def test_api_pipeline_returns_timestamped_transcript_and_reuses_result():
         "videoId": "aircAruvnKk",
     }
     assert translation_provider.calls == 1
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_x_api_pipeline_transcribes_a_generated_wav_with_fake_asr(tmp_path):
+    media_root = tmp_path / "media"
+    media_root.mkdir()
+    wav_fixture = tmp_path / "fixture.wav"
+    with wave.open(str(wav_fixture), "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(16_000)
+        audio.writeframes(b"\x00\x00" * 1_600)
+
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'pipeline.sqlite'}"
+    engine = create_async_engine(database_url)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    encryption_key = base64.b64encode(b"x" * 32).decode("ascii")
+    settings = Settings(
+        database_url=database_url,
+        media_temp_root=str(media_root),
+        max_media_bytes=1024 * 1024,
+        max_temp_bytes_per_job=2 * 1024 * 1024,
+        llm_credential_encryption_key=encryption_key,
+    )
+    app = create_app(settings)
+
+    async def session_dependency() -> AsyncIterator[AsyncSession]:
+        async with factory() as session:
+            yield session
+
+    app.dependency_overrides[get_session] = session_dependency
+    app.dependency_overrides[get_job_dispatcher] = lambda: lambda _job_id: None
+    app.dependency_overrides[get_quota_limiter] = lambda: PermissiveQuotaLimiter()
+    transcriber = FakeWavTranscriber()
+    translation_provider = FixedTranslationProvider()
+    headers = {
+        "Authorization": "Bearer integration-test-installation-token-with-256-bits",
+        "X-Veeky-Installation-Id": "11111111-1111-4111-8111-111111111111",
+    }
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers=headers,
+    ) as client:
+        registered = await client.post(
+            "/v1/installations/register",
+            json={
+                "installationId": "11111111-1111-4111-8111-111111111111",
+                "installationToken": "integration-test-installation-token-with-256-bits",
+            },
+        )
+        assert registered.status_code == 201
+        created = await client.post(
+            "/v1/analyses",
+            json={
+                "contentRef": {
+                    "platform": "x",
+                    "sourceContentId": "2075545587093807111",
+                    "mediaIndex": 1,
+                },
+                "targetLanguage": "zh-Hans",
+                "mediaUrl": "https://video.twimg.com/ext_tw_video/fixture.mp4",
+                "llmConfig": {
+                    "apiUrl": "https://api.example.com/v1",
+                    "apiKey": "test-key",
+                },
+            },
+        )
+        assert created.status_code == 202
+        job_id = created.json()["jobId"]
+
+        pipeline = AnalysisPipeline(
+            factory,
+            None,
+            translation_provider,
+            FixedAnalysisService(),
+            credential_cipher=JobCredentialCipher(encryption_key),
+            media_downloader=WavFixtureDownloader(wav_fixture),
+            audio_extractor=WavFixtureExtractor(),
+            transcriber=transcriber,
+            settings=settings,
+        )
+        await pipeline.run(job_id)
+
+        status = await client.get(f"/v1/analyses/{job_id}")
+        result = await client.get(f"/v1/analyses/{job_id}/result")
+
+    assert status.json()["status"] == "completed"
+    assert result.status_code == 200
+    assert result.json()["contentRef"] == {
+        "platform": "x",
+        "sourceContentId": "2075545587093807111",
+        "mediaIndex": 1,
+    }
+    assert result.json()["transcript"][0]["original"] == "Hello from X."
+    assert result.json()["transcript"][0]["translated"] == "译文：Hello from X."
+    assert len(transcriber.paths) == 1
+    assert not any(media_root.iterdir())
     await engine.dispose()

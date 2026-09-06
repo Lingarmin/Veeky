@@ -134,6 +134,12 @@ test("restores saved analysis and seeks the existing player without reloading", 
       body: JSON.stringify({
         items: [{
           jobId: "job-history",
+          contentId: "33333333-3333-4333-8333-333333333333",
+          contentRef: {
+            platform: "youtube",
+            sourceContentId: "aircAruvnKk",
+            mediaIndex: 1,
+          },
           videoId: "aircAruvnKk",
           videoTitle: "Neural networks",
           durationMs: 754_000,
@@ -150,6 +156,12 @@ test("restores saved analysis and seeks the existing player without reloading", 
       contentType: "application/json",
       body: JSON.stringify({
         jobId: "job-history",
+        contentId: "33333333-3333-4333-8333-333333333333",
+        contentRef: {
+          platform: "youtube",
+          sourceContentId: "aircAruvnKk",
+          mediaIndex: 1,
+        },
         videoId: "aircAruvnKk",
         videoTitle: "Neural networks",
         durationMs: 754_000,
@@ -264,6 +276,88 @@ test("shows the four-hour limit error before analysis can start", async () => {
 
     await expect(extensionPage.getByText("此视频时长过长，无法分析。")).toBeVisible();
     await expect(extensionPage.getByRole("button", { name: "分析此视频" })).toHaveCount(0);
+  } finally {
+    await context.close();
+    rmSync(profilePath, { recursive: true, force: true });
+  }
+});
+
+test("renders translated subtitles as an X video advances", async () => {
+  const extensionPath = resolve(process.cwd(), "dist");
+  const executablePath = process.env.PLAYWRIGHT_CHROMIUM_PATH
+    ?? chromium.executablePath();
+  test.skip(
+    !existsSync(executablePath),
+    "Install Playwright Chromium or set PLAYWRIGHT_CHROMIUM_PATH",
+  );
+  const profilePath = mkdtempSync(join(tmpdir(), "veeky-x-subtitles-"));
+  const context = await chromium.launchPersistentContext(profilePath, {
+    executablePath,
+    headless: true,
+    args: [
+      `--disable-extensions-except=${extensionPath}`,
+      `--load-extension=${extensionPath}`,
+    ],
+  });
+
+  try {
+    let worker = context.serviceWorkers()[0];
+    if (!worker) worker = await context.waitForEvent("serviceworker");
+    const extensionId = new URL(worker.url()).host;
+    const xPage = await context.newPage();
+    await xPage.route("**/*", (route) => route.fulfill({
+      contentType: "text/html",
+      body: `
+        <title>X video</title>
+        <article>
+          <a href="/viktoroddy/status/2075545587093807111/video/1">
+            <div data-testid="videoPlayer"><video></video></div>
+          </a>
+        </article>
+      `,
+    }));
+    const xUrl = "https://x.com/viktoroddy/status/2075545587093807111/video/1";
+    await xPage.goto(xUrl);
+    await xPage.locator("video").evaluate((video) => {
+      Object.defineProperty(video, "duration", { configurable: true, value: 10 });
+      video.dispatchEvent(new Event("play"));
+    });
+
+    const xTabId = await worker.evaluate(async (url) => {
+      const tab = (await chrome.tabs.query({})).find((item) => item.url === url);
+      if (tab?.id === undefined) throw new Error("X video tab not found");
+      return tab.id;
+    }, xUrl);
+    const extensionPage = await context.newPage();
+    await extensionPage.goto(`chrome-extension://${extensionId}/sidepanel.html`);
+    const contentRef = {
+      platform: "x" as const,
+      sourceContentId: "2075545587093807111",
+      mediaIndex: 1,
+    };
+
+    await extensionPage.evaluate(
+      ({ tabId, ref }) => chrome.runtime.sendMessage({
+        type: "SET_SUBTITLES",
+        tabId,
+        contentRef: ref,
+        segments: [{
+          id: "segment-1",
+          startMs: 1000,
+          durationMs: 2000,
+          original: "Original subtitle",
+          translated: "预期的中文字幕",
+        }],
+      }),
+      { tabId: xTabId, ref: contentRef },
+    );
+
+    await xPage.locator("video").evaluate((video) => {
+      (video as HTMLVideoElement).currentTime = 1.5;
+      video.dispatchEvent(new Event("timeupdate"));
+    });
+    await expect(xPage.locator(".veeky-subtitle-overlay")).toHaveText("预期的中文字幕");
+    await expect(xPage.getByText("Original subtitle")).toHaveCount(0);
   } finally {
     await context.close();
     rmSync(profilePath, { recursive: true, force: true });
