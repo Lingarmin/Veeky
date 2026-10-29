@@ -81,6 +81,7 @@ from app.services.translation import (
     LlmTranslationProvider,
     provider_translation_version,
 )
+from app.security.admission import cleanup_usage
 from app.security.credentials import JobCredentialCipher
 
 
@@ -492,6 +493,7 @@ class SqlTranslationCache:
     async def get(self, key: TranslationCacheKey) -> list[TranslatedSegment] | None:
         translation = await self.session.scalar(
             select(Translation).where(
+                Translation.installation_id == key.installation_id,
                 Translation.track_id == key.track_id,
                 Translation.target_language == key.target_language,
                 Translation.transcript_version == key.transcript_version,
@@ -508,6 +510,7 @@ class SqlTranslationCache:
     ) -> None:
         self.session.add(
             Translation(
+                installation_id=key.installation_id,
                 track_id=key.track_id,
                 target_language=key.target_language,
                 provider=key.provider,
@@ -648,11 +651,14 @@ class AnalysisPipeline:
                     return
                 provider_config = dict(job.llm_config or {})
                 provider_config["api_key"] = api_key
-                translation_provider, analysis_service = build_llm_services(
-                    provider_config
-                )
-                api_key = ""
-                provider_config.clear()
+                try:
+                    translation_provider, analysis_service = build_llm_services(provider_config)
+                except (ValueError, KeyError):
+                    await self._fail(job_id, lease_token, "llm_config_invalid", None)
+                    return None
+                finally:
+                    api_key = ""
+                    provider_config.clear()
 
             if track is None:
                 initial_status = (
@@ -727,7 +733,7 @@ class AnalysisPipeline:
                     raise JobLeaseLost()
                 cache = SqlTranslationCache(session)
                 translation_service = CachedTranslationService(
-                    translation_provider, cache
+                    translation_provider, cache, installation_id=job.installation_id
                 )
                 await self._before_deadline(
                     translation_service.translate(
@@ -1053,6 +1059,7 @@ class AnalysisPipeline:
                 )
             )
             cached = None
+            needs_fresh_translation = False
             if not current.force_run and llm_cache_fingerprint is not None:
                 candidates = list(
                     await session.scalars(
@@ -1079,6 +1086,15 @@ class AnalysisPipeline:
                     ),
                     None,
                 )
+                if cached is not None:
+                    # A historical summary alone cannot satisfy a new job:
+                    # its old translation may be quarantined or owned elsewhere.
+                    cached_track = await self._load_persisted_track(cached)
+                    if cached_track is None or not await self._translation_is_persisted(
+                        cached, cached_track
+                    ):
+                        needs_fresh_translation = True
+                        cached = None
             if cached is not None and cached.result is not None:
                 current.source_language = language
                 current.transcript_version = version
@@ -1117,7 +1133,7 @@ class AnalysisPipeline:
             current.source_language = language
             current.transcript_version = version
             current.cache_key = final_cache_key
-            if current.force_run:
+            if current.force_run or needs_fresh_translation:
                 current.cache_key += f":run:{current.id}"
             video = await session.get(Video, current.video_id)
             video.duration_ms = duration_ms
@@ -1754,6 +1770,7 @@ class AnalysisPipeline:
             return (
                 await session.scalar(
                     select(Translation.id).where(
+                        Translation.installation_id == job.installation_id,
                         Translation.track_id == track.id,
                         Translation.target_language == job.target_language,
                         Translation.transcript_version == track.transcript_version,
@@ -2086,7 +2103,10 @@ async def cleanup_expired_media_sessions_async(
 ) -> MediaCleanupCounts:
     current = settings or get_settings()
     async with session_factory() as session:
-        return await cleanup_expired_uploads(session, current, limit=100)
+        counts = await cleanup_expired_uploads(session, current, limit=100)
+        await cleanup_usage(session)
+        await session.commit()
+        return counts
 
 
 async def run_expired_media_cleanup() -> MediaCleanupCounts:

@@ -1,0 +1,151 @@
+# Standalone stack: never combine with the local docker-compose.yml.
+name: veeky-production
+
+x-app: &app
+  image: veeky-backend:${VEEKY_IMAGE_TAG:?Set VEEKY_IMAGE_TAG to the tested release revision}
+  build:
+    context: ../api
+  env_file:
+    - ${VEEKY_PRODUCTION_ENV_FILE:-.env.production}
+  environment: &app-env
+    ENVIRONMENT: production
+    RUNNING_IN_DOCKER: "true"
+    DATABASE_URL: postgresql+asyncpg://veeky:${POSTGRES_PASSWORD:?Set a unique hex POSTGRES_PASSWORD}@postgresql:5432/veeky
+    REDIS_URL: redis://redis:6379/0
+    LLM_CREDENTIAL_ENCRYPTION_KEY: ${LLM_CREDENTIAL_ENCRYPTION_KEY:?Set a persistent 32-byte base64 encryption key}
+    ALLOWED_CHROME_EXTENSION_ORIGINS: ${ALLOWED_CHROME_EXTENSION_ORIGINS:?Set the exact published extension origin}
+    TRUSTED_PROXY_CIDRS: '["10.203.77.2/32"]'
+    ASR_MODEL_SIZE: small
+    ASR_DEVICE: cpu
+    ASR_COMPUTE_TYPE: int8
+    ASR_MODEL_DIR: /models/whisper
+    MEDIA_TEMP_ROOT: /var/lib/veeky/media
+    MAX_VIDEO_DURATION_SECONDS: "14400"
+  restart: unless-stopped
+  init: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop: [ALL]
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  proxy:
+    image: caddy:2.10.2-alpine
+    environment:
+      VEEKY_API_HOST: ${VEEKY_API_HOST:?Set the real public API DNS hostname}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      edge:
+        ipv4_address: 10.203.77.2
+    depends_on:
+      api:
+        condition: service_healthy
+    cpus: 0.5
+    mem_limit: 256m
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  api:
+    <<: *app
+    command: ["/bin/sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-proxy-headers --no-access-log"]
+    networks: [edge, backend]
+    depends_on:
+      postgresql: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    volumes:
+      - whisper_models:/models:ro
+      - media_temp:/var/lib/veeky/media
+    cpus: 1
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  worker:
+    <<: *app
+    hostname: worker
+    command: ["celery", "-A", "app.workers.tasks.celery_app", "worker", "--loglevel=WARNING", "--concurrency=1"]
+    networks: [backend, worker_egress]
+    depends_on:
+      api: {condition: service_healthy}
+    volumes:
+      - whisper_models:/models
+      - media_temp:/var/lib/veeky/media
+    cpus: 4
+    mem_limit: 6g
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.workers.tasks.celery_app inspect ping -d celery@worker --timeout=3 | grep -q pong"]
+      interval: 30s
+      timeout: 10s
+      retries: 4
+      start_period: 30s
+
+  scheduler:
+    <<: *app
+    command: ["celery", "-A", "app.workers.tasks.celery_app", "beat", "--loglevel=WARNING", "--schedule=/tmp/celerybeat-schedule"]
+    networks: [backend]
+    depends_on:
+      api: {condition: service_healthy}
+    cpus: 0.5
+    mem_limit: 512m
+
+  postgresql:
+    image: postgres:16.9-alpine
+    environment:
+      POSTGRES_DB: veeky
+      POSTGRES_USER: veeky
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set a unique hex POSTGRES_PASSWORD}
+    networks: [backend]
+    volumes: ["postgresql_data:/var/lib/postgresql/data"]
+    cpus: 1
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U veeky -d veeky"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4.5-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "noeviction"]
+    networks: [backend]
+    volumes: ["redis_data:/data"]
+    cpus: 0.5
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+networks:
+  edge:
+    ipam:
+      config: [{subnet: 10.203.77.0/28}]
+  worker_egress: {}
+  backend:
+    internal: true
+
+volumes:
+  caddy_data:
+  caddy_config:
+  postgresql_data:
+  redis_data:
+  whisper_models:
+  media_temp:

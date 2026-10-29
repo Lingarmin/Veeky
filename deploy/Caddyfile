@@ -1,0 +1,21 @@
+{
+    admin off
+}
+
+{$VEEKY_API_HOST} {
+    # One upload part is 8 MiB. Whole videos use multiple authenticated parts.
+    request_body {
+        max_size 16MB
+    }
+    header {
+        Strict-Transport-Security "max-age=31536000"
+        X-Content-Type-Options nosniff
+    }
+    # Public traffic must go directly to this proxy. Drop client-supplied IP chains.
+    reverse_proxy api:8000 {
+        header_up X-Forwarded-For {remote_host}
+        header_up -Forwarded
+        header_up -X-Real-IP
+    }
+    # No access logs: do not record URLs, credentials or media request bodies.
+}

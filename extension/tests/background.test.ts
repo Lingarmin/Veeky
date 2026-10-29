@@ -88,10 +88,12 @@ function createChrome(
     },
     storage: {
       session: {
+        setAccessLevel: vi.fn(async () => undefined),
         get: vi.fn(async () => structuredClone(stored)),
         set: vi.fn(async (value: Record<string, unknown>) => { stored = { ...stored, ...value }; }),
       },
       local: {
+        setAccessLevel: vi.fn(async () => undefined),
         get: vi.fn(async () => structuredClone(localStored)),
         set: vi.fn(async (value: Record<string, unknown>) => { localStored = { ...localStored, ...value }; }),
         remove: vi.fn(async (key: string) => { delete localStored[key]; }),

@@ -44,6 +44,41 @@ import app.workers.tasks as worker_tasks
 VALID_TEST_KEY = base64.b64encode(b"v" * 32).decode("ascii")
 
 
+@pytest.mark.asyncio
+async def test_translation_cache_isolated_between_installations(pipeline_context):
+    factory, first_id = pipeline_context
+    first_provider = FakeTranslationProvider()
+    await AnalysisPipeline(factory, FakeTranscriptService(), first_provider, FakeAnalysisService()).run(first_id)
+    async with factory() as session:
+        first = await session.get(AnalysisJob, first_id)
+        second = AnalysisJob(
+            installation=Installation(id="22222222-2222-4222-8222-222222222222", token_hash="b" * 64),
+            video_id=first.video_id, content_id=first.content_id,
+            source_language=first.source_language, target_language=first.target_language,
+            transcript_version=first.transcript_version, cache_key="second-owner-cache",
+        )
+        session.add(second)
+        await session.commit()
+        second_id = second.id
+
+    class SecondProvider(FakeTranslationProvider):
+        async def translate(self, *args):
+            translated = await super().translate(*args)
+            return [TranslatedSegment(t.segment_id, t.start_ms, t.duration_ms, "SECOND:" + t.text) for t in translated]
+
+    second_provider = SecondProvider()
+    await AnalysisPipeline(factory, FakeTranscriptService(), second_provider, FakeAnalysisService()).run(second_id)
+    assert first_provider.calls == 1
+    assert second_provider.calls == 1
+    async with factory() as session:
+        from app.db.models import Translation
+        rows = (await session.scalars(select(Translation))).all()
+        assert len(rows) == 2
+        by_owner = {row.installation_id: row.segments[0]["text"] for row in rows}
+        assert by_owner["11111111-1111-4111-8111-111111111111"] == "ZH:Pixels"
+        assert by_owner["22222222-2222-4222-8222-222222222222"] == "SECOND:ZH:Pixels"
+
+
 def test_analysis_task_time_limits_derive_from_asr_job_timeout():
     assert analyze_video.soft_time_limit == settings.asr_job_timeout_seconds
     assert analyze_video.time_limit == settings.asr_job_timeout_seconds + 60
@@ -224,7 +259,7 @@ async def test_pipeline_resolves_youtube_adapter_before_transcript_acquisition(
 async def test_pipeline_uses_kimi_providers_from_job_snapshot(pipeline_context):
     factory, job_id = pipeline_context
     translation_provider, analysis_service = build_llm_services(
-        {"api_url": "https://api.example.com/v1", "api_key": "secret"}
+        {"api_url": "https://api.moonshot.cn/v1", "api_key": "secret"}
     )
 
     assert translation_provider.name == "kimi"
@@ -270,7 +305,7 @@ async def test_default_pipeline_fails_when_temporary_credentials_expired(
         job = await session.get(AnalysisJob, job_id)
         job.llm_config = {
             "provider": "kimi",
-            "api_url": "https://api.example.com/v1",
+            "api_url": "https://api.moonshot.cn/v1",
             "model": "kimi-k2.5",
         }
         job.llm_credential_ciphertext = cipher.encrypt(job.id, "secret")
@@ -298,6 +333,31 @@ async def test_default_pipeline_fails_when_temporary_credentials_expired(
 
 
 @pytest.mark.asyncio
+async def test_default_pipeline_rejects_legacy_relay_without_network(pipeline_context, monkeypatch):
+    factory, job_id = pipeline_context
+    cipher = JobCredentialCipher(VALID_TEST_KEY)
+    async with factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        job.llm_config = {"provider": "kimi", "api_url": "https://legacy-relay.example/v1", "model": "kimi-k2.5"}
+        job.llm_credential_ciphertext = cipher.encrypt(job.id, "old-secret")
+        job.llm_credential_expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+        await session.commit()
+    def deny_network(*args, **kwargs):
+        pytest.fail("legacy credentials must never reach a network client")
+    monkeypatch.setattr("app.services.llm.build_llm_http_client", deny_network)
+    transcript = FakeTranscriptService()
+    pipeline = AnalysisPipeline(factory, transcript, FakeTranslationProvider(), FakeAnalysisService(), credential_cipher=cipher)
+    pipeline._uses_default_providers = True
+    await pipeline.run(job_id)
+    assert transcript.calls == 0
+    async with factory() as session:
+        job = await session.get(AnalysisJob, job_id)
+        assert job.status == "failed"
+        assert job.failure_code == "llm_config_invalid"
+        assert job.llm_config["api_url"] == "https://legacy-relay.example/v1"
+
+
+@pytest.mark.asyncio
 async def test_default_pipeline_treats_invalid_ciphertext_as_expired_credentials(
     pipeline_context,
 ):
@@ -307,7 +367,7 @@ async def test_default_pipeline_treats_invalid_ciphertext_as_expired_credentials
         job = await session.get(AnalysisJob, job_id)
         job.llm_config = {
             "provider": "kimi",
-            "api_url": "https://api.example.com/v1",
+            "api_url": "https://api.moonshot.cn/v1",
             "model": "kimi-k2.5",
         }
         job.llm_credential_ciphertext = "invalid-ciphertext"

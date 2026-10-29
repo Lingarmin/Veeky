@@ -39,6 +39,27 @@ class Base(DeclarativeBase):
     pass
 
 
+class QuotaUsage(Base):
+    """Admission ledger; independent of task deletion and installation rotation."""
+
+    __tablename__ = "quota_usage"
+    __table_args__ = (
+        Index("ix_quota_usage_kind_created", "kind", "created_at"),
+        Index("ix_quota_usage_subject_created", "subject", "created_at"),
+        Index("ix_quota_usage_resource", "resource_id"),
+        Index("ix_quota_usage_installation_created", "installation_id", "created_at"),
+        CheckConstraint("amount >= 0", name="ck_quota_usage_amount"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_string)
+    kind: Mapped[str] = mapped_column(String(20))
+    subject: Mapped[str] = mapped_column(String(64))
+    installation_id: Mapped[str] = mapped_column(String(36))
+    resource_id: Mapped[str] = mapped_column(String(36))
+    amount: Mapped[int] = mapped_column(BigInteger, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 class Installation(Base):
     __tablename__ = "installations"
     __table_args__ = (
@@ -194,6 +215,7 @@ class Translation(Base):
     __tablename__ = "translations"
     __table_args__ = (
         UniqueConstraint(
+            "installation_id",
             "track_id",
             "target_language",
             "transcript_version",
@@ -204,6 +226,10 @@ class Translation(Base):
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_string)
+    # NULL rows are quarantined pre-isolation history, never a reusable cache.
+    installation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("installations.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     track_id: Mapped[str] = mapped_column(
         ForeignKey("transcript_tracks.id", ondelete="CASCADE"), index=True
     )
@@ -274,6 +300,10 @@ class AnalysisJob(Base):
     transcript_version: Mapped[str] = mapped_column(String(100))
     cache_key: Mapped[str] = mapped_column(String(500), unique=True)
     llm_config: Mapped[dict[str, str] | None] = mapped_column(JSON, nullable=True)
+    # Populated only by the migration for an exact pre-existing history match.
+    legacy_translation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("translations.id", ondelete="SET NULL"), nullable=True
+    )
     llm_credential_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
     llm_credential_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

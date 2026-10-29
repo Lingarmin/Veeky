@@ -3,6 +3,14 @@ import { describe, expect, it } from "vitest";
 import { buildWatchUrl, errorMessageForCode, formatTime } from "../src/sidepanel/store";
 
 describe("side panel helpers", () => {
+  it.each([
+    "registration_daily_limit", "analysis_daily_limit", "asr_daily_limit", "media_daily_limit",
+    "global_analysis_concurrency_limit", "ip_analysis_concurrency_limit", "media_global_capacity",
+    "media_disk_low", "global_media_session_limit", "ip_media_session_limit", "admission_busy",
+  ])("explains resource rejection %s without claiming analysis failed", (code) => {
+    expect(errorMessageForCode(code)).not.toBe("分析没有完成，请稍后重试");
+    expect(errorMessageForCode(code)).toMatch(/额度|上限|队列|空间|正在|繁忙/);
+  });
   it("builds a timestamped YouTube URL", () => {
     expect(buildWatchUrl("aircAruvnKk", 72_500)).toBe(
       "https://www.youtube.com/watch?v=aircAruvnKk&t=72s",
@@ -10,11 +18,14 @@ describe("side panel helpers", () => {
   });
 
   it("maps backend failures to product copy", () => {
+    expect(errorMessageForCode("llm_config_invalid")).toBe("请使用所选服务商的官方地址，并填写模型名称和官方 API Key；不支持第三方中转");
+    expect(errorMessageForCode("llm_unsafe_destination")).toBe("LLM 目标地址未通过安全检查，请使用官方服务并检查网络或 DNS 设置");
+    expect(errorMessageForCode("llm_model_unavailable")).toBe("该模型不可用或当前 API Key 无权访问，请检查模型 ID 和服务商授权");
     expect(errorMessageForCode("no_caption_track")).toBe("该视频暂无可读取字幕");
     expect(errorMessageForCode("request_blocked")).toBe("字幕服务暂时不可用，请稍后重试");
     expect(errorMessageForCode("transcript_connection_failed")).toBe("无法连接 YouTube 字幕服务，请检查代理后重试");
-    expect(errorMessageForCode("api_unavailable")).toBe("本地分析服务未启动。请运行 docker compose up -d 后重试。");
-    expect(errorMessageForCode("worker_unavailable")).toBe("后台任务服务未启动。请运行 docker compose up -d 后重试。");
+    expect(errorMessageForCode("api_unavailable")).toBe("无法读取旧版历史记录，请检查旧服务是否可用。");
+    expect(errorMessageForCode("worker_unavailable")).toBe("本地任务未启动，请重新打开插件。");
     expect(errorMessageForCode("invalid_youtube_url")).toBe("请输入有效的 YouTube 视频链接");
     expect(errorMessageForCode("source_language_unavailable")).toBe("所选字幕语言已不可读，请重新检查视频");
     expect(errorMessageForCode("translation_rejected")).toBe("翻译服务拒绝了请求，请检查 LLM 配置");
@@ -33,7 +44,7 @@ describe("side panel helpers", () => {
     expect(errorMessageForCode("x_media_url_expired")).toBe("媒体地址已过期，请重新播放视频");
     expect(errorMessageForCode("media_too_large")).toBe("视频文件过大，无法分析");
     expect(errorMessageForCode("media_upload_interrupted")).toBe("视频上传中断，请重新开始");
-    expect(errorMessageForCode("audio_track_missing")).toBe("视频中没有可识别的音轨");
+    expect(errorMessageForCode("audio_track_missing")).toBe("该视频没有可读取的音轨");
     expect(errorMessageForCode("asr_resource_exhausted")).toBe("当前设备资源不足，请稍后重试");
     expect(errorMessageForCode("asr_failed")).toBe("语音识别失败，请重新分析");
     expect(errorMessageForCode("unexpected")).toBe("分析没有完成，请稍后重试");

@@ -30,11 +30,16 @@ class TranslatedSegment:
 
 @dataclass(frozen=True)
 class TranslationCacheKey:
+    installation_id: str
     track_id: str
     target_language: str
     transcript_version: str
     provider: str
     provider_version: str
+
+    def __post_init__(self):
+        if not isinstance(self.installation_id, str) or not self.installation_id.strip():
+            raise ValueError("Translation cache requires an installation identity")
 
 
 class TranslationProviderError(RuntimeError):
@@ -209,9 +214,10 @@ class TranslationCache(Protocol):
 
 
 class CachedTranslationService:
-    def __init__(self, provider: TranslationProvider, cache: TranslationCache):
+    def __init__(self, provider: TranslationProvider, cache: TranslationCache, *, installation_id: str):
         self.provider = provider
         self.cache = cache
+        self.installation_id = installation_id
 
     async def translate(
         self,
@@ -222,6 +228,7 @@ class CachedTranslationService:
         transcript_version: str,
     ) -> list[TranslatedSegment]:
         key = TranslationCacheKey(
+            installation_id=self.installation_id,
             track_id=track_id,
             target_language=target_language,
             transcript_version=transcript_version,

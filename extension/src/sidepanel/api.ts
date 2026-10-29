@@ -8,8 +8,9 @@ import type {
   VideoInspection,
 } from "../shared/types";
 import type { InstallationIdentity, InstallationIdentityStore } from "./identity";
+import { DEPLOYMENT, IS_RELEASE } from "../shared/deployment";
 
-export const DEFAULT_API_BASE_URL = "http://127.0.0.1:8000";
+export const DEFAULT_API_BASE_URL = DEPLOYMENT.apiOrigin;
 const API_REQUEST_TIMEOUT_MS = 60_000;
 
 export interface AnalysisCreateResponse extends ContentContext {
@@ -128,6 +129,9 @@ export function createApi(
   baseUrl: string,
   identityStore: InstallationIdentityStore,
 ): AnalysisApi & MediaUploadApi {
+  if (IS_RELEASE && baseUrl !== DEFAULT_API_BASE_URL) {
+    throw new Error("Release backend cannot be overridden");
+  }
   return {
     testLlm: (config) => request(`${baseUrl}/v1/llm/test`, identityStore, {
       method: "POST",
@@ -219,6 +223,8 @@ async function authenticatedFetch(
   try {
     return await waitForAbort(fetch(url, {
       ...init,
+      redirect: "error",
+      credentials: "omit",
       signal: controller.signal,
       headers: {
         "Content-Type": "application/json",

@@ -82,10 +82,22 @@ def test_production_settings_require_a_32_byte_base64_encryption_key():
         _env_file=None,
         environment="production",
         llm_credential_encryption_key=key,
+        allowed_chrome_extension_origins=["chrome-extension://" + "a" * 32],
     )
 
     assert settings.llm_credential_encryption_key is not None
     assert settings.llm_credential_encryption_key.get_secret_value() == key
+
+
+@pytest.mark.parametrize("origins", [[], ["*"], ["https://example.com"], ["chrome-extension://abc"], ["chrome-extension://" + "a" * 32 + "/"]])
+def test_production_requires_exact_extension_origins(origins):
+    with pytest.raises(ValueError, match="ALLOWED_CHROME_EXTENSION_ORIGINS"):
+        Settings(
+            _env_file=None,
+            environment="production",
+            llm_credential_encryption_key=base64.b64encode(b"a" * 32).decode("ascii"),
+            allowed_chrome_extension_origins=origins,
+        )
 
 
 @pytest.mark.parametrize("key", [None, "not-base64", base64.b64encode(b"a" * 31).decode("ascii")])

@@ -1,11 +1,13 @@
 import base64
 import binascii
 import os
+import ipaddress
+import re
 from functools import lru_cache
 from typing import Literal, Self
 from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import Field, PositiveInt, SecretStr, model_validator
+from pydantic import Field, PositiveInt, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -36,6 +38,28 @@ class Settings(BaseSettings):
     write_rate_limit_per_minute: PositiveInt = 20
     read_rate_limit_per_minute: PositiveInt = 120
     max_active_jobs_per_installation: PositiveInt = 1
+    trusted_proxy_cidrs: list[str] = Field(default_factory=list)
+    registration_limit_per_ip_per_day: PositiveInt = 20
+    registration_limit_global_per_day: PositiveInt = 1000
+    write_rate_limit_per_ip_per_minute: PositiveInt = 60
+    read_rate_limit_per_ip_per_minute: PositiveInt = 360
+    write_rate_limit_global_per_minute: PositiveInt = 600
+    read_rate_limit_global_per_minute: PositiveInt = 3600
+    max_active_jobs_per_ip: PositiveInt = 2
+    max_active_jobs_global: PositiveInt = 8
+    analysis_limit_per_ip_per_day: PositiveInt = 20
+    analysis_limit_per_installation_per_day: PositiveInt = 20
+    analysis_limit_global_per_day: PositiveInt = 200
+    asr_seconds_per_ip_per_day: PositiveInt = 28800
+    asr_seconds_per_installation_per_day: PositiveInt = 28800
+    asr_seconds_global_per_day: PositiveInt = 172800
+    max_active_media_upload_sessions_per_ip: PositiveInt = 2
+    max_active_media_upload_sessions_global: PositiveInt = 8
+    media_bytes_per_ip_per_day: PositiveInt = 8 * 1024**3
+    media_bytes_per_installation_per_day: PositiveInt = 8 * 1024**3
+    media_bytes_global_per_day: PositiveInt = 40 * 1024**3
+    max_temp_bytes_global: PositiveInt = 20 * 1024**3
+    min_media_free_disk_bytes: PositiveInt = 1024**3
     max_video_duration_seconds: PositiveInt = 14400
     max_media_bytes: PositiveInt = 4 * 1024 * 1024 * 1024
     max_temp_bytes_per_job: PositiveInt = 6 * 1024 * 1024 * 1024
@@ -51,6 +75,14 @@ class Settings(BaseSettings):
     asr_model_dir: str = "/models/whisper"
     media_temp_root: str = "/var/lib/veeky/media"
     llm_credential_encryption_key: SecretStr | None = None
+
+    @field_validator("trusted_proxy_cidrs")
+    @classmethod
+    def validate_trusted_proxies(cls, values: list[str]) -> list[str]:
+        networks = [ipaddress.ip_network(value, strict=False) for value in values]
+        if any(network.prefixlen == 0 for network in networks):
+            raise ValueError("Trust specific reverse proxy networks, never every address")
+        return [str(network) for network in networks]
 
     @model_validator(mode="after")
     def require_valid_encryption_key_in_production(self) -> Self:
@@ -72,6 +104,13 @@ class Settings(BaseSettings):
         if len(decoded_key) != 32:
             raise ValueError(
                 "LLM_CREDENTIAL_ENCRYPTION_KEY must decode to exactly 32 bytes"
+            )
+        if not self.allowed_chrome_extension_origins or any(
+            re.fullmatch(r"chrome-extension://[a-p]{32}", origin) is None
+            for origin in self.allowed_chrome_extension_origins
+        ):
+            raise ValueError(
+                "ALLOWED_CHROME_EXTENSION_ORIGINS must contain exact Chrome extension origins in production"
             )
         return self
 

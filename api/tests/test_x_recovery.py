@@ -766,7 +766,7 @@ async def test_expired_lease_reuses_committed_translation_before_finalization(x_
     class MatchingTranslation(FakeTranslation):
         name = "kimi"
         version = provider_translation_version(
-            "https://api.example.com/v1/chat/completions",
+            "https://api.moonshot.cn/v1/chat/completions",
             provider="kimi",
             version="kimi-k2.5",
         )

@@ -128,7 +128,7 @@ async def test_registration_rejects_a_different_token_for_an_existing_id(
 @pytest.mark.parametrize(
     ("method", "path", "json"),
     [
-        ("POST", "/v1/llm/test", {"apiUrl": "https://api.example.com", "apiKey": "x"}),
+        ("POST", "/v1/llm/test", {"apiUrl": "https://api.moonshot.cn", "apiKey": "x"}),
         ("POST", "/v1/videos/inspect", {"url": "https://youtu.be/aircAruvnKk"}),
         (
             "POST",

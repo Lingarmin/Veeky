@@ -7,12 +7,15 @@ import {
   Clock3,
   FileVideo2,
   History,
+  Import,
   Languages,
   Link2,
   Play,
   RefreshCw,
   Search,
   Settings,
+  Trash2,
+  X,
 } from "lucide-react";
 
 import type {
@@ -25,12 +28,17 @@ import type {
   VideoInspection,
 } from "../shared/types";
 import type { AnalysisApi } from "./api";
-import { createApi, DEFAULT_API_BASE_URL } from "./api";
+import { SettingsHelp } from "./SettingsHelp";
+import { createLocalApi, type LocalApi } from "../local/runtime";
+import type { LocalAnalysisStatus } from "../local/analysis";
+import type { LocalAnalysisTask } from "../local/repository";
+import type { LocalStorageMetadata } from "../local/storage";
+import { importLegacyHistory, type LegacyImportCounts } from "../local/legacy-import";
+import { contentKey } from "../shared/content";
 import type { BrowserBridge } from "./browser";
 import { browserBridge } from "./browser";
-import { browserInstallationIdentityStore } from "./identity";
 import { errorMessageForCode, formatTime } from "./store";
-import { browserLlmConfigStore, defaultLlmConfig, isLlmConfigured, LLM_PROVIDER_OPTIONS } from "./llm";
+import { browserLlmConfigStore, defaultLlmConfig, HUNYUAN_MIGRATION_NOTICE, isLlmConfigured, LLM_PROVIDER_OPTIONS } from "./llm";
 import type { LlmConfig, LlmConfigStore } from "./llm";
 
 type Phase = "loading" | "selecting" | "checking" | "ready" | "settings" | "history" | "processing" | "complete" | "error";
@@ -58,8 +66,10 @@ const TARGET_LANGUAGES = [
   ["ja", "日本語"],
 ];
 
-const defaultApi = createApi(DEFAULT_API_BASE_URL, browserInstallationIdentityStore);
+const defaultApi = createLocalApi();
 const HISTORY_PAGE_SIZE = 20;
+const EXPERIMENTAL_ASR_KEY = "veeky.experimentalLocalAsr.v1";
+const LEGACY_IMPORT_COMPLETED_KEY = "veeky.legacyHistoryImportCompleted.v1";
 
 function comparisonKey(value: string): string {
   return value.normalize("NFKC").toLocaleLowerCase().replace(/[\p{P}\p{S}\s]/gu, "");
@@ -83,6 +93,18 @@ export function App({
   const [sourceLanguage, setSourceLanguage] = useState("");
   const [targetLanguage, setTargetLanguage] = useState("zh-Hans");
   const [jobStatus, setJobStatus] = useState<JobStatus>("queued");
+  const [localProgress, setLocalProgress] = useState<Partial<LocalAnalysisStatus> | null>(null);
+  const [recoverable, setRecoverable] = useState<LocalAnalysisTask[]>([]);
+  const [pendingDiscardId, setPendingDiscardId] = useState<string | null>(null);
+  const [discarding, setDiscarding] = useState(false);
+  const [experimentalAsr, setExperimentalAsr] = useState(false);
+  const [importConsent, setImportConsent] = useState(false);
+  const [importCompleted, setImportCompleted] = useState(false);
+  const [importPreferenceLoaded, setImportPreferenceLoaded] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [importNotice, setImportNotice] = useState<{ message: string } | null>(null);
+  const importController = useRef<AbortController | null>(null);
+  const localApi = api as Partial<LocalApi>;
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [error, setError] = useState("");
   const [choice, setChoice] = useState<VideoChoice>("current");
@@ -93,10 +115,17 @@ export function App({
   const [llmConfig, setLlmConfig] = useState<LlmConfig>(defaultLlmConfig("kimi"));
   const [settingsError, setSettingsError] = useState("");
   const [testingLlm, setTestingLlm] = useState(false);
+  const [savingLlm, setSavingLlm] = useState(false);
+  const [loadingLlm, setLoadingLlm] = useState(true);
+  const [llmLoadError, setLlmLoadError] = useState("");
+  const llmGenerationRef = useRef(0);
+  const llmActionGenerationRef = useRef(0);
   const [historyItems, setHistoryItems] = useState<AnalysisHistoryItem[]>([]);
   const [historyHasMore, setHistoryHasMore] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState("");
+  const [storageMetadata, setStorageMetadata] = useState<LocalStorageMetadata | null>(null);
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const [resultFromHistory, setResultFromHistory] = useState(false);
   const [settingsReturnPhase, setSettingsReturnPhase] = useState<Phase>("selecting");
   const [failedAnalysis, setFailedAnalysis] = useState<RetryAnalysisInput | null>(null);
@@ -116,6 +145,11 @@ export function App({
   const completedResultRef = useRef<AnalysisResult | null>(null);
 
   const setPhase = useCallback((nextPhase: Phase) => {
+    if (phaseRef.current === "settings" && nextPhase !== "settings") {
+      llmActionGenerationRef.current += 1;
+      setTestingLlm(false);
+      setSavingLlm(false);
+    }
     phaseRef.current = nextPhase;
     setPhaseState(nextPhase);
   }, []);
@@ -192,6 +226,7 @@ export function App({
       const status = await api.getStatus(jobId);
       if (!isCurrentPoll(jobId, generation)) return;
       setJobStatus(status.status);
+      if ("stage" in status) setLocalProgress(status as LocalAnalysisStatus);
       if (status.status === "completed") {
         const analysis = await api.getResult(jobId);
         if (!isCurrentPoll(jobId, generation)) return;
@@ -221,13 +256,27 @@ export function App({
           const analysis = await api.getResult(jobId);
           if (!isCurrentPoll(jobId, generation)) return;
           setResult(analysis);
+          if ("stage" in status) {
+            // Local pipeline translates first; do not display an empty overview.
+          } else {
           setSection("overview");
           setPhase("complete");
+          }
         } catch (requestError) {
           if (errorCode(requestError) !== "analysis_not_complete") throw requestError;
         }
       }
       if (status.status === "failed") {
+        if ("stage" in status) {
+          const partial = await api.getResult(jobId);
+          if (!isCurrentPoll(jobId, generation)) return;
+          setError(errorMessageForCode(status.failureCode));
+          setErrorCodeValue(status.failureCode);
+          if (partial.transcript.length) {
+            setResult(partial); setSection("transcript"); setPhase("complete");
+          } else setPhase("error");
+          return;
+        }
         if (status.failureCode === "translation_failed") {
           const analysis = await api.getResult(jobId);
           if (!isCurrentPoll(jobId, generation)) return;
@@ -266,7 +315,7 @@ export function App({
     }
   }, [api, browser, isCurrentPoll, pollIntervalMs, showResult]);
 
-  const prepareVideoChoice = useCallback(async () => {
+  const prepareVideoChoice = useCallback(async ({ restoreAnalysis = true }: { restoreAnalysis?: boolean } = {}) => {
     cancelAnalysisOperation();
     stopPolling();
     const generation = pollGenerationRef.current;
@@ -297,13 +346,22 @@ export function App({
         return;
       }
       setChoice("current");
+      // Explicit navigation starts a new choice flow. Only initial loading and
+      // recovery should automatically reopen work saved for the active video.
+      if (!restoreAnalysis) {
+        setPhase("selecting");
+        return;
+      }
       if (active.analysis && analysisMatches(active.analysis, activeRef)) {
-        const status = await api.getStatus(active.analysis.jobId);
+        const status = await api.getStatus(active.analysis.jobId).catch((failure) => {
+          if (localApi.resume && errorCode(failure) === "analysis_not_found") return { status: "failed" as const };
+          throw failure;
+        });
         if (!isCurrentGeneration(generation)) return;
         if (status.status === "completed") {
           const analysis = await api.getResult(active.analysis.jobId);
           if (!isCurrentGeneration(generation)) return;
-          showResult(analysis);
+          showResult(analysis, true);
           return;
         }
         if (status.status !== "failed") {
@@ -321,10 +379,21 @@ export function App({
         if (history.items[0]) {
           const analysis = await api.getResult(history.items[0].jobId);
           if (!isCurrentGeneration(generation)) return;
-          showResult(analysis);
+          showResult(analysis, true);
           return;
         }
       } else {
+        if (localApi.resume) {
+          const history = await api.getHistory({ contentId: contentKey(activeRef), limit: 1 });
+          if (!isCurrentGeneration(generation)) return;
+          if (history.items[0]) {
+            const analysis = await api.getResult(history.items[0].jobId);
+            if (!isCurrentGeneration(generation)) return;
+            showResult(analysis, true);
+            return;
+          }
+          setPhase("selecting"); return;
+        }
         const candidates = await browser.getMediaCandidates(active.tabId, activeRef);
         if (!isCurrentGeneration(generation)) return;
         const inspected = await api.inspect({
@@ -339,7 +408,7 @@ export function App({
         if (history.items[0]) {
           const analysis = await api.getResult(history.items[0].jobId);
           if (!isCurrentGeneration(generation)) return;
-          showResult(analysis);
+          showResult(analysis, true);
           return;
         }
       }
@@ -354,11 +423,125 @@ export function App({
   }, [api, browser, cancelAnalysisOperation, isCurrentGeneration, poll, showResult, stopPolling]);
 
   useEffect(() => {
-    void Promise.all([
-      prepareVideoChoice(),
-      llmStore.load().then(setLlmConfig),
-    ]);
+    let disposed = false;
+    if (localApi.getRecoverableTasks) void localApi.getRecoverableTasks().then((tasks) => {
+      if (!disposed) setRecoverable(tasks);
+    }).catch(() => {});
+    return () => { disposed = true; };
+  }, [api, phase]);
+
+  const resumeLocalTask = async (task: LocalAnalysisTask) => {
+    if (!localApi.resume || !context) return;
+    const operation = beginAnalysisOperation();
+    setError(""); setLocalProgress(null);
+    try {
+      const created = await localApi.resume(task.jobId);
+      // Registration is only a tab shortcut: failure must not hide a task that
+      // the local engine has already resumed successfully.
+      if (context.contentRef && sameContentRef(context.contentRef, task.contentRef)) {
+        await browser.registerAnalysis(context.tabId, task.contentRef, created.jobId).catch(() => undefined);
+      }
+      if (!isCurrentAnalysisOperation(operation)) return;
+      activeJobRef.current = created.jobId;
+      setProcessingPlatform(task.contentRef.platform); setJobStatus(created.status); setPhase("processing");
+      setRecoverable((items) => items.filter((item) => item.jobId !== task.jobId));
+      void poll(task.jobId, task.contentRef, context.tabId, false, pollGenerationRef.current);
+    } catch (failure) {
+      if (isCurrentAnalysisOperation(operation)) {
+        setError(errorMessageForCode(errorCode(failure))); setPhase("error");
+      }
+    } finally { finishAnalysisOperation(operation); }
+  };
+
+  const cancelLocalTask = async () => {
+    if (!localApi.cancel || !activeJobRef.current) return;
+    try { await localApi.cancel(activeJobRef.current); }
+    catch (failure) { setError(errorMessageForCode(errorCode(failure))); }
+  };
+
+  const discardLocalTask = async (jobId: string) => {
+    if (!localApi.discardRecoverableTask || discarding) return;
+    setDiscarding(true);
+    try {
+      await localApi.discardRecoverableTask(jobId);
+      setRecoverable((tasks) => tasks.filter((task) => task.jobId !== jobId));
+      setPendingDiscardId(null);
+      if (localApi.getStorageMetadata) setStorageMetadata(await localApi.getStorageMetadata());
+    } catch (failure) {
+      setError(errorMessageForCode(errorCode(failure), "无法删除此任务，请重试"));
+      setPhase("error");
+    } finally { setDiscarding(false); }
+  };
+
+  useEffect(() => {
+    let disposed = false;
+    if (localApi.resume) void chrome.storage.local.get([EXPERIMENTAL_ASR_KEY, LEGACY_IMPORT_COMPLETED_KEY])
+      .then((stored) => {
+        if (disposed) return;
+        setExperimentalAsr(stored[EXPERIMENTAL_ASR_KEY] === true);
+        if (stored[LEGACY_IMPORT_COMPLETED_KEY] === true) setImportCompleted(true);
+      }).catch(() => {}).finally(() => {
+        if (!disposed) setImportPreferenceLoaded(true);
+      });
+    return () => { disposed = true; importController.current?.abort(); };
+  }, []);
+
+  const changeExperimentalAsr = async (enabled: boolean) => {
+    try {
+      await chrome.storage.local.set({ [EXPERIMENTAL_ASR_KEY]: enabled });
+      setExperimentalAsr(enabled);
+    } catch { setSettingsError("无法保存实验功能设置，请重新打开插件重试。"); }
+  };
+
+  const importHistory = async () => {
+    if ((!importConsent && !importCompleted) || !importPreferenceLoaded || importing) return;
+    setImporting(true); setImportNotice({ message: "正在导入旧历史记录…" });
+    const controller = new AbortController(); importController.current = controller;
+    const format = (counts: LegacyImportCounts) => `已导入 ${counts.imported} 条，已存在 ${counts.skipped} 条，不兼容 ${counts.rejected} 条。`;
+    const origins = ["http://127.0.0.1:8000/*"];
+    let granted = false;
+    try {
+      // Request from the user's click; normal operation never requests loopback access.
+      granted = await chrome.permissions.request({ origins });
+      if (!granted) { setImportNotice({ message: "未授权访问旧本地服务，未导入记录。" }); return; }
+      const counts = await importLegacyHistory({ confirmed: true, apiOrigin: "http://127.0.0.1:8000", signal: controller.signal,
+        onProgress: (value) => setImportNotice({ message: format(value) }) });
+      if (controller.signal.aborted) throw new DOMException("Aborted", "AbortError");
+      setImportCompleted(true);
+      let preferenceNotice = "";
+      try { await chrome.storage.local.set({ [LEGACY_IMPORT_COMPLETED_KEY]: true }); }
+      catch { preferenceNotice = "导入状态未保存，下次打开可能需要再次确认。"; }
+      setImportNotice({ message: `导入完成。${format(counts)}旧记录保持不变。${preferenceNotice}` });
+      if (phaseRef.current === "history") void openHistory(true);
+    } catch (failure) {
+      setImportNotice({ message: controller.signal.aborted ? "导入已停止，已导入的记录保留。" : errorMessageForCode(errorCode(failure), "导入未完成。请确认旧本地服务已启动，且此插件保留原安装身份。已导入记录保留，可再次导入。") });
+    } finally {
+      if (granted) await chrome.permissions.remove({ origins }).catch(() => {});
+      importController.current = null; setImporting(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!importNotice || importing) return;
+    const timer = window.setTimeout(() => setImportNotice(null), 5000);
+    return () => window.clearTimeout(timer);
+  }, [importNotice, importing]);
+
+  useEffect(() => {
+    const generation = ++llmGenerationRef.current;
+    setLoadingLlm(true);
+    void prepareVideoChoice();
+    void llmStore.load().then((config) => {
+      if (llmGenerationRef.current === generation) setLlmConfig(config);
+    }).catch(() => {
+      if (llmGenerationRef.current !== generation) return;
+      setLlmConfig(defaultLlmConfig("kimi"));
+      setLlmLoadError("配置读取失败，请重新选择服务商重试，或重新填写官方 API Key 后保存。");
+    }).finally(() => {
+      if (llmGenerationRef.current === generation) setLoadingLlm(false);
+    });
     return () => {
+      llmGenerationRef.current += 1;
       cancelAnalysisOperation();
       stopPolling();
     };
@@ -465,11 +648,38 @@ export function App({
       if (!isCurrentGeneration(generation)) return;
       setHistoryItems((current) => reset ? page.items : [...current, ...page.items]);
       setHistoryHasMore(page.hasMore);
+      setPendingDeleteId(null);
+      // Older versions had no completion preference. Existing imported records
+      // establish prior consent; do not request migration access automatically.
+      if (localApi.resume && !importCompleted && !importController.current && page.items.some((item) => item.jobId.startsWith("import:"))) {
+        setImportCompleted(true);
+        void chrome.storage.local.set({ [LEGACY_IMPORT_COMPLETED_KEY]: true }).catch(() => {});
+      }
+      if (localApi.getStorageMetadata) {
+        const metadata = await localApi.getStorageMetadata();
+        if (isCurrentGeneration(generation)) setStorageMetadata(metadata);
+      }
     } catch (requestError) {
       if (!isCurrentGeneration(generation)) return;
       setHistoryError(errorMessageForCode(errorCode(requestError), "历史记录加载失败，请重试"));
     } finally {
       if (isCurrentGeneration(generation)) setHistoryLoading(false);
+    }
+  };
+
+  const deleteHistoryRecord = async (jobId: string) => {
+    if (!localApi.deleteCompletedAnalysis || historyLoading) return;
+    const generation = pollGenerationRef.current;
+    setHistoryLoading(true);
+    setHistoryError("");
+    try {
+      await localApi.deleteCompletedAnalysis(jobId);
+      setHistoryItems((items) => items.filter((item) => item.jobId !== jobId));
+      if (isCurrentGeneration(generation) && phaseRef.current === "history") await openHistory(true);
+      else setHistoryLoading(false);
+    } catch (failure) {
+      if (isCurrentGeneration(generation)) setHistoryError(errorMessageForCode(errorCode(failure), "删除失败，请重试"));
+      setHistoryLoading(false);
     }
   };
 
@@ -502,6 +712,7 @@ export function App({
     }
     const operationGeneration = beginAnalysisOperation();
     setProcessingPlatform(inspection.contentRef.platform);
+    setLocalProgress(null);
     setPhase("processing");
     setJobStatus("queued");
     try {
@@ -572,6 +783,7 @@ export function App({
     }
     const operationGeneration = beginAnalysisOperation();
     setProcessingPlatform(result.contentRef.platform);
+    setLocalProgress(null);
     setPhase("processing");
     setJobStatus("queued");
     try {
@@ -690,6 +902,76 @@ export function App({
     setPhase(settingsReturnPhase);
   };
 
+  const changeLlmConfig = (config: LlmConfig) => {
+    llmGenerationRef.current += 1;
+    setLlmConfig(config);
+    setSettingsError("");
+    setLlmLoadError("");
+    setTestingLlm(false);
+    setSavingLlm(false);
+  };
+
+  const changeLlmProvider = async (provider: LlmConfig["provider"]) => {
+    const generation = ++llmGenerationRef.current;
+    setLlmConfig(defaultLlmConfig(provider));
+    setSettingsError("");
+    setLlmLoadError("");
+    setTestingLlm(false);
+    setSavingLlm(false);
+    setLoadingLlm(true);
+    try {
+      const config = await llmStore.load(provider);
+      if (llmGenerationRef.current === generation) setLlmConfig(config);
+    } catch {
+      if (llmGenerationRef.current === generation) setLlmLoadError("配置读取失败，请重新选择服务商重试，或重新填写官方 API Key 后保存。");
+    } finally {
+      if (llmGenerationRef.current === generation) setLoadingLlm(false);
+    }
+  };
+
+  const saveLlmSettings = async (testFirst: boolean) => {
+    if (loadingLlm || savingLlm || testingLlm) return;
+    if (!isLlmConfigured(llmConfig)) {
+      setSettingsError(errorMessageForCode("llm_config_invalid"));
+      return;
+    }
+    const generation = ++llmGenerationRef.current;
+    const config = { ...defaultLlmConfig(llmConfig.provider), apiKey: llmConfig.apiKey, model: llmConfig.model };
+    const actionGeneration = ++llmActionGenerationRef.current;
+    const current = () => llmGenerationRef.current === generation
+      && llmActionGenerationRef.current === actionGeneration && phaseRef.current === "settings";
+    setSettingsError("");
+    setLlmLoadError("");
+    if (testFirst) {
+      setTestingLlm(true);
+      try {
+        await api.testLlm(config);
+      } catch (requestError) {
+        if (current()) {
+          setSettingsError(errorMessageForCode(errorCode(requestError), "LLM 连接测试失败，请检查官方 API Key、模型 ID 和网络"));
+          setTestingLlm(false);
+        }
+        return;
+      }
+      if (!current()) return;
+    }
+    setSavingLlm(true);
+    try {
+      await llmStore.save({ ...config, rememberOnDevice: llmConfig.rememberOnDevice === true });
+      if (!current()) return;
+      setLlmConfig({ ...config, rememberOnDevice: llmConfig.rememberOnDevice === true });
+      if (testFirst) setSettingsError("连接成功，配置已保存");
+      else closeSettings();
+    } catch {
+      if (current()) setSettingsError("配置保存失败，请检查浏览器存储后重试。");
+    } finally {
+      if (llmGenerationRef.current === generation) {
+        setTestingLlm(false);
+        setSavingLlm(false);
+      }
+    }
+  };
+
   const seek = (startMs: number) => {
     const contentRef = result?.contentRef ?? context?.contentRef;
     if (context && contentRef) void browser.seek(context.tabId, contentRef, startMs);
@@ -714,7 +996,7 @@ export function App({
           <button className="icon-button" type="button" onClick={openSettings} title="LLM 设置" aria-label="LLM 设置">
             <Settings size={17} strokeWidth={1.8} />
           </button>
-          <button className="icon-button" type="button" onClick={() => void prepareVideoChoice()} title="选择视频" aria-label="选择视频">
+          <button className="icon-button" type="button" onClick={() => void prepareVideoChoice({ restoreAnalysis: false })} title="选择视频" aria-label="选择视频">
             <RefreshCw size={17} strokeWidth={1.8} />
           </button>
         </div>
@@ -724,6 +1006,20 @@ export function App({
           </button>
         </div>
       </header>
+
+      {phase !== "processing" && recoverable.length > 0 && <aside className="privacy-note" aria-label="可恢复任务">
+        <p>以下任务已暂停，已完成的内容保存在本机。继续会使用任务原来的服务商和模型；如未保存 Key，请先在设置中填写。</p>
+        {recoverable.map((task) => <div key={task.jobId}>
+          <span>{task.videoTitle} · {errorMessageForCode(task.failureCode ?? "analysis_interrupted")}</span>
+          <button className="secondary-button" type="button" disabled={discarding} onClick={() => void resumeLocalTask(task)}>继续此任务</button>
+          {localApi.discardRecoverableTask && (pendingDiscardId === task.jobId ? <div>
+            <p>放弃此任务并删除已保存的字幕和进度？此操作无法撤销。</p>
+            <button className="secondary-button" disabled={discarding} onClick={() => void discardLocalTask(task.jobId)}>确认放弃任务</button>
+            <button className="secondary-button" disabled={discarding} onClick={() => setPendingDiscardId(null)}>取消</button>
+          </div> : <button className="secondary-button" disabled={discarding} onClick={() => setPendingDiscardId(task.jobId)}>放弃任务</button>)}
+        </div>)}
+      </aside>}
+      {phase === "complete" && result?.partial && error && <p role="status" className="settings-message">{error}。已读取的字幕保留在下方。</p>}
 
       {phase === "loading" && <LoadingView />}
       {phase === "selecting" && (
@@ -763,27 +1059,17 @@ export function App({
       {phase === "settings" && (
         <SettingsView
           config={llmConfig}
-          error={settingsError}
+          error={settingsError || llmLoadError}
           testing={testingLlm}
-          onChange={setLlmConfig}
-          onProviderChange={async (provider) => {
-            setLlmConfig(await llmStore.load(provider));
-            setSettingsError("");
-          }}
-          onSave={async () => { await llmStore.save(llmConfig); setSettingsError(""); closeSettings(); }}
-          onTest={async () => {
-            if (!isLlmConfigured(llmConfig)) { setSettingsError("请填写 API URL 和 API Key"); return; }
-            setTestingLlm(true); setSettingsError("");
-            try { await api.testLlm(llmConfig); await llmStore.save(llmConfig); setSettingsError("连接成功，可以开始分析"); }
-            catch (requestError) {
-              setSettingsError(errorMessageForCode(
-                errorCode(requestError),
-                "LLM 连接测试失败，请检查 Provider、API 地址、模型和 API Key",
-              ));
-            }
-            finally { setTestingLlm(false); }
-          }}
+          saving={savingLlm}
+          loading={loadingLlm}
+          onChange={changeLlmConfig}
+          onProviderChange={changeLlmProvider}
+          onSave={() => void saveLlmSettings(false)}
+          onTest={() => void saveLlmSettings(true)}
           onBack={closeSettings}
+          experimentalAsr={localApi.resume ? experimentalAsr : undefined}
+          onExperimentalAsr={(enabled) => void changeExperimentalAsr(enabled)}
         />
       )}
       {phase === "history" && (
@@ -795,10 +1081,24 @@ export function App({
           onOpen={(item) => void openHistoryResult(item)}
           onLoadMore={() => void openHistory(false)}
           onRetry={() => void openHistory(historyItems.length === 0)}
-          onBack={() => void prepareVideoChoice()}
+          onBack={() => void prepareVideoChoice({ restoreAnalysis: false })}
+          storageMetadata={storageMetadata}
+          pendingDeleteId={pendingDeleteId}
+          onRequestDelete={localApi.deleteCompletedAnalysis ? setPendingDeleteId : undefined}
+          onConfirmDelete={(jobId) => void deleteHistoryRecord(jobId)}
+          importAction={localApi.resume ? <button className="history-import-button" type="button"
+            title="从旧本地服务导入历史记录（只读，不删除原记录）"
+            disabled={!importPreferenceLoaded || (!importConsent && !importCompleted) || importing || historyLoading}
+            onClick={() => void importHistory()}><Import size={16} strokeWidth={1.8} aria-hidden="true" />导入</button> : undefined}
+          migration={localApi.resume && !importCompleted && importPreferenceLoaded ? <section className="privacy-note history-import-note">
+              <label><input type="checkbox" checked={importConsent} disabled={importing} onChange={(event) => setImportConsent(event.target.checked)} />从旧本地服务导入当前安装的已完成记录（只读，不删除原记录）</label>
+              <p>仅迁移时需要启动原本地服务。关闭此侧边栏会停止导入，可再次导入而不重复。</p>
+          </section> : undefined}
         />
       )}
-      {phase === "processing" && <ProcessingView platform={processingPlatform} status={jobStatus} uploadPercent={uploadPercent} />}
+      {phase === "processing" && <><ProcessingView platform={processingPlatform} status={jobStatus} uploadPercent={uploadPercent} localProgress={localProgress} />
+        {localApi.cancel && <button className="secondary-button" type="button" onClick={() => void cancelLocalTask()}>暂停任务</button>}
+      </>}
       {phase === "error" && <ErrorView
         message={error}
         retryLabel={errorCodeValue === "llm_credentials_expired" ? "重试" : "重新检查"}
@@ -816,9 +1116,19 @@ export function App({
           onQueryChange={setQuery}
           onSeek={seek}
           onRetry={() => void reanalyze()}
-          onBack={resultFromHistory ? () => setPhase("history") : undefined}
+          onBack={resultFromHistory
+            ? () => void openHistory()
+            : () => void prepareVideoChoice({ restoreAnalysis: false })}
         />
       )}
+      {importNotice && <aside className="import-toast" aria-label="历史导入提示">
+        <Import size={18} strokeWidth={1.8} aria-hidden="true" />
+        <div className="import-toast-content">
+          <p role="status" aria-atomic="true">{importNotice.message}</p>
+          {importing && <button className="secondary-button" type="button" onClick={() => importController.current?.abort()}>停止导入</button>}
+        </div>
+        {!importing && <button className="icon-button" type="button" aria-label="关闭导入提示" onClick={() => setImportNotice(null)}><X size={16} strokeWidth={1.8} aria-hidden="true" /></button>}
+      </aside>}
     </div>
   );
 }
@@ -863,7 +1173,7 @@ function SelectionView({
       <button className="primary-button" type="button" onClick={onCheck}>{usingCurrentVideo ? (isX ? "检查当前视频" : "检查当前视频字幕") : "检查此链接字幕"}</button>
       {usingCurrentVideo && existingJobId && <button className="secondary-button" type="button" onClick={onViewExisting}>查看当前分析</button>}
       {!llmConfigured && <button className="setup-link" type="button" onClick={onSettings}><Settings size={14} />先配置 LLM，再生成翻译和概览</button>}
-      <p className="privacy-note">{isX ? "视频会在本机提取音频并识别语音。" : "先确认公开字幕是否可读，再决定是否开始分析。"}</p>
+      <p className="privacy-note">{isX ? "视频会在浏览器本机提取音频并识别语音。首次使用需要下载 Whisper small 模型。" : "先确认公开字幕是否可读，再决定是否开始分析。"}</p>
     </main>
   );
 }
@@ -884,6 +1194,7 @@ function ReadyView({
   llmConfigured: boolean;
   onSettings(): void;
 }) {
+  const [modelConsent, setModelConsent] = useState(false);
   const tracks = inspection.tracks.reduce<typeof inspection.tracks>((result, track) => {
     const existingIndex = result.findIndex((item) => item.languageCode === track.languageCode);
     if (existingIndex === -1) {
@@ -922,43 +1233,54 @@ function ReadyView({
         <Languages size={16} /><span>{isX ? "自动识别语音" : selected?.isGenerated ? "YouTube 自动字幕" : "提供者字幕"}</span>
         <Clock3 size={16} /><span>{formatTime(inspection.durationMs)}</span>
       </div>
-      <button className="primary-button" type="button" onClick={onStart}>{isCurrentVideo ? "分析此视频" : "分析并打开此视频"}</button>
+      {isX && <label className="privacy-note"><input type="checkbox" checked={modelConsent} onChange={(event) => setModelConsent(event.target.checked)} />允许下载并缓存 Whisper small 模型（首次约数百 MB），使用本机 CPU 识别。识别可能慢于视频播放，不保证实时。</label>}
+      <button className="primary-button" type="button" onClick={onStart} disabled={isX && !modelConsent}>{isCurrentVideo ? "分析此视频" : "分析并打开此视频"}</button>
       {!llmConfigured && <button className="setup-link" type="button" onClick={onSettings}><Settings size={14} />配置 LLM 后开始</button>}
       <button className="secondary-button" type="button" onClick={onBack}>更换视频</button>
-      <p className="privacy-note">{isX ? "媒体只上传到你的本地 Veeky 服务。" : "只处理公开提供的字幕。"}</p>
+      <p className="privacy-note">{isX ? "音频只在本机识别；识别后的字幕直接发送给所选官方 LLM 服务商，用于翻译和摘要。" : "公开字幕直接发送给所选官方 LLM 服务商，用于翻译和摘要。"}分析结果与历史记录保存在此浏览器。</p>
     </main>
   );
 }
 
 function SettingsView({
-  config, error, testing, onChange, onProviderChange, onSave, onTest, onBack,
+  config, error, testing, saving, loading, onChange, onProviderChange, onSave, onTest, onBack, experimentalAsr, onExperimentalAsr,
 }: {
   config: LlmConfig;
   error: string;
   testing: boolean;
+  saving: boolean;
+  loading: boolean;
   onChange(config: LlmConfig): void;
   onProviderChange(provider: LlmConfig["provider"]): void;
   onSave(): void;
   onTest(): void;
   onBack(): void;
+  experimentalAsr?: boolean;
+  onExperimentalAsr(enabled: boolean): void;
 }) {
   return (
     <main className="settings-view">
       <p className="section-label">LLM 设置</p>
       <h1>配置 LLM</h1>
-      <p className="settings-copy">翻译字幕和生成视频概览都需要你自己的 LLM API。</p>
+      <p className="settings-copy">仅支持以下服务商的官方 API，不支持自定义地址或第三方中转。请填写对应服务商的官方 API Key。</p>
       <label className="settings-field" htmlFor="llm-provider"><span>Provider</span><select id="llm-provider" value={config.provider} onChange={(event) => {
         const provider = event.target.value as LlmConfig["provider"];
         onProviderChange(provider);
       }}>{LLM_PROVIDER_OPTIONS.map((option) => <option key={option.provider} value={option.provider}>{option.label}</option>)}</select></label>
-      <label className="settings-field" htmlFor="llm-api-url"><span>API URL</span><input id="llm-api-url" value={config.apiUrl} onChange={(event) => onChange({ ...config, apiUrl: event.target.value })} placeholder="https://api.moonshot.cn/v1" inputMode="url" /></label>
-      <label className="settings-field" htmlFor="llm-model"><span>模型</span><input id="llm-model" value={config.model} onChange={(event) => onChange({ ...config, model: event.target.value })} placeholder="kimi-k2.5" /></label>
-      <label className="settings-field" htmlFor="llm-api-key"><span>API Key</span><input id="llm-api-key" type="password" value={config.apiKey} onChange={(event) => onChange({ ...config, apiKey: event.target.value })} placeholder="sk-..." /></label>
+      <label className="settings-field" htmlFor="llm-api-url"><span>API URL</span><input id="llm-api-url" value={config.apiUrl} readOnly inputMode="url" /></label>
+      <label className="settings-field" htmlFor="llm-model"><span>模型</span><input id="llm-model" value={config.model} disabled={loading} onChange={(event) => onChange({ ...config, model: event.target.value })} placeholder={defaultLlmConfig(config.provider).model} /></label>
+      <label className="settings-field" htmlFor="llm-api-key"><span>API Key</span><input id="llm-api-key" type="password" value={config.apiKey} disabled={loading} onChange={(event) => onChange({ ...config, apiKey: event.target.value })} placeholder="官方 API Key" /></label>
+      <div className="settings-preferences">
+        <label className="settings-remember"><input type="checkbox" checked={config.rememberOnDevice === true} disabled={loading} onChange={(event) => onChange({ ...config, rememberOnDevice: event.target.checked })} /> 记住在此设备</label>
+        <SettingsHelp />
+      </div>
+      {experimentalAsr !== undefined && <label className="privacy-note settings-asr-option"><input type="checkbox" checked={experimentalAsr} onChange={(event) => onExperimentalAsr(event.target.checked)} /><span>启用实验性 X 本机语音识别。使用 CPU Whisper small；尚未完成真实模型和性能验收，可能无法完成或速度较慢。首次使用需下载模型。</span></label>}
+      {(config.migrationNotice || config.provider === "hunyuan") && <p className="settings-copy">{config.migrationNotice || HUNYUAN_MIGRATION_NOTICE}</p>}
+      {loading && <p className="settings-copy">正在读取此服务商的独立配置…</p>}
       {error && <p className={`settings-message ${error.includes("成功") ? "success" : ""}`} role="status">{error}</p>}
-      <button className="primary-button" type="button" onClick={onTest} disabled={testing}>{testing ? "测试中..." : "测试连通"}</button>
-      <button className="secondary-button" type="button" onClick={onSave}>保存配置</button>
+      <button className="primary-button" type="button" onClick={onTest} disabled={testing || saving || loading}>{testing ? "测试中..." : "测试连通"}</button>
+      <button className="secondary-button" type="button" onClick={onSave} disabled={testing || saving || loading}>{saving && !testing ? "保存中..." : "保存配置"}</button>
       <button className="secondary-button" type="button" onClick={onBack}>返回</button>
-      <p className="privacy-note">API Key 会发送到本地 API，用于后台翻译和概览任务。</p>
     </main>
   );
 }
@@ -967,23 +1289,25 @@ function ProcessingView({
   platform,
   status,
   uploadPercent,
+  localProgress,
 }: {
   platform: ContentRef["platform"];
   status: JobStatus;
   uploadPercent: number | null;
+  localProgress?: Partial<LocalAnalysisStatus> | null;
 }) {
   const stages: Array<[JobStatus, string]> = platform === "x"
     ? [
       ["downloading_media", "获取视频"],
       ["extracting_audio", "提取音频"],
       ["transcribing", "识别语音"],
-      ["analyzing", "整理章节与重点"],
       ["translating", "翻译字幕"],
+      ["analyzing", "整理章节与重点"],
     ]
     : [
       ["fetching_transcript", "读取字幕"],
-      ["analyzing", "整理章节与重点"],
       ["translating", "翻译字幕"],
+      ["analyzing", "整理章节与重点"],
     ];
   const activeIndex = status === "queued" || status === "waiting_for_media"
     ? 0
@@ -1003,8 +1327,9 @@ function ProcessingView({
     <main className="processing-view">
       <div className="processing-mark"><span></span><span></span><span></span></div>
       <p className="section-label">后台处理中</p>
-      <h1>{title}</h1>
-      <p>切换网页不会中断任务。回到{platform === "youtube" ? "这个 YouTube" : "原视频"}标签页后，结果仍会保留。</p>
+      <h1>{localProgress?.stage === "downloading_model" ? "正在下载并校验语音模型" : title}</h1>
+      {localProgress?.progressTotal != null && <p role="status">进度 {Math.min(100, Math.floor((localProgress.progressCompleted ?? 0) / Math.max(1, localProgress.progressTotal) * 100))}%</p>}
+      <p>可以关闭侧边栏。关闭浏览器会暂停任务；下次打开后可手动继续，已完成的步骤保留。</p>
       <div className="stage-list">
         {stages.map(([key, label], index) => (
           <div className={`stage ${index < activeIndex ? "done" : ""} ${index === activeIndex ? "active" : ""}`} key={key}>
@@ -1018,7 +1343,7 @@ function ProcessingView({
   );
 }
 
-function HistoryView({ items, loading, error, hasMore, onOpen, onLoadMore, onRetry, onBack }: {
+function HistoryView({ items, loading, error, hasMore, onOpen, onLoadMore, onRetry, onBack, importAction, migration, storageMetadata, pendingDeleteId, onRequestDelete, onConfirmDelete }: {
   items: AnalysisHistoryItem[];
   loading: boolean;
   error: string;
@@ -1027,20 +1352,54 @@ function HistoryView({ items, loading, error, hasMore, onOpen, onLoadMore, onRet
   onLoadMore(): void;
   onRetry(): void;
   onBack(): void;
+  importAction?: import("react").ReactNode;
+  migration?: import("react").ReactNode;
+  storageMetadata: LocalStorageMetadata | null;
+  pendingDeleteId: string | null;
+  onRequestDelete?: (jobId: string | null) => void;
+  onConfirmDelete(jobId: string): void;
 }) {
+  const historyNearLimit = storageMetadata !== null && (
+    storageMetadata.history.recordCount >= storageMetadata.history.maxRecords * 0.9
+    || storageMetadata.history.bytes >= storageMetadata.history.maxBytes * 0.9
+  );
+  const taskDataNearLimit = storageMetadata !== null
+    && storageMetadata.taskData.bytes >= storageMetadata.taskData.maxBytes * 0.9;
+
   return (
     <main className="history-view">
-      <div className="view-heading">
+      <div className="view-heading history-heading">
         <button className="icon-button" type="button" onClick={onBack} aria-label="返回当前视频"><ChevronLeft size={18} /></button>
-        <div><p className="section-label">已完成</p><h1>历史记录</h1></div>
+        <div><h1>历史记录</h1></div>
+        {importAction}
       </div>
+      {migration}
+      {historyNearLimit && <p className="privacy-note" role="status">历史记录存储空间不足，请清理不再需要的记录。</p>}
+      {taskDataNearLimit && <p className="privacy-note" role="status">任务与进度存储空间不足，请在上方放弃不再需要的暂停任务。</p>}
       {items.length === 0 && !loading && !error && <p className="empty-state">还没有分析记录</p>}
       <div className="history-list">
         {items.map((item) => (
-          <button className="history-row" type="button" key={item.jobId} onClick={() => onOpen(item)} aria-label={`打开 ${item.videoTitle}`}>
-            <span><strong>{item.videoTitle}</strong><small>视频时长 {formatTime(item.durationMs)} · {formatCompletedAt(item.completedAt)}</small></span>
-            <ChevronRight size={16} />
-          </button>
+          <div className="history-item" key={item.jobId}>
+            <div className="history-entry">
+              <button className="history-row" type="button" disabled={loading} onClick={() => onOpen(item)} aria-label={`打开 ${item.videoTitle}`}>
+                <span><strong>{item.videoTitle}</strong><small>视频时长 {formatTime(item.durationMs)} · {formatCompletedAt(item.completedAt)}</small></span>
+                <ChevronRight size={16} />
+              </button>
+              {onRequestDelete && <button
+                className="icon-button history-delete-action"
+                type="button"
+                disabled={loading || pendingDeleteId === item.jobId}
+                aria-label={`删除 ${item.videoTitle}`}
+                title="删除记录"
+                onClick={() => onRequestDelete(item.jobId)}
+              ><Trash2 size={16} strokeWidth={1.8} aria-hidden="true" /></button>}
+            </div>
+            {onRequestDelete && pendingDeleteId === item.jobId && <div className="privacy-note">
+              <p>删除“{item.videoTitle}”及其本机任务数据？此操作无法撤销，旧服务中的原记录不受影响。</p>
+              <button className="secondary-button" disabled={loading} onClick={() => onConfirmDelete(item.jobId)}>确认删除</button>
+              <button className="secondary-button" disabled={loading} onClick={() => onRequestDelete(null)}>取消</button>
+            </div>}
+          </div>
         ))}
       </div>
       {error && <div className="history-error" role="alert"><span>{error}</span><button type="button" onClick={onRetry}>重试</button></div>}
@@ -1059,17 +1418,14 @@ function ResultView({ result, section, query, transcript, onSectionChange, onQue
   onQueryChange(query: string): void;
   onSeek(startMs: number): void;
   onRetry(): void;
-  onBack?(): void;
+  onBack(): void;
 }) {
   return (
     <main className="result-view">
-      {onBack && <button className="result-back" type="button" onClick={onBack}><ChevronLeft size={15} />返回历史记录</button>}
-      <div className="result-source"><span><i></i>{result.partial ? (result.failureCode ? "仅原文可用" : "概览已生成") : "分析完成"}</span><span>{result.sourceLanguage}</span><span>译为 {result.targetLanguage}</span></div>
-      {result.partial && <p className="partial-banner">
-        {result.failureCode === "translation_failed"
-          ? "原始字幕可用，翻译暂时失败。"
-          : "概览已生成，逐字稿仍在翻译。"}
-      </p>}
+      <div className="result-toolbar">
+        <button className="result-back" type="button" onClick={onBack}><ChevronLeft size={15} />返回</button>
+        <button className="secondary-button retry-analysis" type="button" onClick={onRetry}>重新分析</button>
+      </div>
       <div className="result-video">
         <strong>{result.videoTitle}</strong>
         <small>
@@ -1077,7 +1433,6 @@ function ResultView({ result, section, query, transcript, onSectionChange, onQue
           {result.isGenerated !== null && ` · ${result.isGenerated ? "YouTube 自动字幕" : "提供者字幕"}`}
         </small>
       </div>
-      <button className="secondary-button retry-analysis" type="button" onClick={onRetry}>重新分析</button>
       <div className="result-tabs" role="tablist">
         <button type="button" role="tab" aria-selected={section === "overview"} className={section === "overview" ? "active" : ""} onClick={() => onSectionChange("overview")}>概览</button>
         <button type="button" role="tab" aria-selected={section === "transcript"} className={section === "transcript" ? "active" : ""} onClick={() => onSectionChange("transcript")}>逐字稿</button>

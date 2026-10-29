@@ -431,7 +431,7 @@ async def test_every_media_mutation_consumes_the_installation_write_quota(media_
     )
     await client.delete(f"/v1/media-sessions/{session_id}")
 
-    assert limiter.calls == [
+    assert [call for call in limiter.calls if call[0] == INSTALLATION_ID] == [
         (INSTALLATION_ID, "write", 20),
         (INSTALLATION_ID, "read", 120),
         (INSTALLATION_ID, "write", 20),
@@ -483,7 +483,7 @@ async def test_create_bounds_and_strictly_validates_body_after_auth_and_quota(
     assert oversized.status_code == 413
     assert oversized.json()["detail"]["code"] == "create_body_too_large"
     assert unauthorized.status_code == 401
-    assert limiter.calls == [
+    assert [call for call in limiter.calls if call[0] == INSTALLATION_ID] == [
         (INSTALLATION_ID, "write", 20),
         (INSTALLATION_ID, "write", 20),
     ]

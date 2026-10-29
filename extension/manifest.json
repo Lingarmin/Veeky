@@ -11,9 +11,22 @@
     "https://www.youtu.be/*",
     "https://*.x.com/*",
     "https://video.twimg.com/*",
-    "http://127.0.0.1:8000/*",
-    "http://localhost:8000/*"
+    "https://api.moonshot.cn/*",
+    "https://api.deepseek.com/*",
+    "https://tokenhub.tencentmaas.com/*",
+    "https://dashscope.aliyuncs.com/*",
+    "https://open.bigmodel.cn/*",
+    "https://huggingface.co/*",
+    "https://cdn-lfs.huggingface.co/*",
+    "https://cdn-lfs.hf.co/*",
+    "https://cdn-lfs-us-1.hf.co/*",
+    "https://cdn-lfs-eu-1.hf.co/*",
+    "https://cas-bridge.xethub.hf.co/*"
   ],
+  "optional_host_permissions": ["http://127.0.0.1:8000/*", "http://localhost:8000/*"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self' https://www.youtube.com https://m.youtube.com https://youtube.com https://video.twimg.com https://api.moonshot.cn https://api.deepseek.com https://tokenhub.tencentmaas.com https://dashscope.aliyuncs.com https://open.bigmodel.cn https://huggingface.co https://cdn-lfs.huggingface.co https://cdn-lfs.hf.co https://cdn-lfs-us-1.hf.co https://cdn-lfs-eu-1.hf.co https://cas-bridge.xethub.hf.co http://127.0.0.1:8000 http://localhost:8000"
+  },
   "content_scripts": [
     {
       "matches": ["https://x.com/*", "https://www.x.com/*"],

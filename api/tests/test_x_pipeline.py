@@ -22,6 +22,7 @@ from app.db.models import (
     MediaUploadPart,
     MediaUploadSession,
     TranscriptTrack,
+    Translation,
     Video,
 )
 from app.security.credentials import JobCredentialCipher
@@ -30,7 +31,7 @@ from app.services.asr import AsrError, FasterWhisperTranscriber
 from app.services.media_download import MediaDownloadError
 from app.services.media_upload import create_upload_session
 from app.services.transcripts import TranscriptSegment
-from app.services.translation import TranslatedSegment, TranslationProviderError
+from app.services.translation import TranslatedSegment, TranslationProviderError, provider_translation_version
 from app.workers.tasks import (
     AnalysisPipeline,
     AudioExtractionError,
@@ -170,7 +171,7 @@ async def x_context(tmp_path):
             cache_key=f"pending:{INSTALLATION_ID}:job-x",
             llm_config={
                 "provider": "kimi",
-                "api_url": "https://api.example.com/v1/chat/completions",
+                "api_url": "https://api.moonshot.cn/v1/chat/completions",
                 "model": "kimi-k2.5",
                 "pipeline_revision": "pipeline-v1|prompt-v1|schema-v1",
             },
@@ -269,7 +270,7 @@ async def test_x_direct_media_runs_all_stages_and_persists_asr_identity(x_contex
         assert job.cache_key.startswith(
             f"{INSTALLATION_ID}:{job.content_id}:en:zh-Hans:{track.transcript_version}:"
         )
-        assert "api.example.com" not in job.cache_key
+        assert "api.moonshot.cn" not in job.cache_key
         assert "pipeline-v1" not in job.cache_key
         assert track.transcript_source == "faster_whisper"
         assert track.asr_model == "small"
@@ -743,11 +744,22 @@ async def test_translation_failure_preserves_x_transcript_and_cleans_temp(x_cont
 
 
 @pytest.mark.asyncio
-async def test_matching_final_x_transcript_reuses_result_without_llm_calls(x_context):
+@pytest.mark.parametrize("cached_owner", [INSTALLATION_ID, OTHER_INSTALLATION_ID, None])
+async def test_matching_final_x_transcript_reuses_only_owned_translation(x_context, cached_owner):
     factory, cipher, _, _ = x_context
     await make_pipeline(x_context).run("job-x")
     async with factory() as session:
         first = await session.get(AnalysisJob, "job-x")
+        translation = await session.scalar(select(Translation))
+        translation.installation_id = cached_owner
+        translation.provider = "kimi"
+        translation.provider_version = provider_translation_version(
+            "https://api.moonshot.cn/v1/chat/completions"
+        )
+        if cached_owner is None:
+            first.legacy_translation_id = translation.id
+        if cached_owner == OTHER_INSTALLATION_ID:
+            session.add(Installation(id=OTHER_INSTALLATION_ID, token_hash="b" * 64))
         second = AnalysisJob(
             id="job-x-2",
             installation_id=first.installation_id,
@@ -767,19 +779,26 @@ async def test_matching_final_x_transcript_reuses_result_without_llm_calls(x_con
         session.add(second)
         await session.commit()
 
-    class MustNotAnalyze:
-        async def analyze(self, *args, **kwargs):
-            raise AssertionError("analysis provider was called")
+    calls = []
 
-    class MustNotTranslate(FakeTranslation):
+    class RecordingAnalysis(FakeAnalysis):
+        async def analyze(self, *args, **kwargs):
+            calls.append("analysis")
+            return await super().analyze(*args, **kwargs)
+
+    class RecordingTranslation(FakeTranslation):
+        name = "kimi"
+        version = provider_translation_version("https://api.moonshot.cn/v1/chat/completions")
+
         async def translate(self, *args, **kwargs):
-            raise AssertionError("translation provider was called")
+            calls.append("translation")
+            return await super().translate(*args, **kwargs)
 
     pipeline = AnalysisPipeline(
         factory,
         None,
-        MustNotTranslate(),
-        MustNotAnalyze(),
+        RecordingTranslation(),
+        RecordingAnalysis(),
         credential_cipher=cipher,
         media_downloader=FakeDownloader(),
         audio_extractor=FakeAudioExtractor(),
@@ -796,6 +815,8 @@ async def test_matching_final_x_transcript_reuses_result_without_llm_calls(x_con
         )
         assert second.status == "completed"
         assert second.result.one_line_summary == "Summary"
+        assert second.legacy_translation_id is None
+    assert sorted(calls) == ([] if cached_owner == INSTALLATION_ID else ["analysis", "translation"])
 
 
 @pytest.mark.asyncio

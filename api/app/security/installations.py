@@ -15,6 +15,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import Installation
 from app.db.session import get_session
 from app.core.settings import Settings, get_settings
+from app.security.client_ip import client_quota_subject
+from app.security.admission import acquire_admission_lock, admit_registration
 from app.security.quotas import (
     QuotaServiceUnavailable,
     RateLimitExceeded,
@@ -75,15 +77,16 @@ async def register_installation(
     response: Response,
     session: Annotated[AsyncSession, Depends(get_session)],
     limiter: Annotated[RedisQuotaLimiter, Depends(get_quota_limiter)],
-    _: Annotated[Settings, Depends(get_settings)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> RegistrationResponse:
-    client_ip = http_request.client.host if http_request.client else "unknown"
+    client_ip = client_quota_subject(http_request, settings)
     try:
         await limiter.enforce(
             client_ip,
             "registration",
             _REGISTRATION_RATE_LIMIT_PER_MINUTE,
         )
+        await limiter.enforce("global", "registration", 100)
     except RateLimitExceeded as error:
         raise HTTPException(
             status_code=429,
@@ -102,6 +105,7 @@ async def register_installation(
             },
         ) from error
     token_hash = hash_installation_token(request.installation_token)
+    await acquire_admission_lock(session)
     installation = await session.get(Installation, request.installation_id)
     if installation is not None:
         if not hmac.compare_digest(installation.token_hash, token_hash):
@@ -110,6 +114,7 @@ async def register_installation(
         await session.commit()
         return RegistrationResponse(installation_id=installation.id)
 
+    await admit_registration(session, settings, client_ip, request.installation_id)
     installation = Installation(id=request.installation_id, token_hash=token_hash)
     session.add(installation)
     try:

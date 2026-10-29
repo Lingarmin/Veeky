@@ -14,7 +14,7 @@ services:
       ASR_DEVICE: ${ASR_DEVICE:-cpu}
       ASR_COMPUTE_TYPE: ${ASR_COMPUTE_TYPE:-int8}
       ASR_MODEL_DIR: ${ASR_MODEL_DIR:-/models/whisper}
-    command: ["/bin/sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+    command: ["/bin/sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-proxy-headers"]
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:

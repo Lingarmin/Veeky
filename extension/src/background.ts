@@ -15,6 +15,9 @@ import type {
 import { OFFSCREEN_MEDIA_PORT } from "./shared/types";
 import { contentKey, parseContentRef, parseXStatusRoute } from "./shared/content";
 import { createApi, DEFAULT_API_BASE_URL, type MediaUploadApi } from "./sidepanel/api";
+import { restrictCredentialStorage } from "./sidepanel/llm";
+import { installLocalRuntime } from "./local/background-runtime";
+import { localError } from "./local/youtube-browser";
 import {
   browserInstallationIdentityStore,
   type InstallationIdentityStore,
@@ -85,6 +88,7 @@ interface BackgroundState {
 }
 
 interface BackgroundDependencies {
+  standalone?: boolean;
   mediaApi?: MediaUploadApi;
   apiBaseUrl?: string;
   identityStore?: InstallationIdentityStore;
@@ -126,9 +130,15 @@ export function installBackgroundHandlers(
   chromeApi: ChromeApi,
   dependencies: BackgroundDependencies = {},
 ): void {
+  // Apply trusted-only access on every worker start, even when no panel is opened.
+  // Preserve rejection for initialization; catching for logging must not grant access.
+  const credentialStorageReady = restrictCredentialStorage(chromeApi.storage);
+  void credentialStorageReady.catch(reportBackgroundError);
   const apiBaseUrl = dependencies.apiBaseUrl ?? DEFAULT_API_BASE_URL;
   const identityStore = dependencies.identityStore ?? browserInstallationIdentityStore;
-  const mediaApi = dependencies.mediaApi ?? createApi(apiBaseUrl, identityStore);
+  const mediaApi = dependencies.mediaApi ?? (dependencies.standalone
+    ? new Proxy({} as MediaUploadApi, { get: () => async () => { throw localError("analysis_legacy_disabled"); } })
+    : createApi(apiBaseUrl, identityStore));
   const lastDetectedContentByTab = new Map<number, ContentRef>();
   const recentRequestsByTab = new Map<number, BufferedMediaCandidate[]>();
   const routeEpochByTab = new Map<number, XRouteEpoch>();
@@ -187,6 +197,12 @@ export function installBackgroundHandlers(
     .setPanelBehavior({ openPanelOnActionClick: false })
     .catch(reportBackgroundError);
   const initialization = runCaptureTask(async () => {
+    await credentialStorageReady;
+    if (dependencies.standalone) {
+      await initializeMediaCapture(chromeApi);
+      await configureActiveTab(chromeApi, lastDetectedContentByTab, routeEpochByTab);
+      return;
+    }
     const [uploadJobs, activeMediaSession] = await Promise.all([
       loadMediaUploadJobsState(chromeApi),
       loadActiveMediaSession(chromeApi),
@@ -296,6 +312,7 @@ export function installBackgroundHandlers(
   });
 
   chromeApi.runtime.onConnect.addListener((port) => {
+    if (dependencies.standalone) return;
     if (port.name !== OFFSCREEN_MEDIA_PORT) return;
     if (!isTrustedOffscreenPort(chromeApi, port)) {
       port.disconnect();
@@ -345,6 +362,10 @@ export function installBackgroundHandlers(
 
   chromeApi.runtime.onMessage.addListener(
     (message: ExtensionMessage, sender, sendResponse) => {
+      if (typeof message?.type === "string" && message.type.startsWith("VEEKY_LOCAL_")) return false;
+      if (dependencies.standalone && isRuntimeUploadMessage(message)) {
+        sendResponse({ ok: false }); return false;
+      }
       const handled = isRuntimeUploadMessage(message)
         ? initialization.then(() => handleMessage(chromeApi, message, sender, state))
         : handleMessage(chromeApi, message, sender, state);
@@ -354,6 +375,23 @@ export function installBackgroundHandlers(
       return true;
     },
   );
+  if (dependencies.standalone) installLocalRuntime(chromeApi, async (ref) => {
+    await initialization;
+    if (!isValidXContentRef(ref)) throw localError("unsupported_media_candidate");
+    return runCaptureTask(async () => {
+      const tabs = await chromeApi.tabs.query({ url: ["https://x.com/*", "https://www.x.com/*"] });
+      const mediaState = await loadMediaCaptureState(chromeApi);
+      for (const tab of tabs) {
+        if (tab.id === undefined || !xUrlMatchesRef(tab.url, ref)) continue;
+        const detected = await resolveLastDetectedContext(chromeApi, tab.id, tab.url);
+        if (!detected || !sameContentRef(detected.contentRef, ref) || !detected.durationMs) continue;
+        const candidates = sortCandidates(pruneCandidates(mediaState[String(tab.id)]?.candidates[contentKey(ref)] ?? [], Date.now()));
+        const candidate = candidates.find((item) => item.kind === "mp4" || item.kind === "hls");
+        if (candidate) return { url: candidate.url, durationMs: detected.durationMs, title: tab.title ?? "X video" };
+      }
+      throw localError("media_url_expired");
+    });
+  });
 }
 
 function reportBackgroundError(_error: unknown): void {
@@ -1643,5 +1681,5 @@ async function configureActiveTab(
 }
 
 if (typeof chrome !== "undefined" && chrome.runtime?.id) {
-  installBackgroundHandlers(chrome);
+  installBackgroundHandlers(chrome, { standalone: true });
 }

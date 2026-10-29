@@ -16,6 +16,7 @@ from app.core.settings import Settings, get_settings
 from app.db.models import AnalysisJob, Installation, MediaUploadSession
 from app.db.session import get_session
 from app.security.installations import require_installation
+from app.security.client_ip import client_quota_subject
 from app.services.media_upload import (
     MAX_PART_COUNT,
     MediaArtifact,
@@ -120,6 +121,7 @@ async def create_media_session(
             request.kind,
             request.expected_bytes,
             request.part_count,
+            quota_subject=client_quota_subject(http_request, settings),
         )
     except MediaUploadError as error:
         raise _http_error(error) from error

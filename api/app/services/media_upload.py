@@ -15,11 +15,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
+from fastapi import HTTPException
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.settings import Settings
+from app.security.admission import acquire_admission_lock, admit_upload
 from app.db.models import (
     AnalysisJob,
     Installation,
@@ -111,9 +113,11 @@ async def create_upload_session(
     kind: Literal["mp4", "hls"],
     expected_bytes: int,
     part_count: int,
+    *,
+    quota_subject: str | None = None,
 ) -> MediaUploadSession:
     _validate_declaration(settings, expected_bytes, part_count)
-    await _serialize_sqlite_write(database)
+    await acquire_admission_lock(database)
     await database.scalar(
         select(Installation.id)
         .where(Installation.id == installation_id)
@@ -175,8 +179,21 @@ async def create_upload_session(
             await database.commit()
         raise _error(404, "content_not_found", "content was not found")
 
+    upload_id = str(uuid.uuid4())
+    try:
+        await admit_upload(
+            database, settings, quota_subject or installation_id,
+            installation_id, upload_id, expected_bytes,
+        )
+    except HTTPException:
+        # Admission rejection has not added usage or a new upload. Persist the
+        # expiration cleanup whose files have already been removed, so those
+        # old reservations cannot remain stuck until the next cleanup run.
+        if expired_uploads:
+            await database.commit()
+        raise
     upload = MediaUploadSession(
-        id=str(uuid.uuid4()),
+        id=upload_id,
         installation_id=installation_id,
         content_id=content_id,
         status="created",

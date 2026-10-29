@@ -150,7 +150,7 @@ export interface CaptionTrack {
 export interface VideoInspection extends ContentContext {
   durationMs: number;
   sourceStatus: "ready" | "play_required" | "media_required" | "unavailable";
-  transcriptSource: "youtube_caption" | "faster_whisper";
+  transcriptSource: "youtube_caption" | "faster_whisper" | "browser_whisper";
   availableLanguages: CaptionTrack[];
   tracks: CaptionTrack[];
   selectedLanguage: string;

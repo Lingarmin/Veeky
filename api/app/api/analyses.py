@@ -7,7 +7,7 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
@@ -43,6 +43,7 @@ from app.sources.x import XAdapter
 from app.services.translation import provider_translation_version
 from app.services.llm import (
     LLM_PROVIDER_DEFAULTS,
+    LlmProviderConfig,
     LlmProviderError,
     build_llm_client,
     normalize_chat_completions_url,
@@ -51,6 +52,8 @@ from app.services.llm import (
 from app.services.media_upload import expire_complete_upload_if_unreferenced
 from app.services.job_lease import requeue_stale_job
 from app.security.installations import require_installation
+from app.security.client_ip import client_quota_subject
+from app.security.admission import acquire_admission_lock, admit_analysis
 from app.security.credentials import JobCredentialCipher
 from app.security.quotas import (
     QuotaServiceUnavailable,
@@ -82,6 +85,7 @@ class WorkerUnavailableError(RuntimeError):
 
 
 async def enforce_write_quota(
+    request: Request,
     installation: Installation = Depends(require_installation),
     limiter: RedisQuotaLimiter = Depends(get_quota_limiter),
     settings: Settings = Depends(get_settings),
@@ -92,9 +96,17 @@ async def enforce_write_quota(
         "write",
         settings.write_rate_limit_per_minute,
     )
+    await _enforce_quota(
+        limiter, client_quota_subject(request, settings),
+        "write_ip", settings.write_rate_limit_per_ip_per_minute,
+    )
+    await _enforce_quota(
+        limiter, "global", "write_global", settings.write_rate_limit_global_per_minute,
+    )
 
 
 async def enforce_read_quota(
+    request: Request,
     installation: Installation = Depends(require_installation),
     limiter: RedisQuotaLimiter = Depends(get_quota_limiter),
     settings: Settings = Depends(get_settings),
@@ -104,6 +116,13 @@ async def enforce_read_quota(
         installation.id,
         "read",
         settings.read_rate_limit_per_minute,
+    )
+    await _enforce_quota(
+        limiter, client_quota_subject(request, settings),
+        "read_ip", settings.read_rate_limit_per_ip_per_minute,
+    )
+    await _enforce_quota(
+        limiter, "global", "read_global", settings.read_rate_limit_global_per_minute,
     )
 
 
@@ -193,7 +212,9 @@ class InspectResponse(ApiModel):
 class LlmConfigRequest(ApiModel):
     provider: str = "kimi"
     api_url: str = Field(min_length=1, max_length=1000)
-    api_key: str = Field(min_length=1, max_length=500)
+    # Missing/blank keys are rejected by normalized config validation so both
+    # creation and connection tests return the same localized, secret-free error.
+    api_key: str = Field(default="", max_length=500)
     model: str | None = Field(default=None, max_length=120)
 
 
@@ -515,6 +536,7 @@ async def inspect_video(
 async def create_analysis(
     request: AnalysisCreateRequest,
     response: Response,
+    http_request: Request,
     session: AsyncSession = Depends(get_session),
     source_registry: SourceRegistry = Depends(get_source_registry),
     dispatcher: JobDispatcher = Depends(get_job_dispatcher),
@@ -526,7 +548,7 @@ async def create_analysis(
     __: None = Depends(enforce_analysis_create_lock),
 ) -> AnalysisCreateResponse:
     installation_id = installation.id
-    _validate_llm_config(request.llm_config)
+    normalized_llm = _validate_llm_config(request.llm_config)
     ref, video = await _resolve_content_locator(session, request)
     adapter = _source_adapter(source_registry, ref.platform)
     preferred_languages = [request.source_language] if request.source_language else []
@@ -549,6 +571,8 @@ async def create_analysis(
         ):
             raise _api_error(422, "source_language_unavailable", "所选字幕语言不可读取")
     duration_ms = source_inspection.duration_ms or (video.duration_ms if video else 0)
+    await acquire_admission_lock(session)
+    video = await _find_video_by_ref(session, ref)
     if video is None:
         video, _ = await _get_or_create_video(
             session,
@@ -574,7 +598,7 @@ async def create_analysis(
             source_language,
             request.target_language,
             version,
-            f"{pipeline_revision}|{request.llm_config.provider}|{request.llm_config.model or ''}|{normalize_chat_completions_url(request.llm_config.api_url)}",
+            f"{pipeline_revision}|{normalized_llm.provider}|{normalized_llm.model}|{normalized_llm.api_url}",
         )
         if request.force:
             cache_key = f"{cache_key}:run:{uuid.uuid4().hex}"
@@ -639,6 +663,11 @@ async def create_analysis(
     )
     if (active_jobs or 0) >= settings.max_active_jobs_per_installation:
         raise _analysis_concurrency_error()
+
+    await admit_analysis(
+        session, settings, client_quota_subject(http_request, settings),
+        installation_id, existing.id if existing else job_id, ref.platform,
+    )
 
     if existing is None:
         job = AnalysisJob(
@@ -865,6 +894,15 @@ async def get_analysis_result(
             Translation.target_language == job.target_language,
             Translation.transcript_version == version,
         ]
+        if job.legacy_translation_id is not None:
+            # Preserve only the old output explicitly bound to this owned job by
+            # migration. Never discover unowned rows through the cache identity.
+            base_translation_filters.extend([
+                Translation.id == job.legacy_translation_id,
+                Translation.installation_id.is_(None),
+            ])
+        else:
+            base_translation_filters.append(Translation.installation_id == installation_id)
         translation = None
         if job.llm_config is not None:
             provider = job.llm_config.get("provider")
@@ -1140,14 +1178,13 @@ def _validate_content_ref(ref: ContentRef) -> None:
         raise _api_error(422, "invalid_content_ref", "视频内容引用无效")
 
 
-def _validate_llm_config(config: LlmConfigRequest | None) -> None:
+def _validate_llm_config(config: LlmConfigRequest | None) -> LlmProviderConfig:
     if config is None:
         raise _api_error(422, "llm_config_required", "请先配置 LLM 服务")
     try:
-        normalized = normalize_provider_config(
+        return normalize_provider_config(
             config.provider, config.api_url, config.api_key, config.model
         )
-        normalize_chat_completions_url(normalized.api_url)
     except ValueError as error:
         raise _api_error(422, "llm_config_invalid", str(error)) from error
 
@@ -1160,7 +1197,7 @@ def _llm_snapshot(
     )
     return {
         "provider": normalized.provider,
-        "api_url": normalize_chat_completions_url(normalized.api_url),
+        "api_url": normalized.api_url,
         "model": normalized.model,
         "pipeline_revision": pipeline_revision,
     }

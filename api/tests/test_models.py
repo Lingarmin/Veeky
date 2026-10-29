@@ -33,6 +33,9 @@ async def session():
 
 @pytest.mark.asyncio
 async def test_translation_cache_key_is_unique(session):
+    owner = Installation(id="11111111-1111-4111-8111-111111111111", token_hash="a" * 64)
+    session.add(owner)
+    await session.flush()
     video = Video(
         video_id="aircAruvnKk",
         title="But what is a neural network?",
@@ -50,6 +53,7 @@ async def test_translation_cache_key_is_unique(session):
     session.add_all(
         [
             Translation(
+                installation_id=owner.id,
                 track=track,
                 target_language="zh-Hans",
                 provider="libretranslate",
@@ -58,6 +62,7 @@ async def test_translation_cache_key_is_unique(session):
                 segments=[{"segment_id": "one", "text": "译文"}],
             ),
             Translation(
+                installation_id=owner.id,
                 track=track,
                 target_language="zh-Hans",
                 provider="libretranslate",

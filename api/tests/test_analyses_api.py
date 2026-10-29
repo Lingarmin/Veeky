@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-from httpx import ASGITransport, AsyncClient
+from httpx import ASGITransport, AsyncClient, MockTransport, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -158,7 +158,7 @@ class BoundaryQuotaLimiter:
             raise RateLimitExceeded(37)
 
 
-LLM_CONFIG = {"apiUrl": "https://api.example.com/v1", "apiKey": "test-key"}
+LLM_CONFIG = {"apiUrl": "https://api.moonshot.cn/v1", "apiKey": "test-key"}
 VALID_TEST_KEY = base64.b64encode(b"v" * 32).decode("ascii")
 INSTALLATION_ID = "11111111-1111-4111-8111-111111111111"
 INSTALLATION_TOKEN = "installation-token-with-at-least-forty-three-characters"
@@ -185,6 +185,7 @@ async def _complete_job_with_translation(
     provider_version: str,
     llm_config=_KEEP_LLM_CONFIG,
     store_translation: bool = True,
+    translation_owner=_KEEP_LLM_CONFIG,
 ) -> None:
     async with factory() as session:
         job = await session.get(AnalysisJob, job_id)
@@ -220,6 +221,7 @@ async def _complete_job_with_translation(
         if store_translation:
             session.add(
                 Translation(
+                    installation_id=(job.installation_id if translation_owner is _KEEP_LLM_CONFIG else translation_owner),
                     track_id=track.id,
                     target_language=job.target_language,
                     provider=provider,
@@ -243,7 +245,7 @@ def test_llm_snapshot_normalizes_cache_identity_without_storing_the_key():
         LlmConfigRequest.model_validate(
             {
                 "provider": " KIMI ",
-                "apiUrl": "https://api.example.com/v1/",
+                "apiUrl": "https://api.moonshot.cn/v1/",
                 "apiKey": "first-secret",
             }
         ),
@@ -253,7 +255,7 @@ def test_llm_snapshot_normalizes_cache_identity_without_storing_the_key():
         LlmConfigRequest.model_validate(
             {
                 "provider": "kimi",
-                "apiUrl": "https://api.example.com/v1/chat/completions",
+                "apiUrl": "https://api.moonshot.cn/v1/chat/completions",
                 "apiKey": "second-secret",
                 "model": "kimi-k2.5",
             }
@@ -264,7 +266,7 @@ def test_llm_snapshot_normalizes_cache_identity_without_storing_the_key():
     assert first == same
     assert first == {
         "provider": "kimi",
-        "api_url": "https://api.example.com/v1/chat/completions",
+        "api_url": "https://api.moonshot.cn/v1/chat/completions",
         "model": "kimi-k2.5",
         "pipeline_revision": "analysis-schema-v1|prompt-v1|pipeline-v1",
     }
@@ -947,7 +949,7 @@ async def test_create_rejects_an_llm_endpoint_with_query_credentials(api_context
         "targetLanguage": "zh-Hans",
         "llmConfig": {
             **LLM_CONFIG,
-            "apiUrl": "https://api.example.com/v1?api_key=must-not-persist",
+            "apiUrl": "https://api.moonshot.cn/v1?api_key=must-not-persist",
         },
     }
 
@@ -1235,6 +1237,107 @@ async def test_llm_test_rejects_invalid_url_without_network_call(api_context):
     assert response.status_code == 422
     assert response.json()["detail"]["code"] == "llm_config_invalid"
     assert "secret" not in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["/v1/llm/test", "/v1/analyses"])
+@pytest.mark.parametrize("config,expected", [
+    ({"provider": "unknown-secret", "apiUrl": "https://api.moonshot.cn/v1", "apiKey": "private-secret"}, "服务商"),
+    ({"apiUrl": "https://relay.example/private-secret", "apiKey": "private-secret"}, "地址"),
+    ({"apiUrl": "https://api.moonshot.cn/v1", "apiKey": ""}, "API Key"),
+    ({"apiUrl": "https://api.moonshot.cn/v1", "apiKey": " \t "}, "API Key"),
+    ({"apiUrl": "https://api.moonshot.cn/v1"}, "API Key"),
+])
+async def test_llm_config_errors_give_secret_free_chinese_official_guidance(api_context, monkeypatch, route, config, expected):
+    client, _, _, dispatched = api_context
+
+    def deny_network(*args, **kwargs):
+        pytest.fail("invalid config reached network client")
+
+    monkeypatch.setattr("app.services.llm.build_llm_http_client", deny_network)
+    payload = config if route.endswith("/test") else {
+        "videoId": "aircAruvnKk", "sourceLanguage": "en", "llmConfig": config,
+    }
+    response = await client.post(route, json=payload)
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail["code"] == "llm_config_invalid"
+    assert "官方" in detail["message"]
+    assert expected in detail["message"]
+    assert "private-secret" not in response.text
+    assert "unknown-secret" not in response.text
+    assert not dispatched
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url", [
+    "https://relay.example/v1", "http://127.0.0.1/v1", "https://169.254.169.254/v1",
+    "https://api.deepseek.com/v1", "https://api.moonshot.cn:8443/v1",
+    "https://api.moonshot.cn/v1?key=old-secret",
+])
+@pytest.mark.parametrize("route", ["/v1/llm/test", "/v1/analyses"])
+async def test_api_rejects_nonofficial_destination_before_any_outbound(api_context, monkeypatch, url, route):
+    client, _, factory, dispatched = api_context
+    def deny_network(*args, **kwargs):
+        pytest.fail("untrusted destination reached network client")
+    monkeypatch.setattr("app.services.llm.build_llm_http_client", deny_network)
+    config = {"provider": "kimi", "apiUrl": url, "apiKey": "old-secret"}
+    payload = config if route.endswith("/test") else {
+        "videoId": "aircAruvnKk", "sourceLanguage": "en", "llmConfig": config,
+    }
+    response = await client.post(route, json=payload)
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "llm_config_invalid"
+    assert "old-secret" not in response.text
+    assert not dispatched
+    async with factory() as session:
+        assert await session.scalar(select(AnalysisJob)) is None
+
+
+@pytest.mark.asyncio
+async def test_create_canonicalizes_glm_origin_base_and_full_endpoint(api_context):
+    client, _, factory, dispatched = api_context
+    ids = []
+    for url in ["https://open.bigmodel.cn", "https://open.bigmodel.cn/api/paas/v4", "https://open.bigmodel.cn/api/paas/v4/chat/completions/"]:
+        response = await client.post("/v1/analyses", json={
+            "videoId": "aircAruvnKk", "sourceLanguage": "en",
+            "llmConfig": {"provider": "glm", "apiUrl": url, "apiKey": "secret"},
+        })
+        assert response.status_code in {200, 202}
+        ids.append(response.json()["jobId"])
+    assert len(set(ids)) == 1
+    async with factory() as session:
+        jobs = list(await session.scalars(select(AnalysisJob)))
+        assert len(jobs) == 1
+        assert jobs[0].llm_config["api_url"] == "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider,base,label", [
+    ("kimi", "https://api.moonshot.cn/v1", "Kimi"),
+    ("deepseek", "https://api.deepseek.com/v1", "DeepSeek"),
+    ("hunyuan", "https://tokenhub.tencentmaas.com/v1", "腾讯混元"),
+    ("qwen", "https://dashscope.aliyuncs.com/compatible-mode/v1", "通义千问"),
+    ("glm", "https://open.bigmodel.cn/api/paas/v4", "智谱 GLM"),
+])
+async def test_llm_api_probe_uses_protected_transport_for_all_providers(api_context, monkeypatch, provider, base, label):
+    from app.services.llm import build_llm_client
+    client, _, _, _ = api_context
+    requests = []
+    def handler(request):
+        requests.append(request)
+        return Response(200, json={"choices": [{"message": {"content": '{"ok":true}'}}]})
+    def build(config):
+        return build_llm_client(config, resolver=lambda _: ["8.8.8.8"], inner_transport=MockTransport(handler))
+    monkeypatch.setattr("app.api.analyses.build_llm_client", build)
+    response = await client.post("/v1/llm/test", json={"provider": provider, "apiUrl": base, "apiKey": "test-secret"})
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "message": f"{label} 连接成功"}
+    assert len(requests) == 1
+    assert requests[0].url.host == "8.8.8.8"
+    assert requests[0].headers["host"] in base
+    assert requests[0].extensions["sni_hostname"] == requests[0].headers["host"]
 
 
 @pytest.mark.asyncio
@@ -1690,7 +1793,7 @@ async def _store_history_job(
             cache_key=f"history:{cache_suffix}",
             llm_config={
                 "provider": "deepseek",
-                "api_url": "https://api.example.com/v1",
+                "api_url": "https://api.moonshot.cn/v1",
                 "api_key": "must-not-leak",
                 "model": "deepseek-v4-flash",
             },
@@ -2108,7 +2211,7 @@ async def test_legacy_result_does_not_guess_between_multiple_translation_provide
         (
             "deepseek",
             provider_translation_version(
-                "https://api.example.com/v1/chat/completions",
+                "https://api.moonshot.cn/v1/chat/completions",
                 provider="deepseek",
                 version="kimi-k2.5",
             ),
@@ -2116,7 +2219,7 @@ async def test_legacy_result_does_not_guess_between_multiple_translation_provide
         (
             "kimi",
             provider_translation_version(
-                "https://api.example.com/v1/chat/completions",
+                "https://api.moonshot.cn/v1/chat/completions",
                 provider="kimi",
                 version="different-model",
             ),
@@ -2156,6 +2259,56 @@ async def test_modern_result_does_not_fall_back_to_another_translation_identity(
 
     assert response.status_code == 200
     assert response.json()["transcript"][0]["translated"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("translation_owner", [None, INSTALLATION_ID, OTHER_INSTALLATION_ID])
+@pytest.mark.parametrize("legacy_binding", [False, True])
+async def test_result_reads_only_owned_or_explicit_legacy_translation(
+    api_context, translation_owner, legacy_binding,
+):
+    client, _, factory, _ = api_context
+    registered = await client.post("/v1/installations/register", json={
+        "installationId": OTHER_INSTALLATION_ID,
+        "installationToken": OTHER_INSTALLATION_TOKEN,
+    })
+    assert registered.status_code == 201
+    created = await client.post("/v1/analyses", json={
+        "videoId": "aircAruvnKk", "sourceLanguage": "en",
+        "targetLanguage": "zh-Hans", "llmConfig": LLM_CONFIG,
+    })
+    assert created.status_code == 202
+    job_id = created.json()["jobId"]
+    await _complete_job_with_translation(
+        factory, job_id, provider="kimi",
+        translation_owner=translation_owner,
+        provider_version=provider_translation_version(
+            "https://api.moonshot.cn/v1/chat/completions", provider="kimi", version="kimi-k2.5",
+        ),
+    )
+    if legacy_binding:
+        async with factory() as session:
+            job = await session.get(AnalysisJob, job_id)
+            translation = await session.scalar(select(Translation))
+            job.legacy_translation_id = translation.id
+            if translation_owner is None:
+                # A new scoped cache must not change the historical output.
+                session.add(Translation(
+                    installation_id=INSTALLATION_ID,
+                    track_id=translation.track_id,
+                    target_language=translation.target_language,
+                    provider=translation.provider,
+                    provider_version=translation.provider_version,
+                    transcript_version=translation.transcript_version,
+                    segments=[{**translation.segments[0], "text": "New translation"}],
+                ))
+            await session.commit()
+    response = await client.get(f"/v1/analyses/{job_id}/result")
+    assert response.status_code == 200
+    allowed = (translation_owner is None) if legacy_binding else (translation_owner == INSTALLATION_ID)
+    assert response.json()["transcript"][0]["translated"] == ("Stored translation" if allowed else None)
+    foreign_response = await client.get(f"/v1/analyses/{job_id}/result", headers=OTHER_AUTH_HEADERS)
+    assert foreign_response.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -2243,11 +2396,12 @@ async def test_status_and_result_endpoints(api_context):
         await session.flush()
         session.add(
             Translation(
+                installation_id=job.installation_id,
                 track_id=track.id,
                 target_language="zh-Hans",
                 provider="kimi",
                 provider_version=provider_translation_version(
-                    "https://api.example.com/v1/chat/completions",
+                    "https://api.moonshot.cn/v1/chat/completions",
                     provider="kimi",
                     version="kimi-k2.5",
                 ),

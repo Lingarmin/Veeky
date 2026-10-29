@@ -23,12 +23,12 @@ from app.services.analysis import AnalysisSegment, KimiAnalysisProvider
 
 
 def test_normalizes_kimi_base_and_completion_urls():
-    assert normalize_chat_completions_url("https://api.example.com/v1") == (
-        "https://api.example.com/v1/chat/completions"
+    assert normalize_chat_completions_url("https://api.moonshot.cn/v1") == (
+        "https://api.moonshot.cn/v1/chat/completions"
     )
     assert normalize_chat_completions_url(
-        "https://api.example.com/v1/chat/completions/"
-    ) == "https://api.example.com/v1/chat/completions"
+        "https://api.moonshot.cn/v1/chat/completions/"
+    ) == "https://api.moonshot.cn/v1/chat/completions"
 
 
 def test_deepseek_client_uses_deepseek_defaults():
@@ -64,9 +64,10 @@ async def test_kimi_client_returns_json_content():
         )
 
     client = KimiClient(
-        "https://api.example.com/v1",
+        "https://api.moonshot.cn/v1",
         "secret-key",
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        inner_transport=httpx.MockTransport(handler),
+        resolver=lambda _: ["8.8.8.8"],
     )
 
     result = await client.complete_json([{"role": "user", "content": "ping"}])
@@ -92,9 +93,10 @@ async def test_llm_client_retries_a_transient_timeout():
         )
 
     client = KimiClient(
-        "https://api.example.com/v1",
+        "https://api.moonshot.cn/v1",
         "secret-key",
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        inner_transport=httpx.MockTransport(handler),
+        resolver=lambda _: ["8.8.8.8"],
         max_attempts=2,
         retry_delay_seconds=0,
     )
@@ -104,7 +106,7 @@ async def test_llm_client_retries_a_transient_timeout():
 
 
 def test_llm_client_uses_a_timeout_that_covers_long_json_requests():
-    client = KimiClient("https://api.example.com/v1", "secret-key")
+    client = KimiClient("https://api.moonshot.cn/v1", "secret-key")
 
     assert client.timeout_seconds == 180
 
@@ -118,9 +120,10 @@ async def test_llm_client_accepts_content_parts_from_compatible_gateway():
         )
 
     client = KimiClient(
-        "https://api.example.com/v1",
+        "https://api.moonshot.cn/v1",
         "secret-key",
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        inner_transport=httpx.MockTransport(handler),
+        resolver=lambda _: ["8.8.8.8"],
     )
     assert await client.complete([{"role": "user", "content": "ping"}]) == "OK"
 
@@ -134,9 +137,10 @@ async def test_llm_client_uses_reasoning_content_when_gateway_leaves_content_emp
         )
 
     client = KimiClient(
-        "https://api.example.com/v1",
+        "https://api.moonshot.cn/v1",
         "secret-key",
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        inner_transport=httpx.MockTransport(handler),
+        resolver=lambda _: ["8.8.8.8"],
     )
     assert await client.complete_json([{"role": "user", "content": "ping"}]) == {"ok": True}
 
@@ -147,9 +151,10 @@ async def test_kimi_client_redacts_key_and_maps_auth_failure():
         return httpx.Response(401, text="invalid secret-key")
 
     client = KimiClient(
-        "https://api.example.com/v1",
+        "https://api.moonshot.cn/v1",
         "secret-key",
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        inner_transport=httpx.MockTransport(handler),
+        resolver=lambda _: ["8.8.8.8"],
     )
 
     with pytest.raises(KimiProviderError) as error:
@@ -168,9 +173,10 @@ async def test_kimi_client_includes_sanitized_provider_rejection_detail():
         )
 
     client = KimiClient(
-        "https://api.example.com/v1",
+        "https://api.moonshot.cn/v1",
         "secret-key",
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        inner_transport=httpx.MockTransport(handler),
+        resolver=lambda _: ["8.8.8.8"],
     )
 
     with pytest.raises(KimiProviderError) as error:
@@ -202,9 +208,10 @@ async def test_kimi_client_honors_retry_after_when_rate_limited(monkeypatch):
 
     monkeypatch.setattr("app.services.llm.asyncio.sleep", fake_sleep)
     client = KimiClient(
-        "https://api.example.com/v1",
+        "https://api.moonshot.cn/v1",
         "secret-key",
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        inner_transport=httpx.MockTransport(handler),
+        resolver=lambda _: ["8.8.8.8"],
         max_attempts=2,
         retry_delay_seconds=0,
     )
@@ -234,9 +241,10 @@ async def test_kimi_client_maps_insufficient_balance_without_retrying_or_exposin
         )
 
     client = KimiClient(
-        "https://api.example.com/v1",
+        "https://api.moonshot.cn/v1",
         "secret-key",
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        inner_transport=httpx.MockTransport(handler),
+        resolver=lambda _: ["8.8.8.8"],
     )
 
     with pytest.raises(KimiProviderError) as error:
@@ -261,9 +269,10 @@ async def test_kimi_client_falls_back_when_gateway_rejects_json_format():
         return httpx.Response(200, json={"choices": [{"message": {"content": '{"ok": true}'}}]})
 
     client = KimiClient(
-        "https://api.example.com/v1",
+        "https://api.moonshot.cn/v1",
         "secret-key",
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        inner_transport=httpx.MockTransport(handler),
+        resolver=lambda _: ["8.8.8.8"],
     )
 
     assert await client.complete_json([{"role": "user", "content": "ping"}]) == {"ok": True}
@@ -287,9 +296,10 @@ async def test_llm_client_extracts_json_from_markdown_and_leading_text():
         )
 
     client = DeepSeekClient(
-        "https://api.example.com/v1",
+        "https://api.deepseek.com/v1",
         "secret-key",
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        inner_transport=httpx.MockTransport(handler),
+        resolver=lambda _: ["8.8.8.8"],
     )
 
     assert await client.complete_json([{"role": "user", "content": "ping"}]) == {"ok": True}
@@ -323,7 +333,7 @@ def test_kimi_translation_uses_larger_parallel_batches_for_long_videos():
     class FakeClient:
         provider = "kimi"
         model = "kimi-k2.5"
-        url = "https://api.example.com/v1/chat/completions"
+        url = "https://api.moonshot.cn/v1/chat/completions"
 
     provider = KimiTranslationProvider(FakeClient())
 
@@ -336,7 +346,7 @@ async def test_llm_translation_splits_a_batch_when_the_model_omits_segments():
     class IncompleteThenCompleteClient:
         provider = "kimi"
         model = "kimi-k2.5"
-        url = "https://api.example.com/v1/chat/completions"
+        url = "https://api.moonshot.cn/v1/chat/completions"
 
         def __init__(self):
             self.calls = 0
@@ -370,7 +380,7 @@ async def test_llm_translation_maps_a_singleton_without_segment_id():
     class SingletonClient:
         provider = "deepseek"
         model = "deepseek-v4-flash"
-        url = "https://api.example.com/v1/chat/completions"
+        url = "https://api.deepseek.com/v1/chat/completions"
 
         async def complete_json(self, _messages):
             return {"translations": [{"text": "只有这一段译文"}]}
@@ -391,7 +401,7 @@ async def test_llm_translation_accepts_common_translation_field_alias():
     class AliasClient:
         provider = "deepseek"
         model = "deepseek-v4-flash"
-        url = "https://api.example.com/v1/chat/completions"
+        url = "https://api.deepseek.com/v1/chat/completions"
 
         async def complete_json(self, _messages):
             return {"translations": [{"translation": "别名译文"}]}
@@ -407,13 +417,14 @@ async def test_llm_translation_accepts_common_translation_field_alias():
 
 
 def test_kimi_translation_cache_version_includes_endpoint():
-    first = KimiTranslationProvider(KimiClient("https://one.example/v1", "key"))
-    second = KimiTranslationProvider(KimiClient("https://two.example/v1", "key"))
+    # Historical completed jobs retain their original endpoint-derived identity,
+    # even though new outbound clients reject these old relay destinations.
+    first = kimi_translation_version("https://one.example/v1/chat/completions")
+    second = kimi_translation_version("https://two.example/v1/chat/completions")
 
-    assert first.version != second.version
-    assert len(first.version) <= 80
-    assert first.version == kimi_translation_version("https://one.example/v1/chat/completions")
-    assert provider_translation_version("https://one.example/v1/chat/completions", provider="deepseek", version="deepseek-chat") != first.version
+    assert first != second
+    assert len(first) <= 80
+    assert provider_translation_version("https://one.example/v1/chat/completions", provider="deepseek", version="deepseek-chat") != first
 
 
 @pytest.mark.asyncio

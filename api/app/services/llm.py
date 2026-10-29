@@ -9,6 +9,9 @@ from urllib.parse import urlparse
 
 import httpx
 
+from app.services.llm_providers import LLM_PROVIDERS, OFFICIAL_PROVIDER_MESSAGE, official_completion_url
+from app.services.llm_security import Resolver, UnsafeLlmDestination, build_llm_http_client
+
 
 KIMI_MODEL = "kimi-k2.5"
 DEEPSEEK_MODEL = "deepseek-chat"
@@ -20,16 +23,20 @@ DEEPSEEK_CANONICAL_MODELS = {
 }
 
 LLM_PROVIDER_DEFAULTS = {
-    "kimi": {"model": KIMI_MODEL, "label": "Kimi"},
-    "deepseek": {"model": DEEPSEEK_MODEL, "label": "DeepSeek"},
+    name: {"model": provider.default_model, "label": provider.label}
+    for name, provider in LLM_PROVIDERS.items()
 }
 
 
 class LlmProviderError(RuntimeError):
-    def __init__(self, code: str, message: str, status_code: int | None = None):
+    def __init__(
+        self, code: str, message: str, status_code: int | None = None, *,
+        unsupported_parameters: frozenset[str] = frozenset(),
+    ):
         super().__init__(message)
         self.code = code
         self.status_code = status_code
+        self.unsupported_parameters = unsupported_parameters
 
 
 # Kept as an import-compatible alias for existing callers and old jobs.
@@ -47,8 +54,8 @@ class LlmProviderConfig:
 def default_model_for_provider(provider: str) -> str:
     try:
         return str(LLM_PROVIDER_DEFAULTS[provider]["model"])
-    except KeyError as error:
-        raise ValueError("Unsupported LLM provider") from error
+    except KeyError:
+        raise ValueError(OFFICIAL_PROVIDER_MESSAGE) from None
 
 
 def normalize_provider_config(
@@ -59,7 +66,9 @@ def normalize_provider_config(
 ) -> LlmProviderConfig:
     normalized_provider = (provider or "kimi").strip().lower()
     if normalized_provider not in LLM_PROVIDER_DEFAULTS:
-        raise ValueError("Unsupported LLM provider")
+        raise ValueError(OFFICIAL_PROVIDER_MESSAGE)
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise ValueError("请填写所选官方服务商的 API Key，不支持使用第三方中转密钥。")
     normalized_model = (model or "").strip() or default_model_for_provider(normalized_provider)
     if (
         normalized_provider == "deepseek"
@@ -68,7 +77,7 @@ def normalize_provider_config(
         normalized_model = normalized_model.casefold()
     return LlmProviderConfig(
         provider=normalized_provider,
-        api_url=api_url,
+        api_url=official_completion_url(normalized_provider, api_url),
         api_key=api_key,
         model=normalized_model,
     )
@@ -98,7 +107,8 @@ class OpenAICompatibleClient:
         *,
         provider: str = "kimi",
         model: str | None = None,
-        client: httpx.AsyncClient | None = None,
+        inner_transport: httpx.AsyncBaseTransport | None = None,
+        resolver: Resolver | None = None,
         timeout_seconds: float = 180,
         max_attempts: int = 3,
         retry_delay_seconds: float = 1.0,
@@ -107,13 +117,13 @@ class OpenAICompatibleClient:
         self.provider = config.provider
         self.provider_label = str(LLM_PROVIDER_DEFAULTS[self.provider]["label"])
         self.model = config.model
-        self.url = normalize_chat_completions_url(api_url)
+        self.url = config.api_url
         self.api_key = api_key
-        self.client = client
+        self._inner_transport = inner_transport
+        self._resolver = resolver
         self.timeout_seconds = timeout_seconds
         self.max_attempts = max(1, max_attempts)
         self.retry_delay_seconds = max(0.0, retry_delay_seconds)
-        self._supports_thinking_parameter = self.provider == "kimi"
 
     async def complete(
         self,
@@ -131,30 +141,37 @@ class OpenAICompatibleClient:
             payload["response_format"] = response_format
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
-        if thinking is not None and self._supports_thinking_parameter:
-            payload["thinking"] = thinking
+        if thinking is not None:
+            if self.provider == "kimi" or (
+                self.provider == "hunyuan" and self.model.lower() == "hy3"
+            ) or (
+                self.provider == "glm" and self.model.lower().startswith(("glm-4.5", "glm-4.6", "glm-4.7"))
+            ):
+                payload["thinking"] = thinking
+            elif self.provider == "qwen":
+                payload["enable_thinking"] = thinking.get("type") != "disabled"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
         for attempt in range(self.max_attempts):
             try:
-                if self.client is not None:
-                    response = await self.client.post(
+                async with build_llm_http_client(
+                    self.provider, inner_transport=self._inner_transport, resolver=self._resolver,
+                ) as client:
+                    response = await client.post(
                         self.url, json=payload, headers=headers, timeout=self.timeout_seconds
                     )
-                else:
-                    async with httpx.AsyncClient() as client:
-                        response = await client.post(
-                            self.url, json=payload, headers=headers, timeout=self.timeout_seconds
-                        )
-            except httpx.RequestError as error:
+            except UnsafeLlmDestination:
+                raise LlmProviderError(
+                    "llm_unsafe_destination", "LLM destination could not be safely requested",
+                ) from None
+            except httpx.RequestError:
                 if attempt + 1 == self.max_attempts:
-                    detail = f": {type(error).__name__}: {error}" if str(error) else ""
                     raise LlmProviderError(
                         "llm_unavailable",
-                        f"无法连接 {self.provider_label} 服务{detail}",
-                    ) from error
+                        f"无法连接 {self.provider_label} 服务",
+                    ) from None
                 await asyncio.sleep(self.retry_delay_seconds * (2**attempt))
                 continue
 
@@ -172,6 +189,10 @@ class OpenAICompatibleClient:
 
         if response.status_code in {401, 403}:
             raise LlmProviderError("llm_authentication_failed", f"{self.provider_label} API Key 无效", response.status_code)
+        if response.status_code == 404 or (
+            response.status_code in {400, 422} and _is_model_unavailable(response)
+        ):
+            raise LlmProviderError("llm_model_unavailable", f"{self.provider_label} 模型不存在或不可用", response.status_code)
         if response.status_code == 429 and _is_quota_exhausted(response):
             raise LlmProviderError(
                 "llm_quota_exhausted",
@@ -195,7 +216,10 @@ class OpenAICompatibleClient:
             message = f"{self.provider_label} 服务拒绝了请求"
             if detail:
                 message = f"{message}: {detail}"
-            raise LlmProviderError("llm_request_rejected", message, response.status_code)
+            raise LlmProviderError(
+                "llm_request_rejected", message, response.status_code,
+                unsupported_parameters=_unsupported_optional_parameters(response),
+            )
         try:
             body = response.json()
             content = _extract_completion_content(body)
@@ -208,31 +232,50 @@ class OpenAICompatibleClient:
     async def complete_json(
         self,
         messages: Sequence[Mapping[str, str]],
+        *,
+        max_tokens: int | None = None,
+        strict: bool = False,
     ) -> dict:
+        response_format = {"type": "json_object"}
+        thinking = {"type": "disabled"}
+        while True:
+            try:
+                content = await self.complete(
+                    messages, response_format=response_format, thinking=thinking,
+                    max_tokens=max_tokens,
+                )
+                break
+            except LlmProviderError as error:
+                if error.code != "llm_request_rejected" or error.status_code not in {400, 422}:
+                    raise
+                # Remove only explicitly unsupported fields. In particular,
+                # JSON-format rejection must not re-enable model reasoning.
+                remove_format = response_format is not None and "response_format" in error.unsupported_parameters
+                remove_thinking = thinking is not None and bool(
+                    {"thinking", "enable_thinking"} & error.unsupported_parameters
+                )
+                if not remove_format and not remove_thinking:
+                    raise
+                if remove_format:
+                    response_format = None
+                if remove_thinking:
+                    thinking = None
         try:
-            content = await self.complete(
-                messages,
-                response_format={"type": "json_object"},
-                thinking={"type": "disabled"},
-            )
-        except LlmProviderError as error:
-            # Some OpenAI-compatible gateways reject response_format even though
-            # they can return valid JSON when the prompt asks for it.
-            if error.code != "llm_request_rejected" or error.status_code not in {400, 422}:
-                raise
-            content = await self.complete(messages, thinking={"type": "disabled"})
-        try:
-            value = _parse_json_object(content)
-        except json.JSONDecodeError as error:
+            value = json.loads(content, parse_constant=_reject_json_constant) if strict else _parse_json_object(content)
+        except ValueError as error:
             raise LlmProviderError("llm_invalid_response", f"{self.provider_label} 未返回有效 JSON") from error
         if not isinstance(value, dict):
             raise LlmProviderError("llm_invalid_response", f"{self.provider_label} JSON 根节点必须是对象")
         return value
 
     async def test_connection(self) -> None:
-        # Keep the connectivity probe compatible with gateways that only
-        # implement the minimal chat-completions request shape.
-        await self.complete([{"role": "user", "content": "Reply with OK."}])
+        result = await self.complete_json(
+            [{"role": "user", "content": 'Return only this JSON object: {"ok":true}'}],
+            max_tokens=128,
+            strict=True,
+        )
+        if result.get("ok") is not True:
+            raise LlmProviderError("llm_invalid_response", f"{self.provider_label} 未返回有效的 JSON 测试结果")
 
 
 class KimiClient(OpenAICompatibleClient):
@@ -305,6 +348,39 @@ def _parse_json_object(content: str) -> dict:
     raise json.JSONDecodeError("JSON object not found", cleaned, 0)
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValueError("Non-standard JSON constant")
+
+
+def _unsupported_optional_parameters(response: httpx.Response) -> frozenset[str]:
+    try:
+        body = response.json()
+    except ValueError:
+        return frozenset()
+    error = body.get("error") if isinstance(body, Mapping) else None
+    if not isinstance(error, Mapping):
+        return frozenset()
+    code = str(error.get("code", "")).casefold()
+    message = str(error.get("message", "")).casefold()
+    if code not in {"unsupported_parameter", "unknown_parameter", "unrecognized_parameter", "extra_forbidden"} and not any(
+        phrase in message for phrase in ("unsupported", "not supported", "does not support", "unknown parameter", "unrecognized parameter", "不支持")
+    ):
+        return frozenset()
+    parameter = str(error.get("param") or error.get("parameter") or "").casefold()
+    optional = {"response_format", "thinking", "enable_thinking"}
+    if parameter in optional:
+        return frozenset({parameter})
+    # A field merely mentioned elsewhere in the explanation is not rejected.
+    # Match the unsupported qualifier immediately before or after that field.
+    field = r"(response_format|enable_thinking|thinking)"
+    patterns = (
+        rf"(?:unsupported|not supported|does not support|unknown|unrecognized|不支持)"
+        rf"\W+(?:(?:the\s+)?(?:parameter|argument|field)\W+)?{field}\b",
+        rf"\b{field}\W+(?:(?:parameter|argument|field)\W+)?(?:is\s+)?(?:unsupported|not supported|不支持)",
+    )
+    return frozenset(parameter for pattern in patterns for parameter in re.findall(pattern, message))
+
+
 def _provider_error_detail(response: httpx.Response, api_key: str) -> str:
     """Return a short, secret-free explanation from an upstream error response."""
     detail: object | None = None
@@ -351,7 +427,25 @@ def _is_quota_exhausted(response: httpx.Response) -> bool:
     )
 
 
-def build_llm_client(config: Mapping[str, str], *, client: httpx.AsyncClient | None = None) -> OpenAICompatibleClient:
+def _is_model_unavailable(response: httpx.Response) -> bool:
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    error = body.get("error") if isinstance(body, Mapping) else None
+    if not isinstance(error, Mapping):
+        return False
+    code = str(error.get("code", "")).casefold()
+    message = str(error.get("message", "")).casefold()
+    return code in {"model_not_found", "invalid_model", "modelnotfound"} or any(
+        phrase in message for phrase in ("model does not exist", "model not found", "model is not available")
+    )
+
+
+def build_llm_client(
+    config: Mapping[str, str], *, inner_transport: httpx.AsyncBaseTransport | None = None,
+    resolver: Resolver | None = None,
+) -> OpenAICompatibleClient:
     normalized = normalize_provider_config(
         config.get("provider"),
         config["api_url"],
@@ -363,5 +457,6 @@ def build_llm_client(config: Mapping[str, str], *, client: httpx.AsyncClient | N
         normalized.api_key,
         provider=normalized.provider,
         model=normalized.model,
-        client=client,
+        inner_transport=inner_transport,
+        resolver=resolver,
     )

@@ -50,7 +50,7 @@ class MemoryCache:
 class FakeLlmClient:
     provider = "kimi"
     model = "kimi-k2.5"
-    url = "https://api.example.com/v1/chat/completions"
+    url = "https://api.moonshot.cn/v1/chat/completions"
 
     def __init__(self):
         self.requests = []
@@ -174,7 +174,7 @@ async def test_cache_hit_does_not_call_provider():
     client = FakeHttpClient()
     provider = LibreTranslateProvider("http://translate:5000", client=client)
     cache = MemoryCache()
-    service = CachedTranslationService(provider, cache)
+    service = CachedTranslationService(provider, cache, installation_id="owner-a")
     source = segments("Hello")
 
     first = await service.translate("track-1", source, "en", "zh", "sha256:abc")
@@ -194,15 +194,39 @@ async def test_cache_does_not_cross_translation_providers():
     second_provider.name = "llm-translation"
     source = segments("Hello")
 
-    await CachedTranslationService(first_provider, cache).translate(
+    await CachedTranslationService(first_provider, cache, installation_id="owner-a").translate(
         "track-1", source, "en", "zh", "sha256:abc"
     )
-    await CachedTranslationService(second_provider, cache).translate(
+    await CachedTranslationService(second_provider, cache, installation_id="owner-a").translate(
         "track-1", source, "en", "zh", "sha256:abc"
     )
 
     assert len(first_client.requests) == 1
     assert len(second_client.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_memory_cache_is_scoped_and_reusable_only_for_same_installation():
+    cache = MemoryCache()
+    first_client, second_client = FakeHttpClient(), FakeHttpClient()
+    first = CachedTranslationService(LibreTranslateProvider("http://test", client=first_client), cache, installation_id="a")
+    second = CachedTranslationService(LibreTranslateProvider("http://test", client=second_client), cache, installation_id="b")
+    args = ("track-1", segments("Hello"), "en", "zh", "version-1")
+    await first.translate(*args)
+    await second.translate(*args)
+    await first.translate(*args)
+    await second.translate(*args)
+    assert len(first_client.requests) == len(second_client.requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", [None, "", " "])
+async def test_cache_without_owner_fails_before_provider_call(owner):
+    client = FakeHttpClient()
+    service = CachedTranslationService(LibreTranslateProvider("http://test", client=client), MemoryCache(), installation_id=owner)
+    with pytest.raises(ValueError, match="installation"):
+        await service.translate("track-1", segments("Hello"), "en", "zh", "v1")
+    assert client.requests == []
 
 
 @pytest.mark.asyncio

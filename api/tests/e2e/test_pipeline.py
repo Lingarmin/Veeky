@@ -65,7 +65,7 @@ class FixedVideoMetadataService:
 class FixedTranslationProvider:
     name = "kimi"
     version = provider_translation_version(
-        "https://api.example.com/v1/chat/completions",
+        "https://api.moonshot.cn/v1/chat/completions",
         provider="kimi",
         version="kimi-k2.5",
     )
@@ -198,7 +198,7 @@ async def test_api_pipeline_returns_timestamped_transcript_and_reuses_result():
         "sourceLanguage": "en",
         "targetLanguage": "zh-Hans",
         "title": "But what is a neural network?",
-        "llmConfig": {"apiUrl": "https://api.example.com/v1", "apiKey": "test-key"},
+        "llmConfig": {"apiUrl": "https://api.moonshot.cn/v1", "apiKey": "test-key"},
     }
     async with AsyncClient(
         transport=ASGITransport(app=app),
@@ -324,7 +324,7 @@ async def test_x_api_pipeline_transcribes_a_generated_wav_with_fake_asr(tmp_path
                 "targetLanguage": "zh-Hans",
                 "mediaUrl": "https://video.twimg.com/ext_tw_video/fixture.mp4",
                 "llmConfig": {
-                    "apiUrl": "https://api.example.com/v1",
+                    "apiUrl": "https://api.moonshot.cn/v1",
                     "apiKey": "test-key",
                 },
             },

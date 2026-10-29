@@ -13,6 +13,8 @@ __pycache__/
 *.py[cod]
 node_modules/
 extension/dist/
+extension/dist-release/
+deploy/.env.production
 playwright-report/
 test-results/
 work/
